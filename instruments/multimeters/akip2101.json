@@ -1,0 +1,13 @@
+{
+    "model_name": "AKIP-2101 / Siglent SDM3055",
+    "keywords": ["AKIP-2101", "SIGLENT"],
+    "timeout": 5000,
+    "encoding": "utf-8",
+    "init_commands": [
+        "*RST",
+        "SENS:FUNC \"CURR:DC\"",
+        "SENS:CURR:DC:NPLC 1"
+    ],
+    "measure_command": "MEAS:CURR:DC?",
+    "ranges": [0.0002, 0.002, 0.02, 0.2, 2.0, 10.0]
+}

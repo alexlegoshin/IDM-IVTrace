@@ -1,0 +1,13 @@
+{
+    "model_name": "АКИП-B7-78/1 (PICOTEST)",
+    "keywords": ["PICOTEST", "AKIP-B7-78", "V7-78"],
+    "timeout": 5000,
+    "encoding": "utf-8",
+    "init_commands": [
+        "*RST",
+        "SENS:FUNC \"CURR:DC\"",
+        "SENS:CURR:DC:NPLC 1"
+    ],
+    "measure_command": "MEAS:CURR:DC?",
+    "ranges": [0.01, 0.1, 1.0, 3.0]
+}

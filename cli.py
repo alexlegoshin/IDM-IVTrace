@@ -1,0 +1,1 @@
+python run.py measure --start 0 --stop 10 --step 0.5 --vlimit 5 --delay 0.2 --cool 0.5 --direction positive --label "Sensor1"
