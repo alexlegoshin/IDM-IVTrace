@@ -57,7 +57,12 @@ def load_and_analyze(latest_csv: Path, I_nom: float, X: float, save_png: bool = 
         raise ValueError(f"Файл {latest_csv} не содержит данных измерений.")
 
     label = metadata.get('Датчик', 'Неизвестный датчик')
-    direction = metadata.get('ветвь', '?')
+    # 'Branch' присутствует в новых файлах (forward/reverse через реле).
+    # Для старых файлов без реле (одна ветвь, метаданные 'ветвь') подстраховываемся.
+    has_branch_col = 'Branch' in df.columns
+    if not has_branch_col:
+        df['Branch'] = metadata.get('ветвь', 'forward')
+
     I_start = df['I_set_A'].min()
     I_stop = df['I_set_A'].max()
 
@@ -82,30 +87,53 @@ def load_and_analyze(latest_csv: Path, I_nom: float, X: float, save_png: bool = 
 
     x_label = f"1:{int(X)}" if float(X).is_integer() else f"1:{X:.1f}"
 
-    # Верхний график: выходной ток
-    ax1.plot(df['I_set_A'], df['I_meas_A'], 'o-', color='steelblue', markersize=4,
-              label=f'{label} ({direction}) – измер.')
-    ax1.plot(df['I_set_A'], df['I_expected_A'], '--', color='orange', linewidth=1.5,
-              label=f'Ожидаемый ({x_label})')
+    # Верхний график: выходной ток. Forward и reverse рисуются отдельно —
+    # это две разные ветви одного и того же прохода через 0, их нельзя
+    # просто сортировать вместе по I_set_A без учёта знака.
+    branch_styles = {
+        'forward': dict(color='steelblue', marker='o', label=f'{label} (forward) – измер.'),
+        'reverse': dict(color='seagreen', marker='s', label=f'{label} (reverse) – измер.'),
+    }
+    for branch_name, sub in df.groupby('Branch', sort=False):
+        sub = sub.sort_values('I_set_A')
+        style = branch_styles.get(branch_name, dict(color='gray', marker='.', label=f'{label} ({branch_name})'))
+        ax1.plot(sub['I_set_A'], sub['I_meas_A'], marker=style['marker'], linestyle='-',
+                  color=style['color'], markersize=4, label=style['label'])
+
+    df_sorted_for_expected = df.sort_values('I_set_A')
+    ax1.plot(df_sorted_for_expected['I_set_A'], df_sorted_for_expected['I_expected_A'], '--',
+              color='orange', linewidth=1.5, label=f'Ожидаемый ({x_label})')
     ax1.set_ylabel('Выходной ток датчика, А')
     ax1.set_title(f'Амплитудная характеристика датчика тока\nДиапазон {I_start}..{I_stop} А')
     ax1.legend(loc='upper left')
     ax1.grid(True, which='major', linestyle='-', linewidth=0.6, alpha=0.7)
     ax1.grid(True, which='minor', linestyle=':', linewidth=0.4, alpha=0.5)
 
-    # Нижний график: приведённая погрешность
+    # Нижний график: приведённая погрешность.
+    # ВАЖНО: forward и reverse обе проходят через I_set_A=0, так что в
+    # объединённых данных x не строго возрастает (дубли на 0, а иногда и на
+    # других точках при неровном шаге). CubicSpline требует строго
+    # возрастающую последовательность x, поэтому дубли усредняем перед
+    # построением сплайна — сами измеренные точки (крестики) остаются
+    # нетронутыми и показывают обе ветви как есть.
     x = df['I_set_A'].values
     y = df['Error_percent'].values
     order = np.argsort(x)
     x_sorted, y_sorted = x[order], y[order]
 
-    if SCIPY_AVAILABLE and len(x_sorted) > 3:
-        cs = CubicSpline(x_sorted, y_sorted)
-        x_smooth = np.linspace(x_sorted[0], x_sorted[-1], 500)
+    x_unique, unique_idx, counts = np.unique(x_sorted, return_index=True, return_counts=True)
+    y_avg = np.array([
+        y_sorted[start:start + count].mean()
+        for start, count in zip(unique_idx, counts)
+    ])
+
+    if SCIPY_AVAILABLE and len(x_unique) > 3:
+        cs = CubicSpline(x_unique, y_avg)
+        x_smooth = np.linspace(x_unique[0], x_unique[-1], 500)
         ax2.plot(x_smooth, cs(x_smooth), '-', color='firebrick', linewidth=1.2,
-                  label='Погрешность приведённая')
+                  label='Погрешность приведённая (сглаженная)')
     else:
-        ax2.plot(x_sorted, y_sorted, '-', color='firebrick', linewidth=1.2,
+        ax2.plot(x_unique, y_avg, '-', color='firebrick', linewidth=1.2,
                   label='Погрешность приведённая')
 
     ax2.plot(df['I_set_A'], df['Error_percent'], 'x', color='firebrick', markersize=6, alpha=0.7)
@@ -125,11 +153,13 @@ def load_and_analyze(latest_csv: Path, I_nom: float, X: float, save_png: bool = 
 
     plt.close(fig)
 
+    branches_present = sorted(df['Branch'].unique().tolist())
+
     stats = {
         'csv_path': latest_csv,
         'png_path': png_path,
         'label': label,
-        'direction': direction,
+        'branches': branches_present,
         'I_start': I_start,
         'I_stop': I_stop,
         'I_nom': I_nom,

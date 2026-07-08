@@ -18,14 +18,16 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     # ---------------- measure ----------------
-    p_measure = subparsers.add_parser("measure", help="Выполнить измерение амплитудной характеристики")
-    p_measure.add_argument("--start", type=float, help="Начальный ток, А")
+    p_measure = subparsers.add_parser(
+        "measure",
+        help="Выполнить измерение амплитудной характеристики (обе полярности через реле)",
+    )
+    p_measure.add_argument("--start", type=float, help="Начальный ток, А (обычно 0)")
     p_measure.add_argument("--stop", type=float, help="Конечный ток, А")
     p_measure.add_argument("--step", type=float, help="Шаг по току, А")
     p_measure.add_argument("--vlimit", type=float, help="Ограничение напряжения на источнике, В")
     p_measure.add_argument("--delay", type=float, help="Задержка на установку тока, с")
     p_measure.add_argument("--cool", type=float, help="Задержка на охлаждение между точками, с")
-    p_measure.add_argument("--direction", choices=["positive", "negative"], help="Ветвь измерения")
     p_measure.add_argument("--label", type=str, help="Комментарий (датчик, пометка)")
     p_measure.add_argument(
         "--dmm-addr", type=str, default=None,
@@ -34,6 +36,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_measure.add_argument(
         "--src-addr", type=str, default=None,
         help="VISA-адрес источника тока (пропустить автоопределение)",
+    )
+    p_measure.add_argument(
+        "--relay-port", type=str, default=None,
+        help="Serial-порт платы реле, например COM3 (пропустить автоопределение)",
     )
     p_measure.add_argument(
         "--yes", action="store_true",
@@ -67,6 +73,9 @@ def resolve_measure_params(args, config_mgr: ConfigManager) -> dict:
     Заполняет параметры измерения: сперва из аргументов командной строки,
     затем (если чего-то не хватает) — из сохранённого конфига или интерактивного ввода.
     Обновляет конфиг сохранёнными значениями.
+
+    Направление больше не запрашивается: плата реле сама выполняет проход
+    в обе стороны (forward + reverse) в рамках одного запуска measure.
     """
     saved = config_mgr.load()
 
@@ -77,7 +86,6 @@ def resolve_measure_params(args, config_mgr: ConfigManager) -> dict:
         'V_limit': args.vlimit,
         'delay': args.delay,
         'cooling_delay': args.cool,
-        'direction': args.direction,
         'label': args.label,
     }
 
@@ -91,7 +99,6 @@ def resolve_measure_params(args, config_mgr: ConfigManager) -> dict:
             print(f"  Ограничение напряжения: {saved.get('V_limit')} В")
             print(f"  Задержка на установку: {saved.get('delay')} с")
             print(f"  Задержка на охлаждение: {saved.get('cooling_delay')} с")
-            print(f"  Последняя ветвь: {saved.get('direction', '?')}")
             print(f"  Последний комментарий: {saved.get('label', '')}")
             use_prev = input("\nИспользовать эти параметры? (y/n, по умолчанию y): ").strip().lower()
             if use_prev != 'n':
@@ -122,30 +129,17 @@ def resolve_measure_params(args, config_mgr: ConfigManager) -> dict:
         label = input(f"Комментарий (датчик, пометка){hint}: ").strip()
         params['label'] = label if label else last_label
 
-    # --- direction ---
-    if params['direction'] is None:
-        last_dir = saved.get('direction', '') if saved else ''
-        hint = f" (Enter для {last_dir}, или введите p/n/+/-)" if last_dir else ""
-        while True:
-            dir_input = input(f"Ветвь (positive/p/+ или negative/n/-){hint}: ").strip().lower()
-            if dir_input == '' and last_dir:
-                dir_input = last_dir
-            if dir_input in ('positive', 'p', '+'):
-                params['direction'] = 'positive'
-                break
-            elif dir_input in ('negative', 'n', '-'):
-                params['direction'] = 'negative'
-                break
-            else:
-                print("Некорректная ветвь. Используйте positive/p/+ или negative/n/-")
-
     # Сохраняем итоговые параметры для следующего запуска
     config_mgr.save(params)
 
     return params
 
 
-def make_csv_filename(data_dir: Path, label: str, direction: str) -> Path:
+def make_csv_filename(data_dir: Path, label: str) -> Path:
+    """
+    Имя файла больше не содержит ветвь (positive/negative) — один CSV теперь
+    содержит обе полярности, а различие фиксируется в колонке Branch.
+    """
     label_safe = re.sub(r'[^a-zA-Z0-9_\- ]', '', label).replace(' ', '_') if label else 'nolabel'
     timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return data_dir / f"IVtrace_{label_safe}_{direction}_{timestamp_str}.csv"
+    return data_dir / f"IVtrace_{label_safe}_{timestamp_str}.csv"

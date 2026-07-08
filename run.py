@@ -5,9 +5,13 @@ IVtrace — консольное приложение для автоматиз�
 
 Использование:
     python run.py measure --start 0 --stop 10 --step 0.5 --vlimit 5 \
-        --delay 0.2 --cool 0.5 --direction positive --label "Sensor1"
+        --delay 0.2 --cool 0.5 --label "Sensor1"
 
     python run.py analyze --inom 150 --ratio 1500
+
+Измерение теперь автоматически проходит обе полярности (forward/reverse)
+за один запуск — переключение направления делает плата реле, вручную
+задавать ветвь (positive/negative) больше не нужно.
 """
 import sys
 from datetime import datetime
@@ -19,6 +23,7 @@ import pyvisa
 from cli import build_parser, resolve_measure_params, make_csv_filename
 from config import ConfigManager
 from instruments import Multimeter, CurrentSource, discover_instruments
+from relay import RelayController, discover_relay_port
 from measurement import run_measurement
 from analysis import load_and_analyze, find_latest_csv
 
@@ -34,10 +39,10 @@ def cmd_measure(args) -> int:
 
     params = resolve_measure_params(args, config_mgr)
 
-    csv_path = make_csv_filename(data_dir, params['label'], params['direction'])
+    csv_path = make_csv_filename(data_dir, params['label'])
     print(f"\nФайл результатов: {csv_path}")
     print(f"Диапазон: {params['I_start']}..{params['I_stop']} А, шаг {params['I_step']} А, "
-          f"ограничение V={params['V_limit']} В, ветвь: {params['direction']}")
+          f"ограничение V={params['V_limit']} В (обе полярности через реле)")
     print(f"Комментарий: {params['label']}")
     print(f"Задержка установки: {params['delay']} с, задержка охлаждения: {params['cooling_delay']} с\n")
 
@@ -74,30 +79,37 @@ def cmd_measure(args) -> int:
         print(f"Ошибка обнаружения приборов: {e}")
         return 1
 
+    try:
+        relay_port = args.relay_port if args.relay_port else discover_relay_port()
+    except RuntimeError as e:
+        print(f"Ошибка обнаружения платы реле: {e}")
+        return 1
+
     dmm = Multimeter(dmm_addr, dmm_cfg, rm=rm)
     src = CurrentSource(src_addr, src_cfg, rm=rm)
+    relay = RelayController(relay_port)
 
-    print("Приборы инициализированы. Начинаю измерения...\n")
+    print("Приборы и реле инициализированы. Начинаю измерения...\n")
 
     try:
         results = run_measurement(
-            dmm, src,
+            dmm, src, relay,
             I_start=params['I_start'], I_stop=params['I_stop'], I_step=params['I_step'],
             V_limit=params['V_limit'], delay=params['delay'], cooling_delay=params['cooling_delay'],
-            direction=params['direction'],
         )
     finally:
         dmm.close()
         src.close()
+        relay.close()
 
-    print("\nИзмерения завершены, источник выключен.")
+    print("\nИзмерения завершены, источник и реле выключены.")
 
     df = pd.DataFrame(results)
     with open(csv_path, 'w', encoding='utf-8') as f:
         f.write(f"# Датчик: {params['label']}\n")
         f.write(f"# Диапазон заданного тока: {params['I_start']}..{params['I_stop']} А, "
                 f"шаг {params['I_step']} А, ограничение V={params['V_limit']} В\n")
-        f.write(f"# ветвь: {params['direction']}\n")
+        f.write(f"# Обе полярности сняты автоматически через плату реле (см. колонку Branch)\n")
         f.write(f"# Задержка установки: {params['delay']} с\n")
         f.write(f"# Задержка охлаждения: {params['cooling_delay']} с\n")
         f.write(f"# Время измерения: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
