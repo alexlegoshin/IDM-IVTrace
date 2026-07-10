@@ -1,0 +1,17 @@
+{
+    "model_name": "ITECH IT-M series",
+    "keywords": ["ITECH", "IT-M"],
+    "timeout": 5000,
+    "encoding": "utf-8",
+    "init_commands": [
+        "*RST",
+        "SOUR:CC:PRI"
+    ],
+    "setup_commands": {
+        "voltage_limit": "SOUR:VOLT {voltage}",
+        "current": "SOUR:CURR {current}",
+        "slew_rate": "SOUR:CURR:SLEW {rate}"
+    },
+    "output_on": "OUTP ON",
+    "output_off": "OUTP OFF"
+}

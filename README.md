@@ -1,46 +1,207 @@
-# IVtrace – Automated I–V Characterization for Current Sensors
+# IVtrace v1.2ae-cli
 
-**IVtrace** is a Python script designed for automated acquisition of current–voltage (transfer) characteristics of current sensors. It runs in a Jupyter Notebook environment and communicates with SCPI‑compliant instruments via the NI‑VISA layer using the `pyvisa` library. Data handling and export are powered by `pandas`, and quick‑look plots can be generated with `matplotlib`.
+Консольное приложение для автоматизированного снятия амплитудной
+характеристики датчиков тока и датчиков напряжения с токовым выходом.
 
-## Key Features
+Источник (тока или напряжения) задаёт возбуждение на первичной обмотке
+датчика, плата реле автоматически переключает полярность, мультиметр
+измеряет выходной ток датчика на вторичной обмотке. Результат — CSV с
+точками измерения и PNG с графиком амплитудной характеристики и
+приведённой погрешности.
 
-- **Instrument auto‑detection** – works with AKIP‑2101 / Siglent multimeters and ITECH IT‑M3910D programmable DC power supplies.
-- **Cached measurement settings** – all parameters (current range, step, voltage limit, delay, etc.) are stored in a JSON configuration file and reloaded on the next run.
-- **Pulsed source operation** – the output of the current source is turned on only during the measurement of each point, reducing self‑heating and power dissipation in the sensor.
-- **Manual polarity switching** – the script always sends a positive current to the unipolar source; the sign (positive/negative) is logically recorded in the results and metadata.
-- **Rich CSV export** – the output file includes a full metadata header (test conditions, timestamp, number of points) followed by the measured data columns (`Timestamp`, `I_set_A`, `V_meas_V`).
+---
 
-## Typical Workflow
+## Структура проекта
 
-1. Load or enter test parameters (start/stop current, step, voltage limit, settling delay).
-2. Choose the polarity branch (`positive` or `negative`) – short aliases `p`/`+` or `n`/`-` are supported.
-3. The script automatically initializes both instruments.
-4. For each current step:
-   - Sets the (positive) current,
-   - Turns on the output,
-   - Waits for stabilization,
-   - Acquires and averages 3 voltage readings,
-   - Turns off the output,
-   - Stores the timestamp, signed current, and averaged voltage.
-5. At the end, the CSV file is saved with all metadata and data.
-6. The first 10 rows are displayed in the console for verification.
+```
+IVtrace/
+├── run.py                        # точка входа: python run.py measure|analyze
+├── cli.py                        # argparse + интерактивный диалог параметров
+├── config.py                     # чтение/запись сохранённых параметров запуска
+├── instruments.py                # классы Multimeter, CurrentSource, VoltageSource
+├── relay.py                      # управление платой реле (переключение полярности)
+├── measurement.py                # цикл измерения (forward/reverse через реле)
+├── analysis.py                   # расчёт погрешности и построение графика
+└── instruments/
+    ├── multimeters/              # JSON-конфиги мультиметров
+    │   ├── akip2101.json
+    │   └── akipb778.json
+    ├── current_sources/          # JSON-конфиги источников тока
+    │   └── akip1162.json
+    └── voltage_sources/          # JSON-конфиги источников напряжения
+        └── gpp74323.json
+```
 
-## Requirements
+При запуске `measure` рядом со скриптом создаётся папка `data/` — туда
+пишутся CSV, PNG и `ivtrace_config.json` (сохранённые параметры последнего
+запуска, подставляются как подсказка в следующий раз).
 
-- Python 3.8+
-- `pyvisa`, `pandas`, `matplotlib`, `datetime`, `pathlib`, `json`
-- NI‑VISA backend (or pyvisa‑py backend for pure‑Python communication)
+---
 
-## Repository Structure
-
-- `IVtrace.ipynb` – main Jupyter Notebook
-- `ivtrace_config.json` – auto‑generated cache for measurement parameters (created in `C:/IVTraceData/`)
-- Sample CSV outputs in the same directory
-
-## Usage Example
+## Установка
 
 ```bash
-# Clone the repository
-git clone https://github.com/yourusername/IVtrace.git
-# Launch Jupyter and run the notebook
-jupyter notebook IVtrace.ipynb
+pip install pyvisa pyserial pandas numpy scipy matplotlib
+```
+
+Также нужен установленный драйвер NI-VISA (или совместимый бэкенд) для
+работы `pyvisa` с USB/GPIB-приборами.
+
+---
+
+## Использование
+
+### Измерение — датчик тока (возбуждение источником тока)
+
+```bash
+python run.py measure --excitation current --start 0 --stop 100 --step 5 \
+    --vlimit 3 --delay 1 --cool 1.5 --label "VAC 4646X100"
+```
+
+### Измерение — датчик напряжения (возбуждение источником напряжения)
+
+```bash
+python run.py measure --excitation voltage --start 0 --stop 64 --step 4 \
+    --delay 1 --cool 0.5 --label "VoltageSensor1"
+```
+
+Если не передать флаги — программа спросит всё интерактивно, начиная с
+типа возбуждения (ток/напряжение), и предложит подставить значения из
+предыдущего запуска (если тип возбуждения совпадает).
+
+### Анализ последнего измерения
+
+```bash
+python run.py analyze --inom 150 --ratio 1500
+```
+
+`--inom` — номинальный первичный ток датчика (А), `--ratio` — коэффициент
+трансформации 1:X (передаётся X). Без флагов запрашиваются интерактивно.
+По умолчанию берётся самый свежий CSV в `data/`; конкретный файл — через
+`--file путь/к/файлу.csv`.
+
+---
+
+## Как это работает
+
+1. **Автообнаружение приборов.** `run.py` перебирает все VISA-ресурсы,
+   опрашивает каждый `*IDN?` и сопоставляет ответ с `keywords` в JSON-конфигах
+   мультиметров и источников (папка источника выбирается по типу
+   возбуждения — `current_sources` или `voltage_sources`). Плата реле ищется
+   отдельно перебором COM-портов с командой `BEN`.
+2. **Цикл измерения** идёт в две ветви одного запуска, без ручного выбора
+   полярности:
+   - `relay.forward()` → проход 0 → максимум (ветвь `forward`, знак `+`)
+   - `relay.reverse()` → проход 0 → максимум (ветвь `reverse`, знак `-`)
+   На каждой точке: возбуждение выставляется → пауза `delay` → 3 измерения
+   мультиметром (с усреднением и авто-диапазоном) → выход выключается →
+   пауза `cool`.
+3. **Измеряемая величина всегда ток** (мультиметр работает в режиме
+   `SENS:CURR:DC` независимо от типа возбуждения) — так как оба типа
+   датчиков, которые поддерживает программа на данный момент, имеют
+   токовый выход.
+4. **CSV** содержит колонку `X_set` (заданное возбуждение, со знаком) и
+   `I_meas_A` (измеренный ток), плюс `Branch` (`forward`/`reverse`).
+   Тип и единица измерения возбуждения записаны в заголовке (строки с `#`).
+5. **`analyze`** читает единицу измерения из заголовка CSV, считает
+   приведённую погрешность относительно ожидаемого выходного тока
+   (`X_set / X`), строит график: сверху — амплитудная характеристика
+   (`forward`/`reverse` отдельными сериями + ожидаемая линия), снизу —
+   приведённая погрешность со сглаживающим сплайном.
+
+Старые CSV без колонки `X_set` (снятые до появления выбора типа
+возбуждения) по-прежнему читаются `analyze` — трактуются как ток.
+
+---
+
+## Приборы
+
+### Мультиметры (`instruments/multimeters/`)
+
+| Файл | Модель | Диапазоны, А |
+|---|---|---|
+| `akip2101.json` | AKIP-2101 / Siglent SDM3055 | 0.0002 … 10.0 |
+| `akipb778.json` | АКИП-B7-78/1 (Picotest) | 0.01 … 3.0 |
+
+Всегда работают в режиме измерения постоянного тока (`SENS:CURR:DC`),
+диапазон переключается автоматически по ходу измерения.
+
+### Источники тока (`instruments/current_sources/`)
+
+| Файл | Модель |
+|---|---|
+| `akip1162.json` | ITECH IT-M series |
+
+### Источники напряжения (`instruments/voltage_sources/`)
+
+| Файл | Модель |
+|---|---|
+| `gpp74323.json` | GW Instek GPP-74323 |
+
+Источник напряжения работает через USB (SCPI) и объединяет каналы
+**CH1 (master) + CH2 (slave) в режиме Tracking Series без общей точки**
+(`TRACK1`) — это даёт объединённый диапазон 0…64В на клеммах CH1(+) и
+CH2(−). Управление идёт только через CH1; полярность на первичке датчика
+меняет не источник, а плата реле, поэтому источник всегда работает
+однополярно (0 → V_max).
+
+**Важный нюанс**, подтверждённый официальной документацией GW Instek:
+ответ `*IDN?` для этой серии не содержит первую цифру номера модели —
+GPP-74323 представляется как `GPP-4323`, что и зашито в `keywords`
+конфига. Если добавляешь другую модель GPP-серии — учти это при подборе
+keywords.
+
+Команды в `gpp74323.json` проверены по официальному руководству
+`GPP-Series_User_manual_EN_REVG_20240506.pdf` (стр. 128, 133–135), но не
+протестированы на реальном приборе этим кодом — при первом реальном
+запуске стоит внимательно посмотреть на лог инициализации (`TRACK1`,
+`VSET1`, `:OUTPut1:STATe`).
+
+### Плата реле
+
+Serial, 115200 бод, окончание строки `\r\n`. После открытия порта ~5 c уходит
+на загрузку контроллера. Команды (без параметров, ответ — `OK`):
+
+| Команда | Действие |
+|---|---|
+| `BEN` | проверка связи / статус жгутов |
+| `IFW` | включить прямое направление тока |
+| `IRW` | включить обратное направление тока |
+| `I_0` | отключить ток, реле в исходное состояние |
+
+Порт определяется автоматически (перебор COM-портов + `BEN`) либо
+указывается вручную флагом `--relay-port`.
+
+---
+
+## Добавление нового прибора
+
+Мультиметр, источник тока или источник напряжения добавляются простым
+JSON-файлом в соответствующую папку — писать код не нужно, если протокол
+укладывается в существующую схему (`init_commands`, `setup_commands`,
+`output_on`/`output_off` и т.д. — по образцу существующих конфигов).
+Главное — правильно подобрать `keywords`, которые встречаются в ответе
+прибора на `*IDN?`.
+
+---
+
+## Известные ограничения (v1.2ae-cli)
+
+- Датчики поддерживаются только с токовым выходом (измерение всегда через
+  `SENS:CURR:DC`). Возможность измерять выход по напряжению — задел на
+  будущее, пока не реализована.
+- `VoltageSource` не проверялся на реальном железе — команды взяты из
+  документации, но не протестированы вживую.
+- Автовыбор диапазона мультиметра ориентируется на первую измеренную
+  точку и не имеет отдельной обработки перегрузки (overload), кроме
+  ловли `VisaIOError`.
+
+---
+
+## История версий
+
+| Версия | Изменения |
+|---|---|
+| **v1.2ae-cli** | Добавлена поддержка датчиков напряжения: `VoltageSource` (GPP-74323, Tracking Series через USB/SCPI), выбор типа возбуждения (ток/напряжение) в начале `measure`, разделение конфигов на `current_sources`/`voltage_sources`, обобщение `measurement.py`/`analysis.py`/CSV-формата под произвольную единицу измерения возбуждения (колонка `X_set`). |
+| v1.1ae-cli | Добавлено управление платой реле для автоматического переключения полярности: один запуск `measure` теперь снимает обе ветви (`forward`/`reverse`) без ручного выбора направления. Найден и исправлен баг чтения ответа платы реле (склейка ответов соседних команд из-за неполного чтения serial-буфера). |
+| v1.0a | Первая версия консольного приложения: перенос логики из Jupyter-ноутбука в модули (`cli.py`, `config.py`, `instruments.py`, `measurement.py`, `analysis.py`), автообнаружение приборов по `*IDN?`, ручной выбор ветви (positive/negative). |

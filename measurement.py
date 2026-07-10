@@ -1,25 +1,37 @@
 import time
 from datetime import datetime
-from typing import List, Dict
+from typing import List, Dict, Union
 
 import pyvisa
 
-from instruments import CurrentSource
+from instruments import CurrentSource, VoltageSource
 from instruments import Multimeter as DMM
 from relay import RelayController
 
+# Единицы измерения задаваемой величины возбуждения — используются и в
+# именах колонок CSV, и в подписях графиков analysis.py.
+EXCITATION_UNITS = {
+    'current': 'A',
+    'voltage': 'V',
+}
 
-def _measure_branch(dmm: DMM, src: CurrentSource,
-                     I_start: float, I_stop: float, I_step: float,
+
+def _measure_branch(dmm: DMM, src: Union[CurrentSource, VoltageSource],
+                     excitation_type: str,
+                     X_start: float, X_stop: float, X_step: float,
                      delay: float, cooling_delay: float,
                      sign: int, branch_name: str,
                      range_reset: bool = False) -> List[Dict]:
     """
-    Выполняет один проход измерения (0..I_max) для уже установленного реле
+    Выполняет один проход измерения (0..X_max) для уже установленного реле
     (направление задаётся снаружи через relay.forward()/reverse()).
-    sign используется только для записи знака в I_set_A.
+
+    excitation_type определяет, что именно выставляется на источнике —
+    ток (src.set_current) или напряжение (src.set_voltage). Измеряемая
+    датчиком величина всегда ток (см. измерение в run_measurement).
+    sign используется только для записи знака в X_set.
     """
-    num_steps = int(round((I_stop - I_start) / I_step)) + 1
+    num_steps = int(round((X_stop - X_start) / X_step)) + 1
     results = []
 
     if range_reset:
@@ -29,10 +41,13 @@ def _measure_branch(dmm: DMM, src: CurrentSource,
         dmm.set_range(dmm.ranges[dmm.current_range_idx])
 
     for step in range(num_steps):
-        abs_current = I_start + step * I_step
-        signed_current = abs_current * sign
+        abs_value = X_start + step * X_step
+        signed_value = abs_value * sign
 
-        src.set_current(abs_current)
+        if excitation_type == 'current':
+            src.set_current(abs_value)
+        else:
+            src.set_voltage(abs_value)
         src.output_on()
         time.sleep(delay)
 
@@ -62,30 +77,47 @@ def _measure_branch(dmm: DMM, src: CurrentSource,
         results.append({
             'Timestamp': datetime.now().isoformat(),
             'Branch': branch_name,
-            'I_set_A': signed_current,
+            'X_set': signed_value,
             'I_meas_A': i_avg,
         })
 
-        print(f"  [{branch_name}] I_уст = {signed_current:+.4f} А  ->  I_изм = {i_avg:.6f} А")
+        unit = EXCITATION_UNITS[excitation_type]
+        print(f"  [{branch_name}] X_уст = {signed_value:+.4f} {unit}  ->  I_изм = {i_avg:.6f} А")
 
     return results
 
 
-def run_measurement(dmm: DMM, src: CurrentSource, relay: RelayController,
-                     I_start: float, I_stop: float, I_step: float,
+def run_measurement(dmm: DMM, src: Union[CurrentSource, VoltageSource], relay: RelayController,
+                     excitation_type: str,
+                     X_start: float, X_stop: float, X_step: float,
                      V_limit: float, delay: float, cooling_delay: float) -> List[Dict]:
     """
     Полный двусторонний цикл измерения амплитудной характеристики датчика тока
     с автоматическим переключением полярности через плату реле:
 
-        1) relay.forward() -> проход 0..I_max (положительная ветвь, sign=+1)
-        2) relay.reverse() -> проход 0..I_max (отрицательная ветвь, sign=-1)
+        1) relay.forward() -> проход 0..X_max (положительная ветвь, sign=+1)
+        2) relay.reverse() -> проход 0..X_max (отрицательная ветвь, sign=-1)
         3) relay.off()
 
-    Направление (Branch) сохраняется в каждой записи результата вместо
-    прежнего единого параметра direction на весь запуск.
+    excitation_type: 'current' — на источник тока подаётся уставка тока
+                      (V_limit используется как ограничение по напряжению);
+                      'voltage' — на источник напряжения подаётся уставка
+                      напряжения (V_limit в этом случае не используется для
+                      настройки источника, X_stop и есть максимальное
+                      напряжение цикла).
+
+    Выход датчика (измеряемая величина) всегда ток — читается мультиметром
+    независимо от типа возбуждения.
+
+    Направление (Branch) сохраняется в каждой записи результата.
     """
-    src.setup(voltage_limit=V_limit)
+    if excitation_type == 'current':
+        src.setup(voltage_limit=V_limit)
+    elif excitation_type == 'voltage':
+        src.setup(voltage_limit=X_stop)
+    else:
+        raise ValueError(f"Неизвестный тип возбуждения: {excitation_type!r} (ожидается 'current' или 'voltage')")
+
     results = []
 
     try:
@@ -93,7 +125,7 @@ def run_measurement(dmm: DMM, src: CurrentSource, relay: RelayController,
         resp = relay.forward()
         print(f"  Ответ реле: {resp}")
         results += _measure_branch(
-            dmm, src, I_start, I_stop, I_step, delay, cooling_delay,
+            dmm, src, excitation_type, X_start, X_stop, X_step, delay, cooling_delay,
             sign=+1, branch_name='forward',
         )
 
@@ -101,7 +133,7 @@ def run_measurement(dmm: DMM, src: CurrentSource, relay: RelayController,
         resp = relay.reverse()
         print(f"  Ответ реле: {resp}")
         results += _measure_branch(
-            dmm, src, I_start, I_stop, I_step, delay, cooling_delay,
+            dmm, src, excitation_type, X_start, X_stop, X_step, delay, cooling_delay,
             sign=-1, branch_name='reverse', range_reset=True,
         )
     finally:

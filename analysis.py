@@ -63,14 +63,30 @@ def load_and_analyze(latest_csv: Path, I_nom: float, X: float, save_png: bool = 
     if not has_branch_col:
         df['Branch'] = metadata.get('ветвь', 'forward')
 
-    I_start = df['I_set_A'].min()
-    I_stop = df['I_set_A'].max()
+    # Колонка возбуждения называется X_set (новые файлы, могут быть током
+    # или напряжением — единица берётся из метаданных) либо I_set_A
+    # (старые файлы до появления выбора типа возбуждения — всегда ток).
+    if 'X_set' in df.columns:
+        excitation_col = 'X_set'
+        excitation_unit = metadata.get('Единица измерения возбуждения', 'А')
+        excitation_type = metadata.get('Тип возбуждения', 'current')
+    else:
+        excitation_col = 'I_set_A'
+        excitation_unit = 'А'
+        excitation_type = 'current'
+
+    excitation_label = 'ток' if excitation_type == 'current' else 'напряжение'
+
+    X_start = df[excitation_col].min()
+    X_stop = df[excitation_col].max()
 
     # ---------- Расчёт погрешности ----------
-    K = 1.0 / X                      # коэффициент передачи I_out / I_in
+    # Погрешность всегда считается относительно выходного тока датчика
+    # (I_meas_A), независимо от того, чем датчик возбуждался.
+    K = 1.0 / X                      # коэффициент передачи I_out / X_in
     I_sec_nom = I_nom * K            # номинальный выходной ток при I_nom
 
-    df['I_expected_A'] = df['I_set_A'] * K
+    df['I_expected_A'] = df[excitation_col] * K
     df['Error_percent'] = np.abs(df['I_meas_A'] - df['I_expected_A']) / I_sec_nom * 100
 
     # ---------- Построение графиков ----------
@@ -89,34 +105,35 @@ def load_and_analyze(latest_csv: Path, I_nom: float, X: float, save_png: bool = 
 
     # Верхний график: выходной ток. Forward и reverse рисуются отдельно —
     # это две разные ветви одного и того же прохода через 0, их нельзя
-    # просто сортировать вместе по I_set_A без учёта знака.
+    # просто сортировать вместе по excitation_col без учёта знака.
     branch_styles = {
         'forward': dict(color='steelblue', marker='o', label=f'{label} (forward) – измер.'),
         'reverse': dict(color='seagreen', marker='s', label=f'{label} (reverse) – измер.'),
     }
     for branch_name, sub in df.groupby('Branch', sort=False):
-        sub = sub.sort_values('I_set_A')
+        sub = sub.sort_values(excitation_col)
         style = branch_styles.get(branch_name, dict(color='gray', marker='.', label=f'{label} ({branch_name})'))
-        ax1.plot(sub['I_set_A'], sub['I_meas_A'], marker=style['marker'], linestyle='-',
+        ax1.plot(sub[excitation_col], sub['I_meas_A'], marker=style['marker'], linestyle='-',
                   color=style['color'], markersize=4, label=style['label'])
 
-    df_sorted_for_expected = df.sort_values('I_set_A')
-    ax1.plot(df_sorted_for_expected['I_set_A'], df_sorted_for_expected['I_expected_A'], '--',
+    df_sorted_for_expected = df.sort_values(excitation_col)
+    ax1.plot(df_sorted_for_expected[excitation_col], df_sorted_for_expected['I_expected_A'], '--',
               color='orange', linewidth=1.5, label=f'Ожидаемый ({x_label})')
     ax1.set_ylabel('Выходной ток датчика, А')
-    ax1.set_title(f'Амплитудная характеристика датчика тока\nДиапазон {I_start}..{I_stop} А')
+    ax1.set_title(f'Амплитудная характеристика датчика тока (возбуждение — {excitation_label})\n'
+                  f'Диапазон {X_start}..{X_stop} {excitation_unit}')
     ax1.legend(loc='upper left')
     ax1.grid(True, which='major', linestyle='-', linewidth=0.6, alpha=0.7)
     ax1.grid(True, which='minor', linestyle=':', linewidth=0.4, alpha=0.5)
 
     # Нижний график: приведённая погрешность.
-    # ВАЖНО: forward и reverse обе проходят через I_set_A=0, так что в
-    # объединённых данных x не строго возрастает (дубли на 0, а иногда и на
-    # других точках при неровном шаге). CubicSpline требует строго
+    # ВАЖНО: forward и reverse обе проходят через excitation_col=0, так что
+    # в объединённых данных x не строго возрастает (дубли на 0, а иногда и
+    # на других точках при неровном шаге). CubicSpline требует строго
     # возрастающую последовательность x, поэтому дубли усредняем перед
     # построением сплайна — сами измеренные точки (крестики) остаются
     # нетронутыми и показывают обе ветви как есть.
-    x = df['I_set_A'].values
+    x = df[excitation_col].values
     y = df['Error_percent'].values
     order = np.argsort(x)
     x_sorted, y_sorted = x[order], y[order]
@@ -136,9 +153,9 @@ def load_and_analyze(latest_csv: Path, I_nom: float, X: float, save_png: bool = 
         ax2.plot(x_unique, y_avg, '-', color='firebrick', linewidth=1.2,
                   label='Погрешность приведённая')
 
-    ax2.plot(df['I_set_A'], df['Error_percent'], 'x', color='firebrick', markersize=6, alpha=0.7)
+    ax2.plot(df[excitation_col], df['Error_percent'], 'x', color='firebrick', markersize=6, alpha=0.7)
     ax2.axhline(y=0, color='gray', linewidth=0.5)
-    ax2.set_xlabel('Заданный первичный ток $I_{уст}$, А')
+    ax2.set_xlabel(f'Заданное возбуждение ({excitation_label}), {excitation_unit}')
     ax2.set_ylabel('Погрешность, %')
     ax2.legend(loc='upper right')
     ax2.grid(True, which='major', linestyle='-', linewidth=0.6, alpha=0.7)
@@ -160,8 +177,10 @@ def load_and_analyze(latest_csv: Path, I_nom: float, X: float, save_png: bool = 
         'png_path': png_path,
         'label': label,
         'branches': branches_present,
-        'I_start': I_start,
-        'I_stop': I_stop,
+        'excitation_type': excitation_type,
+        'excitation_unit': excitation_unit,
+        'X_start': X_start,
+        'X_stop': X_stop,
         'I_nom': I_nom,
         'X': X,
         'points': len(df),

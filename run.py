@@ -4,14 +4,19 @@ IVtrace — консольное приложение для автоматиз�
 амплитудной характеристики датчиков тока.
 
 Использование:
-    python run.py measure --start 0 --stop 10 --step 0.5 --vlimit 5 \
+    python run.py measure --excitation current --start 0 --stop 10 --step 0.5 --vlimit 5 \
         --delay 0.2 --cool 0.5 --label "Sensor1"
+
+    python run.py measure --excitation voltage --start 0 --stop 64 --step 5 \
+        --delay 1 --cool 0.5 --label "VoltageSensor1"
 
     python run.py analyze --inom 150 --ratio 1500
 
-Измерение теперь автоматически проходит обе полярности (forward/reverse)
-за один запуск — переключение направления делает плата реле, вручную
-задавать ветвь (positive/negative) больше не нужно.
+Измерение автоматически проходит обе полярности (forward/reverse) за один
+запуск — переключение направления делает плата реле. Тип возбуждения
+(ток/напряжение) запрашивается в начале measure и определяет, в какой
+папке (instruments/current_sources или instruments/voltage_sources) искать
+конфиг источника.
 """
 import sys
 from datetime import datetime
@@ -22,14 +27,15 @@ import pyvisa
 
 from cli import build_parser, resolve_measure_params, make_csv_filename
 from config import ConfigManager
-from instruments import Multimeter, CurrentSource, discover_instruments
+from instruments import Multimeter, CurrentSource, VoltageSource, discover_instruments, find_config_for_idn
 from relay import RelayController, discover_relay_port
-from measurement import run_measurement
+from measurement import run_measurement, EXCITATION_UNITS
 from analysis import load_and_analyze, find_latest_csv
 
 BASE_DIR = Path(__file__).resolve().parent
 MULTIMETER_CFG_DIR = BASE_DIR / "instruments" / "multimeters"
-SOURCE_CFG_DIR = BASE_DIR / "instruments" / "standard_sources"
+CURRENT_SOURCE_CFG_DIR = BASE_DIR / "instruments" / "current_sources"
+VOLTAGE_SOURCE_CFG_DIR = BASE_DIR / "instruments" / "voltage_sources"
 
 
 def cmd_measure(args) -> int:
@@ -38,11 +44,17 @@ def cmd_measure(args) -> int:
     config_mgr = ConfigManager(data_dir / "ivtrace_config.json")
 
     params = resolve_measure_params(args, config_mgr)
+    excitation_type = params['excitation_type']
+    unit = EXCITATION_UNITS[excitation_type]
+    source_cfg_dir = CURRENT_SOURCE_CFG_DIR if excitation_type == 'current' else VOLTAGE_SOURCE_CFG_DIR
+    source_label = "источник тока" if excitation_type == 'current' else "источник напряжения"
 
     csv_path = make_csv_filename(data_dir, params['label'])
     print(f"\nФайл результатов: {csv_path}")
-    print(f"Диапазон: {params['I_start']}..{params['I_stop']} А, шаг {params['I_step']} А, "
-          f"ограничение V={params['V_limit']} В (обе полярности через реле)")
+    print(f"Возбуждение: {excitation_type} ({unit}), диапазон {params['X_start']}..{params['X_stop']} {unit}, "
+          f"шаг {params['X_step']} {unit} (обе полярности через реле)")
+    if excitation_type == 'current':
+        print(f"Ограничение напряжения источника: {params['V_limit']} В")
     print(f"Комментарий: {params['label']}")
     print(f"Задержка установки: {params['delay']} с, задержка охлаждения: {params['cooling_delay']} с\n")
 
@@ -53,7 +65,6 @@ def cmd_measure(args) -> int:
             dmm_addr, src_addr = args.dmm_addr, args.src_addr
             # При ручном указании адресов всё равно нужно понять, какой конфиг использовать.
             # Опрашиваем *IDN? у каждого адреса, чтобы подобрать json.
-            from instruments import find_config_for_idn
             dmm_instr = rm.open_resource(dmm_addr)
             dmm_instr.encoding = 'utf-8'
             dmm_idn = dmm_instr.query('*IDN?').strip()
@@ -67,13 +78,13 @@ def cmd_measure(args) -> int:
             src_instr.encoding = 'utf-8'
             src_idn = src_instr.query('*IDN?').strip()
             src_instr.close()
-            src_cfg = find_config_for_idn(src_idn, SOURCE_CFG_DIR)
+            src_cfg = find_config_for_idn(src_idn, source_cfg_dir)
             if src_cfg is None:
-                print(f"Не удалось подобрать конфиг источника тока для IDN: {src_idn}")
+                print(f"Не удалось подобрать конфиг {source_label} для IDN: {src_idn}")
                 return 1
         else:
             dmm_addr, dmm_cfg, src_addr, src_cfg = discover_instruments(
-                MULTIMETER_CFG_DIR, SOURCE_CFG_DIR, rm=rm,
+                MULTIMETER_CFG_DIR, source_cfg_dir, rm=rm, source_label=source_label,
             )
     except RuntimeError as e:
         print(f"Ошибка обнаружения приборов: {e}")
@@ -86,15 +97,15 @@ def cmd_measure(args) -> int:
         return 1
 
     dmm = Multimeter(dmm_addr, dmm_cfg, rm=rm)
-    src = CurrentSource(src_addr, src_cfg, rm=rm)
+    src = CurrentSource(src_addr, src_cfg, rm=rm) if excitation_type == 'current' else VoltageSource(src_addr, src_cfg, rm=rm)
     relay = RelayController(relay_port)
 
     print("Приборы и реле инициализированы. Начинаю измерения...\n")
 
     try:
         results = run_measurement(
-            dmm, src, relay,
-            I_start=params['I_start'], I_stop=params['I_stop'], I_step=params['I_step'],
+            dmm, src, relay, excitation_type,
+            X_start=params['X_start'], X_stop=params['X_stop'], X_step=params['X_step'],
             V_limit=params['V_limit'], delay=params['delay'], cooling_delay=params['cooling_delay'],
         )
     finally:
@@ -107,8 +118,12 @@ def cmd_measure(args) -> int:
     df = pd.DataFrame(results)
     with open(csv_path, 'w', encoding='utf-8') as f:
         f.write(f"# Датчик: {params['label']}\n")
-        f.write(f"# Диапазон заданного тока: {params['I_start']}..{params['I_stop']} А, "
-                f"шаг {params['I_step']} А, ограничение V={params['V_limit']} В\n")
+        f.write(f"# Тип возбуждения: {excitation_type}\n")
+        f.write(f"# Единица измерения возбуждения: {unit}\n")
+        f.write(f"# Диапазон заданного возбуждения: {params['X_start']}..{params['X_stop']} {unit}, "
+                f"шаг {params['X_step']} {unit}\n")
+        if excitation_type == 'current':
+            f.write(f"# Ограничение напряжения: {params['V_limit']} В\n")
         f.write(f"# Обе полярности сняты автоматически через плату реле (см. колонку Branch)\n")
         f.write(f"# Задержка установки: {params['delay']} с\n")
         f.write(f"# Задержка охлаждения: {params['cooling_delay']} с\n")

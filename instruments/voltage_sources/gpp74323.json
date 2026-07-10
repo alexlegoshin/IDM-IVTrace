@@ -1,0 +1,29 @@
+{
+    "model_name": "GW Instek GPP-74323",
+    "keywords": ["GPP-4323", "GPP4323"],
+    "source_type": "voltage",
+    "timeout": 5000,
+    "encoding": "utf-8",
+    "init_commands": [
+        "*RST"
+    ],
+    "channels": {
+        "primary": 1,
+        "secondary": 2
+    },
+    "tracking_series_command": "TRACK1",
+    "tracking_independent_command": "TRACK0",
+    "setup_commands": {
+        "voltage": "VSET{ch}:{voltage}",
+        "current_limit": "ISET{ch}:{current}"
+    },
+    "output_on": ":OUTPut{ch}:STATe ON",
+    "output_off": ":OUTPut{ch}:STATe OFF",
+    "all_output_on": "ALLOUTON",
+    "all_output_off": "ALLOUTOFF",
+    "measure_voltage_command": "VOUT{ch}?",
+    "measure_current_command": "IOUT{ch}?",
+    "max_voltage": 64.0,
+    "max_current_limit": 3.0,
+    "notes": "Каналы CH1(Master)+CH2(Slave) объединяются в tracking series без общей точки (TRACK1): суммарный диапазон 0-64В на клеммах CH1(+) и CH2(-). Управление напряжением/выходом в этом режиме — только через CH1 (master); CH2 задавать не нужно. Все команды и синтаксис проверены по GPP-Series_User_manual_EN_REVG_20240506.pdf (страницы 128, 133-135)."
+}

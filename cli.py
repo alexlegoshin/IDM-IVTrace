@@ -9,7 +9,7 @@ from config import ConfigManager
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="run.py",
-        description="IVtrace — автоматизация снятия амплитудной характеристики датчиков тока.",
+        description="IVtrace — автоматизация снятия амплитудной характеристики датчиков тока/напряжения.",
     )
     parser.add_argument(
         "--data-dir", type=Path, default=Path("data"),
@@ -22,11 +22,15 @@ def build_parser() -> argparse.ArgumentParser:
         "measure",
         help="Выполнить измерение амплитудной характеристики (обе полярности через реле)",
     )
-    p_measure.add_argument("--start", type=float, help="Начальный ток, А (обычно 0)")
-    p_measure.add_argument("--stop", type=float, help="Конечный ток, А")
-    p_measure.add_argument("--step", type=float, help="Шаг по току, А")
-    p_measure.add_argument("--vlimit", type=float, help="Ограничение напряжения на источнике, В")
-    p_measure.add_argument("--delay", type=float, help="Задержка на установку тока, с")
+    p_measure.add_argument(
+        "--excitation", choices=["current", "voltage"], default=None,
+        help="Тип возбуждения датчика: current (источник тока) или voltage (источник напряжения)",
+    )
+    p_measure.add_argument("--start", type=float, help="Начальное значение возбуждения (обычно 0)")
+    p_measure.add_argument("--stop", type=float, help="Конечное значение возбуждения")
+    p_measure.add_argument("--step", type=float, help="Шаг возбуждения")
+    p_measure.add_argument("--vlimit", type=float, help="Ограничение напряжения на источнике тока, В (не используется для источника напряжения)")
+    p_measure.add_argument("--delay", type=float, help="Задержка на установку возбуждения, с")
     p_measure.add_argument("--cool", type=float, help="Задержка на охлаждение между точками, с")
     p_measure.add_argument("--label", type=str, help="Комментарий (датчик, пометка)")
     p_measure.add_argument(
@@ -35,7 +39,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_measure.add_argument(
         "--src-addr", type=str, default=None,
-        help="VISA-адрес источника тока (пропустить автоопределение)",
+        help="VISA-адрес источника (пропустить автоопределение)",
     )
     p_measure.add_argument(
         "--relay-port", type=str, default=None,
@@ -68,35 +72,79 @@ def _prompt_float(prompt: str) -> float:
             print("Ошибка ввода: введите число. Попробуйте снова.")
 
 
+def _prompt_excitation_type() -> str:
+    while True:
+        choice = input("Тип возбуждения датчика — ток или напряжение? (current/voltage, c/v): ").strip().lower()
+        if choice in ('current', 'c', 'ток', 'т'):
+            return 'current'
+        if choice in ('voltage', 'v', 'напряжение', 'н'):
+            return 'voltage'
+        print("Введите 'current'/'c' или 'voltage'/'v'.")
+
+
 def resolve_measure_params(args, config_mgr: ConfigManager) -> dict:
     """
     Заполняет параметры измерения: сперва из аргументов командной строки,
     затем (если чего-то не хватает) — из сохранённого конфига или интерактивного ввода.
     Обновляет конфиг сохранёнными значениями.
 
-    Направление больше не запрашивается: плата реле сама выполняет проход
+    Тип возбуждения (ток/напряжение) запрашивается в первую очередь, так как
+    от него зависит, в какой папке искать конфиг источника (instruments/
+    current_sources или instruments/voltage_sources) и какие единицы
+    измерения использовать для X_start/X_stop/X_step.
+
+    Направление (ветвь) не запрашивается: плата реле сама выполняет проход
     в обе стороны (forward + reverse) в рамках одного запуска measure.
     """
     saved = config_mgr.load()
 
+    # --- excitation type — спрашиваем в первую очередь ---
+    excitation_type = args.excitation
+    if excitation_type is None:
+        last_excitation = saved.get('excitation_type') if saved else None
+        if last_excitation and args.yes:
+            # --yes означает "не спрашивать, использовать сохранённое, если есть"
+            excitation_type = last_excitation
+        elif last_excitation:
+            hint = 'ток' if last_excitation == 'current' else 'напряжение'
+            use_prev = input(f"Последний раз использовалось возбуждение: {hint}. Использовать снова? (y/n, по умолчанию y): ").strip().lower()
+            if use_prev != 'n':
+                excitation_type = last_excitation
+        if excitation_type is None:
+            excitation_type = _prompt_excitation_type()
+
+    unit = 'А' if excitation_type == 'current' else 'В'
+
     params = {
-        'I_start': args.start,
-        'I_stop': args.stop,
-        'I_step': args.step,
+        'excitation_type': excitation_type,
+        'X_start': args.start,
+        'X_stop': args.stop,
+        'X_step': args.step,
         'V_limit': args.vlimit,
         'delay': args.delay,
         'cooling_delay': args.cool,
         'label': args.label,
     }
 
-    numeric_keys = ['I_start', 'I_stop', 'I_step', 'V_limit', 'delay', 'cooling_delay']
+    # V_limit нужен только для источника тока (ограничение по напряжению).
+    # Для источника напряжения он не используется вовсе (см. measurement.py).
+    numeric_keys = ['X_start', 'X_stop', 'X_step', 'delay', 'cooling_delay']
+    if excitation_type == 'current':
+        numeric_keys.append('V_limit')
+    else:
+        params['V_limit'] = params['V_limit'] or 0.0  # не используется, но поле оставляем для совместимости CSV
+
     have_all_numeric = all(params[k] is not None for k in numeric_keys)
 
+    # Подсказки из сохранённого конфига валидны только если тип возбуждения совпадает
+    saved_matches_excitation = bool(saved) and saved.get('excitation_type') == excitation_type
+
     if not have_all_numeric:
-        if saved and not args.yes:
+        if saved_matches_excitation and not args.yes:
             print("\nНайдены сохранённые параметры:")
-            print(f"  Ток: {saved.get('I_start')} → {saved.get('I_stop')} А, шаг {saved.get('I_step')} А")
-            print(f"  Ограничение напряжения: {saved.get('V_limit')} В")
+            print(f"  Возбуждение ({unit}): {saved.get('X_start')} → {saved.get('X_stop')}, шаг {saved.get('X_step')} {unit}")
+            if excitation_type == 'current':
+                print(f"  Ограничение напряжения: {saved.get('V_limit')} В")
             print(f"  Задержка на установку: {saved.get('delay')} с")
             print(f"  Задержка на охлаждение: {saved.get('cooling_delay')} с")
             print(f"  Последний комментарий: {saved.get('label', '')}")
@@ -109,16 +157,16 @@ def resolve_measure_params(args, config_mgr: ConfigManager) -> dict:
         # Если всё ещё чего-то не хватает — спрашиваем интерактивно
         if not all(params[k] is not None for k in numeric_keys):
             print("\n=== Настройка измерения ===")
-            if params['I_start'] is None:
-                params['I_start'] = _prompt_float("Начальный ток (А): ")
-            if params['I_stop'] is None:
-                params['I_stop'] = _prompt_float("Конечный ток (А): ")
-            if params['I_step'] is None:
-                params['I_step'] = _prompt_float("Шаг по току (А): ")
-            if params['V_limit'] is None:
+            if params['X_start'] is None:
+                params['X_start'] = _prompt_float(f"Начальное значение возбуждения ({unit}): ")
+            if params['X_stop'] is None:
+                params['X_stop'] = _prompt_float(f"Конечное значение возбуждения ({unit}): ")
+            if params['X_step'] is None:
+                params['X_step'] = _prompt_float(f"Шаг возбуждения ({unit}): ")
+            if excitation_type == 'current' and params['V_limit'] is None:
                 params['V_limit'] = _prompt_float("Ограничение напряжения на источнике (В): ")
             if params['delay'] is None:
-                params['delay'] = _prompt_float("Задержка на установку тока (с): ")
+                params['delay'] = _prompt_float("Задержка на установку возбуждения (с): ")
             if params['cooling_delay'] is None:
                 params['cooling_delay'] = _prompt_float("Задержка на охлаждение между точками (с): ")
 
@@ -137,7 +185,7 @@ def resolve_measure_params(args, config_mgr: ConfigManager) -> dict:
 
 def make_csv_filename(data_dir: Path, label: str) -> Path:
     """
-    Имя файла больше не содержит ветвь (positive/negative) — один CSV теперь
+    Имя файла не содержит ветвь (positive/negative) — один CSV теперь
     содержит обе полярности, а различие фиксируется в колонке Branch.
     """
     label_safe = re.sub(r'[^a-zA-Z0-9_\- ]', '', label).replace(' ', '_') if label else 'nolabel'

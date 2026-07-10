@@ -112,6 +112,74 @@ class CurrentSource:
             pass
 
 
+class VoltageSource:
+    """
+    Обёртка над программируемым источником напряжения (GW Instek GPP-серия),
+    работающим в режиме Tracking Series (CH1 master + CH2 slave, без общей
+    точки) для получения объединённого диапазона 0..64В.
+
+    Все команды соответствуют официальной документации GW Instek
+    (GPP-Series_User_manual_EN_REVG_20240506.pdf, стр. 128, 133-135):
+      TRACK1               — включить tracking series
+      VSET<x>:<value>      — задать напряжение канала x (используется CH1=master)
+      ISET<x>:<value>      — задать токоограничение канала x
+      :OUTPut<x>:STATe ON  — включить выход канала x
+      VOUT<x>? / IOUT<x>?  — измеренные (фактические) значения канала x
+
+    ВАЖНО: IDN? прибора этой серии возвращает модель БЕЗ ведущей цифры,
+    например GPP-74323 представляется как "GPP-4323".
+    """
+
+    def __init__(self, resource_addr: str, config_path: Path, rm: Optional[pyvisa.ResourceManager] = None):
+        self.config = json.loads(Path(config_path).read_text(encoding='utf-8'))
+        self.rm = rm or pyvisa.ResourceManager()
+        self.instr = self.rm.open_resource(resource_addr)
+        self.instr.encoding = self.config.get('encoding', 'utf-8')
+        self.instr.timeout = self.config.get('timeout', 5000)
+        self.primary_ch = self.config.get('channels', {}).get('primary', 1)
+        self._init_device()
+
+    def _init_device(self):
+        for cmd in self.config['init_commands']:
+            self.instr.write(cmd)
+            time.sleep(0.5 if cmd.strip() == '*RST' else 0.1)
+        # Объединяем CH1(master)+CH2(slave) в tracking series: 0..64В на
+        # клеммах CH1(+) и CH2(-), без общей точки. Управление — только
+        # через CH1 (master); CH2 в этом режиме недоступен для настройки.
+        self.instr.write(self.config['tracking_series_command'])
+        time.sleep(0.2)
+
+    def setup(self, voltage_limit: float, current_limit: float = 1.0):
+        """
+        voltage_limit здесь — это максимальное напряжение цикла измерения
+        (V_stop), current_limit — ограничение по току (защита источника,
+        не путать с уставкой самого измерения).
+        """
+        cmds = self.config['setup_commands']
+        self.instr.write(cmds['current_limit'].format(ch=self.primary_ch, current=current_limit))
+        self.instr.write(cmds['voltage'].format(ch=self.primary_ch, voltage=0))
+
+    def set_voltage(self, voltage: float):
+        cmd = self.config['setup_commands']['voltage'].format(ch=self.primary_ch, voltage=voltage)
+        self.instr.write(cmd)
+
+    def output_on(self):
+        self.instr.write(self.config['output_on'].format(ch=self.primary_ch))
+
+    def output_off(self):
+        self.instr.write(self.config['output_off'].format(ch=self.primary_ch))
+
+    def shutdown(self):
+        self.set_voltage(0)
+        self.output_off()
+
+    def close(self):
+        try:
+            self.instr.close()
+        except Exception:
+            pass
+
+
 def find_config_for_idn(idn: str, config_dir: Path) -> Optional[Path]:
     """Ищет json-конфиг в config_dir (нерекурсивно), у которого keywords встречаются в строке IDN."""
     for json_file in sorted(Path(config_dir).glob("*.json")):
@@ -127,10 +195,12 @@ def discover_instruments(
     source_dir: Path,
     rm: Optional[pyvisa.ResourceManager] = None,
     query_timeout: int = 3000,
+    source_label: str = "источник",
 ) -> Tuple[str, Path, str, Path]:
     """
     Перебирает все доступные VISA-ресурсы, опрашивает *IDN? и сопоставляет
-    каждый ответ с json-конфигами мультиметров и источников тока.
+    каждый ответ с json-конфигами мультиметров и источников (тип источника —
+    ток или напряжение — определяется тем, какая source_dir передана).
 
     Возвращает (dmm_addr, dmm_config_path, src_addr, src_config_path).
     Бросает RuntimeError, если один из приборов не найден.
@@ -172,12 +242,12 @@ def discover_instruments(
         if not dmm_addr:
             missing.append("мультиметр")
         if not src_addr:
-            missing.append("источник тока")
+            missing.append(source_label)
         raise RuntimeError(
             f"Не удалось обнаружить: {', '.join(missing)}. Проверьте список ресурсов выше и json-конфиги."
         )
 
-    print(f"\nМультиметр:    {dmm_addr}  ({dmm_cfg.stem})")
-    print(f"Источник тока: {src_addr}  ({src_cfg.stem})\n")
+    print(f"\nМультиметр: {dmm_addr}  ({dmm_cfg.stem})")
+    print(f"{source_label.capitalize()}: {src_addr}  ({src_cfg.stem})\n")
 
     return dmm_addr, dmm_cfg, src_addr, src_cfg
