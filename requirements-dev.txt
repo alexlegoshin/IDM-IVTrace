@@ -1,0 +1,3 @@
+# Дополнительно к рантайму — для сборки portable-exe.
+-r requirements.txt
+pyinstaller

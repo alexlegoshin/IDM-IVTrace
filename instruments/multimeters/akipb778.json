@@ -6,8 +6,9 @@
     "init_commands": [
         "*RST",
         "SENS:FUNC \"CURR:DC\"",
-        "SENS:CURR:DC:NPLC 1"
+        "SENS:CURR:DC:NPLC 1",
+        "SENS:CURR:DC:RANG:AUTO OFF"
     ],
-    "measure_command": "MEAS:CURR:DC?",
+    "measure_command": "READ?",
     "ranges": [0.01, 0.1, 1.0, 3.0]
 }

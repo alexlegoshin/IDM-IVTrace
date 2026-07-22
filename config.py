@@ -5,7 +5,9 @@ from pathlib import Path
 class ConfigManager:
     """
     Отвечает за чтение/запись JSON-конфига с параметрами последнего измерения
-    (I_start, I_stop, I_step, V_limit, delay, cooling_delay, label, direction).
+    (excitation_type, X_start, X_stop, X_step, V_limit, delay, cooling_delay,
+    label). Направление (forward/reverse) не хранится — обе ветви снимаются
+    автоматически через плату реле в рамках одного запуска measure.
 
     Ничего не знает про приборы — просто key-value хранилище на диске.
     """

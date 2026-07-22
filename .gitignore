@@ -1,0 +1,17 @@
+# Артефакты сборки PyInstaller
+/build/
+/dist/
+*.manifest
+
+# Пользовательские данные измерений
+/data/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Виртуальные окружения
+.venv/
+venv/

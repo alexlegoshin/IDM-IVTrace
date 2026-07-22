@@ -40,7 +40,8 @@ def _read_metadata(csv_path: Path) -> dict:
     return metadata
 
 
-def load_and_analyze(latest_csv: Path, I_nom: float, X: float, save_png: bool = True) -> dict:
+def load_and_analyze(latest_csv: Path, I_nom: float, X: float, save_png: bool = True,
+                     show: bool = False, close_fig: bool = True) -> dict:
     """
     Читает CSV с результатами измерения, считает приведённую погрешность
     относительно ожидаемого выходного тока датчика (коэффициент 1:X),
@@ -168,7 +169,13 @@ def load_and_analyze(latest_csv: Path, I_nom: float, X: float, save_png: bool = 
         png_path = latest_csv.with_suffix('.png')
         plt.savefig(png_path, dpi=150, bbox_inches='tight')
 
-    plt.close(fig)
+    if show:
+        plt.show()
+
+    # close_fig=False используется GUI, чтобы встроить фигуру в окно
+    # (FigureCanvasTkAgg); в этом случае ответственность за close — на вызове.
+    if close_fig:
+        plt.close(fig)
 
     branches_present = sorted(df['Branch'].unique().tolist())
 
@@ -187,5 +194,6 @@ def load_and_analyze(latest_csv: Path, I_nom: float, X: float, save_png: bool = 
         'max_error_percent': float(df['Error_percent'].max()),
         'mean_error_percent': float(df['Error_percent'].mean()),
         'dataframe': df,
+        'figure': None if close_fig else fig,
     }
     return stats

@@ -6,16 +6,34 @@ from pathlib import Path
 from config import ConfigManager
 
 
-def build_parser() -> argparse.ArgumentParser:
+def build_parser(default_data_dir: Path = Path("data")) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="run.py",
-        description="IVtrace — автоматизация снятия амплитудной характеристики датчиков тока/напряжения.",
+        prog="IVTrace",
+        description="IVtrace — автоматизация снятия амплитудной характеристики датчиков тока/напряжения. "
+                    "Без аргументов запускается графический интерфейс (GUI).",
     )
     parser.add_argument(
-        "--data-dir", type=Path, default=Path("data"),
-        help="Каталог для хранения CSV/PNG и конфига (по умолчанию: ./data)",
+        "--data-dir", type=Path, default=default_data_dir,
+        help="Каталог для хранения CSV/PNG и конфига (по умолчанию: ./data рядом с программой)",
     )
-    subparsers = parser.add_subparsers(dest="command", required=True)
+    parser.add_argument(
+        "--skip-selftest", action="store_true",
+        help="Пропустить предполётные самотесты (НЕ рекомендуется: тесты защищают оборудование от повреждения при поломке кода)",
+    )
+    # required=False: без подкоманды запускается GUI (см. run.main).
+    subparsers = parser.add_subparsers(dest="command", required=False)
+
+    # ---------------- gui ----------------
+    subparsers.add_parser(
+        "gui",
+        help="Запустить графический интерфейс (то же, что запуск без аргументов)",
+    )
+
+    # ---------------- selftest ----------------
+    subparsers.add_parser(
+        "selftest",
+        help="Прогнать виртуальные самотесты и проверку NI-VISA, вывести отчёт и выйти",
+    )
 
     # ---------------- measure ----------------
     p_measure = subparsers.add_parser(
@@ -64,12 +82,41 @@ def build_parser() -> argparse.ArgumentParser:
 # Интерактивный ввод параметров measure (с подсказками из сохранённого конфига)
 # ----------------------------------------------------------------------
 
-def _prompt_float(prompt: str) -> float:
+def validate_measure_params(params: dict, excitation_type: str) -> list:
+    """
+    Проверяет числовые параметры измерения. Возвращает список текстовых
+    описаний ошибок (пустой — если всё в порядке). Используется и в CLI
+    (resolve_measure_params), и в GUI, чтобы правила были едиными.
+
+    Защищает от X_step<=0 (деление на ноль в measurement.py) и
+    X_stop < X_start (пустой проход измерения), а также от отрицательных
+    задержек и неположительного V_limit для источника тока.
+    """
+    errors = []
+    if params.get('X_step') is None or params['X_step'] <= 0:
+        errors.append("Шаг возбуждения должен быть положительным числом.")
+    if params.get('X_start') is None or params.get('X_stop') is None or params['X_stop'] < params['X_start']:
+        errors.append("Конечное значение должно быть не меньше начального.")
+    if params.get('delay') is not None and params['delay'] < 0:
+        errors.append("Задержка на установку не может быть отрицательной.")
+    if params.get('cooling_delay') is not None and params['cooling_delay'] < 0:
+        errors.append("Задержка на охлаждение не может быть отрицательной.")
+    if excitation_type == 'current' and (params.get('V_limit') is None or params['V_limit'] <= 0):
+        errors.append("Ограничение напряжения должно быть положительным числом.")
+    return errors
+
+
+def _prompt_float(prompt: str, validator=None, error_msg: str = None) -> float:
     while True:
         try:
-            return float(input(prompt))
+            value = float(input(prompt))
         except ValueError:
             print("Ошибка ввода: введите число. Попробуйте снова.")
+            continue
+        if validator is not None and not validator(value):
+            print(error_msg or "Недопустимое значение. Попробуйте снова.")
+            continue
+        return value
 
 
 def _prompt_excitation_type() -> str:
@@ -160,15 +207,43 @@ def resolve_measure_params(args, config_mgr: ConfigManager) -> dict:
             if params['X_start'] is None:
                 params['X_start'] = _prompt_float(f"Начальное значение возбуждения ({unit}): ")
             if params['X_stop'] is None:
-                params['X_stop'] = _prompt_float(f"Конечное значение возбуждения ({unit}): ")
+                params['X_stop'] = _prompt_float(
+                    f"Конечное значение возбуждения ({unit}): ",
+                    validator=lambda v: v >= params['X_start'],
+                    error_msg=f"Конечное значение должно быть не меньше начального ({params['X_start']} {unit}).",
+                )
             if params['X_step'] is None:
-                params['X_step'] = _prompt_float(f"Шаг возбуждения ({unit}): ")
+                params['X_step'] = _prompt_float(
+                    f"Шаг возбуждения ({unit}): ",
+                    validator=lambda v: v > 0,
+                    error_msg="Шаг возбуждения должен быть положительным числом.",
+                )
             if excitation_type == 'current' and params['V_limit'] is None:
-                params['V_limit'] = _prompt_float("Ограничение напряжения на источнике (В): ")
+                params['V_limit'] = _prompt_float(
+                    "Ограничение напряжения на источнике (В): ",
+                    validator=lambda v: v > 0,
+                    error_msg="Ограничение напряжения должно быть положительным числом.",
+                )
             if params['delay'] is None:
-                params['delay'] = _prompt_float("Задержка на установку возбуждения (с): ")
+                params['delay'] = _prompt_float(
+                    "Задержка на установку возбуждения (с): ",
+                    validator=lambda v: v >= 0,
+                    error_msg="Задержка не может быть отрицательной.",
+                )
             if params['cooling_delay'] is None:
-                params['cooling_delay'] = _prompt_float("Задержка на охлаждение между точками (с): ")
+                params['cooling_delay'] = _prompt_float(
+                    "Задержка на охлаждение между точками (с): ",
+                    validator=lambda v: v >= 0,
+                    error_msg="Задержка не может быть отрицательной.",
+                )
+
+    # Финальная проверка — покрывает и значения из --флагов/сохранённого
+    # конфига (не проходившие через интерактивные валидаторы выше), и
+    # защищает от X_step=0 (деление на ноль в measurement.py) и
+    # X_stop < X_start (пустой проход измерения).
+    errors = validate_measure_params(params, excitation_type)
+    if errors:
+        raise ValueError("Некорректные параметры измерения:\n  " + "\n  ".join(errors))
 
     # --- label ---
     if params['label'] is None:

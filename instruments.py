@@ -30,6 +30,11 @@ class Multimeter:
         self.instr.write(f'SENS:CURR:DC:RANG {range_val}')
 
     def measure_current(self) -> float:
+        # measure_command должен быть 'READ?' (или 'FETC?'), а не 'MEAS:CURR:DC?':
+        # MEAS?/CONF? по SCPI переконфигурируют прибор и сбрасывают диапазон
+        # обратно в AUTO при каждом вызове, из-за чего set_range()/auto_range()
+        # ниже становятся no-op. READ? использует уже выставленную конфигурацию
+        # (функция, NPLC, диапазон), не трогая её.
         cmd = self.config['measure_command']
         return float(self.instr.query(cmd))
 
@@ -151,9 +156,12 @@ class VoltageSource:
 
     def setup(self, voltage_limit: float, current_limit: float = 1.0):
         """
-        voltage_limit здесь — это максимальное напряжение цикла измерения
-        (V_stop), current_limit — ограничение по току (защита источника,
-        не путать с уставкой самого измерения).
+        voltage_limit принимается для единообразия вызова с CurrentSource.setup()
+        (measurement.py вызывает src.setup(voltage_limit=...) для обоих типов
+        источника), но сейчас не используется: в конфиге GPP-серии нет
+        отдельной команды OVP/предела по напряжению — сама уставка (VSET)
+        каждый раз ограничена X_stop. current_limit — реальное ограничение
+        по току (защита источника через ISET).
         """
         cmds = self.config['setup_commands']
         self.instr.write(cmds['current_limit'].format(ch=self.primary_ch, current=current_limit))

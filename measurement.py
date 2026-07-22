@@ -1,6 +1,7 @@
+import math
 import time
 from datetime import datetime
-from typing import List, Dict, Union
+from typing import Callable, List, Dict, Optional, Union
 
 import pyvisa
 
@@ -21,7 +22,8 @@ def _measure_branch(dmm: DMM, src: Union[CurrentSource, VoltageSource],
                      X_start: float, X_stop: float, X_step: float,
                      delay: float, cooling_delay: float,
                      sign: int, branch_name: str,
-                     range_reset: bool = False) -> List[Dict]:
+                     range_reset: bool = False,
+                     should_stop: Optional[Callable[[], bool]] = None) -> List[Dict]:
     """
     Выполняет один проход измерения (0..X_max) для уже установленного реле
     (направление задаётся снаружи через relay.forward()/reverse()).
@@ -30,6 +32,11 @@ def _measure_branch(dmm: DMM, src: Union[CurrentSource, VoltageSource],
     ток (src.set_current) или напряжение (src.set_voltage). Измеряемая
     датчиком величина всегда ток (см. измерение в run_measurement).
     sign используется только для записи знака в X_set.
+
+    should_stop — необязательный колбэк без аргументов; если он возвращает
+    True, проход прерывается между точками (источник уже выключен на
+    предыдущем шаге). Используется GUI для кнопки «Стоп»; при None (по
+    умолчанию, как в CLI) поведение прежнее.
     """
     num_steps = int(round((X_stop - X_start) / X_step)) + 1
     results = []
@@ -41,6 +48,10 @@ def _measure_branch(dmm: DMM, src: Union[CurrentSource, VoltageSource],
         dmm.set_range(dmm.ranges[dmm.current_range_idx])
 
     for step in range(num_steps):
+        if should_stop is not None and should_stop():
+            print(f"  [{branch_name}] Остановка по запросу пользователя.")
+            break
+
         abs_value = X_start + step * X_step
         signed_value = abs_value * sign
 
@@ -68,8 +79,15 @@ def _measure_branch(dmm: DMM, src: Union[CurrentSource, VoltageSource],
             except Exception:
                 pass
 
-        i_avg = sum(currents) / len(currents) if currents else 0.0
-        dmm.auto_range(i_avg, is_first=(step == 0))
+        if currents:
+            i_avg = sum(currents) / len(currents)
+            dmm.auto_range(i_avg, is_first=(step == 0))
+        else:
+            # Все попытки чтения провалились — точку помечаем NaN, а не
+            # тихим нулём, чтобы не выдать сбой связи за реальный провал
+            # характеристики. auto_range не трогаем: нет данных, по которым
+            # выбирать диапазон.
+            i_avg = math.nan
 
         src.output_off()
         time.sleep(cooling_delay)
@@ -90,7 +108,8 @@ def _measure_branch(dmm: DMM, src: Union[CurrentSource, VoltageSource],
 def run_measurement(dmm: DMM, src: Union[CurrentSource, VoltageSource], relay: RelayController,
                      excitation_type: str,
                      X_start: float, X_stop: float, X_step: float,
-                     V_limit: float, delay: float, cooling_delay: float) -> List[Dict]:
+                     V_limit: float, delay: float, cooling_delay: float,
+                     should_stop: Optional[Callable[[], bool]] = None) -> List[Dict]:
     """
     Полный двусторонний цикл измерения амплитудной характеристики датчика тока
     с автоматическим переключением полярности через плату реле:
@@ -126,15 +145,19 @@ def run_measurement(dmm: DMM, src: Union[CurrentSource, VoltageSource], relay: R
         print(f"  Ответ реле: {resp}")
         results += _measure_branch(
             dmm, src, excitation_type, X_start, X_stop, X_step, delay, cooling_delay,
-            sign=+1, branch_name='forward',
+            sign=+1, branch_name='forward', should_stop=should_stop,
         )
+
+        if should_stop is not None and should_stop():
+            print("\nИзмерение прервано пользователем до обратной ветви.")
+            return results
 
         print("\nПереключаю реле: обратное направление (IRW)...")
         resp = relay.reverse()
         print(f"  Ответ реле: {resp}")
         results += _measure_branch(
             dmm, src, excitation_type, X_start, X_stop, X_step, delay, cooling_delay,
-            sign=-1, branch_name='reverse', range_reset=True,
+            sign=-1, branch_name='reverse', range_reset=True, should_stop=should_stop,
         )
     finally:
         src.shutdown()
