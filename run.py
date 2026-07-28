@@ -29,7 +29,7 @@ import sys
 
 from apppaths import default_data_dir
 from cli import build_parser, resolve_measure_params, make_csv_filename
-from config import ConfigManager
+from config import ConfigManager, SensorConfigManager
 from analysis import load_and_analyze, find_latest_csv
 
 

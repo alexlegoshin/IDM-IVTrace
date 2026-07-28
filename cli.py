@@ -20,7 +20,6 @@ def build_parser(default_data_dir: Path = Path("data")) -> argparse.ArgumentPars
         "--skip-selftest", action="store_true",
         help="Пропустить предполётные самотесты (НЕ рекомендуется: тесты защищают оборудование от повреждения при поломке кода)",
     )
-    # required=False: без подкоманды запускается GUI (см. run.main).
     subparsers = parser.add_subparsers(dest="command", required=False)
 
     # ---------------- gui ----------------
@@ -68,6 +67,40 @@ def build_parser(default_data_dir: Path = Path("data")) -> argparse.ArgumentPars
         help="Не спрашивать подтверждения, использовать сохранённые/переданные параметры без диалога",
     )
 
+    # --- Новые параметры ---
+    p_measure.add_argument(
+        "--inom", type=float, default=None,
+        help="Номинальный первичный ток датчика, А",
+    )
+    p_measure.add_argument(
+        "--ratio", type=float, default=None,
+        help="Коэффициент преобразования 1:X (передать X)",
+    )
+    p_measure.add_argument(
+        "--error-threshold", type=float, default=None,
+        help="Порог погрешности для досрочной остановки, % (по умолчанию 1.0)",
+    )
+    p_measure.add_argument(
+        "--stop-on-error", action="store_true",
+        help="Остановить измерение при превышении порога погрешности",
+    )
+    p_measure.add_argument(
+        "--no-relay", action="store_true",
+        help="Измерять без реле (одна полярность)",
+    )
+    p_measure.add_argument(
+        "--invert-input", action="store_true",
+        help="Инвертировать входные значения (если перепутана полярность)",
+    )
+    p_measure.add_argument(
+        "--save-config", type=str, default=None,
+        help="Сохранить текущие параметры как конфиг датчика с указанным именем",
+    )
+    p_measure.add_argument(
+        "--load-config", type=str, default=None,
+        help="Загрузить параметры из конфига датчика",
+    )
+
     # ---------------- analyze ----------------
     p_analyze = subparsers.add_parser("analyze", help="Построить график и рассчитать погрешность по последнему CSV")
     p_analyze.add_argument("--file", type=Path, default=None, help="Путь к конкретному CSV (по умолчанию — последний в data-dir)")
@@ -83,15 +116,6 @@ def build_parser(default_data_dir: Path = Path("data")) -> argparse.ArgumentPars
 # ----------------------------------------------------------------------
 
 def validate_measure_params(params: dict, excitation_type: str) -> list:
-    """
-    Проверяет числовые параметры измерения. Возвращает список текстовых
-    описаний ошибок (пустой — если всё в порядке). Используется и в CLI
-    (resolve_measure_params), и в GUI, чтобы правила были едиными.
-
-    Защищает от X_step<=0 (деление на ноль в measurement.py) и
-    X_stop < X_start (пустой проход измерения), а также от отрицательных
-    задержек и неположительного V_limit для источника тока.
-    """
     errors = []
     if params.get('X_step') is None or params['X_step'] <= 0:
         errors.append("Шаг возбуждения должен быть положительным числом.")
@@ -129,28 +153,31 @@ def _prompt_excitation_type() -> str:
         print("Введите 'current'/'c' или 'voltage'/'v'.")
 
 
-def resolve_measure_params(args, config_mgr: ConfigManager) -> dict:
+def resolve_measure_params(args, config_mgr: ConfigManager, sensor_config_mgr=None) -> dict:
     """
     Заполняет параметры измерения: сперва из аргументов командной строки,
     затем (если чего-то не хватает) — из сохранённого конфига или интерактивного ввода.
     Обновляет конфиг сохранёнными значениями.
 
-    Тип возбуждения (ток/напряжение) запрашивается в первую очередь, так как
-    от него зависит, в какой папке искать конфиг источника (instruments/
-    current_sources или instruments/voltage_sources) и какие единицы
-    измерения использовать для X_start/X_stop/X_step.
-
-    Направление (ветвь) не запрашивается: плата реле сама выполняет проход
-    в обе стороны (forward + reverse) в рамках одного запуска measure.
+    Если указан --load-config, параметры загружаются из указанного конфига.
+    Если указан --save-config, после заполнения параметры сохраняются в конфиг.
     """
     saved = config_mgr.load()
+    loaded = {}
+
+    # Загрузка конфига датчика, если указан
+    if args.load_config and sensor_config_mgr:
+        loaded = sensor_config_mgr.load_sensor_config(args.load_config) or {}
+        if loaded:
+            print(f"Конфиг датчика '{args.load_config}' загружен.")
+        else:
+            print(f"Предупреждение: конфиг '{args.load_config}' не найден или повреждён.")
 
     # --- excitation type — спрашиваем в первую очередь ---
-    excitation_type = args.excitation
+    excitation_type = args.excitation or loaded.get('excitation_type')
     if excitation_type is None:
         last_excitation = saved.get('excitation_type') if saved else None
         if last_excitation and args.yes:
-            # --yes означает "не спрашивать, использовать сохранённое, если есть"
             excitation_type = last_excitation
         elif last_excitation:
             hint = 'ток' if last_excitation == 'current' else 'напряжение'
@@ -162,32 +189,38 @@ def resolve_measure_params(args, config_mgr: ConfigManager) -> dict:
 
     unit = 'А' if excitation_type == 'current' else 'В'
 
+    # Формируем словарь параметров: приоритет — аргументы командной строки, затем загруженный конфиг, затем сохранённый
     params = {
         'excitation_type': excitation_type,
-        'X_start': args.start,
-        'X_stop': args.stop,
-        'X_step': args.step,
-        'V_limit': args.vlimit,
-        'delay': args.delay,
-        'cooling_delay': args.cool,
-        'label': args.label,
+        'X_start': args.start if args.start is not None else loaded.get('X_start'),
+        'X_stop': args.stop if args.stop is not None else loaded.get('X_stop'),
+        'X_step': args.step if args.step is not None else loaded.get('X_step'),
+        'V_limit': args.vlimit if args.vlimit is not None else loaded.get('V_limit'),
+        'delay': args.delay if args.delay is not None else loaded.get('delay'),
+        'cooling_delay': args.cool if args.cool is not None else loaded.get('cooling_delay'),
+        'label': args.label if args.label is not None else loaded.get('label'),
+        # Новые параметры
+        'I_nom': args.inom if args.inom is not None else loaded.get('I_nom'),
+        'ratio': args.ratio if args.ratio is not None else loaded.get('ratio'),
+        'error_threshold': args.error_threshold if args.error_threshold is not None else loaded.get('error_threshold', 1.0),
+        'stop_on_error': args.stop_on_error or loaded.get('stop_on_error', False),
+        'use_relay': not args.no_relay if args.no_relay is not None else loaded.get('use_relay', True),
+        'invert_input': args.invert_input or loaded.get('invert_input', False),
     }
 
-    # V_limit нужен только для источника тока (ограничение по напряжению).
-    # Для источника напряжения он не используется вовсе (см. measurement.py).
+    # Для источника напряжения V_limit не используется
+    if excitation_type == 'voltage':
+        params['V_limit'] = 0.0
+
     numeric_keys = ['X_start', 'X_stop', 'X_step', 'delay', 'cooling_delay']
     if excitation_type == 'current':
         numeric_keys.append('V_limit')
-    else:
-        params['V_limit'] = params['V_limit'] or 0.0  # не используется, но поле оставляем для совместимости CSV
 
     have_all_numeric = all(params[k] is not None for k in numeric_keys)
-
-    # Подсказки из сохранённого конфига валидны только если тип возбуждения совпадает
     saved_matches_excitation = bool(saved) and saved.get('excitation_type') == excitation_type
 
     if not have_all_numeric:
-        if saved_matches_excitation and not args.yes:
+        if saved_matches_excitation and not args.yes and not loaded:
             print("\nНайдены сохранённые параметры:")
             print(f"  Возбуждение ({unit}): {saved.get('X_start')} → {saved.get('X_stop')}, шаг {saved.get('X_step')} {unit}")
             if excitation_type == 'current':
@@ -237,13 +270,19 @@ def resolve_measure_params(args, config_mgr: ConfigManager) -> dict:
                     error_msg="Задержка не может быть отрицательной.",
                 )
 
-    # Финальная проверка — покрывает и значения из --флагов/сохранённого
-    # конфига (не проходившие через интерактивные валидаторы выше), и
-    # защищает от X_step=0 (деление на ноль в measurement.py) и
-    # X_stop < X_start (пустой проход измерения).
-    errors = validate_measure_params(params, excitation_type)
-    if errors:
-        raise ValueError("Некорректные параметры измерения:\n  " + "\n  ".join(errors))
+    # Запрашиваем I_nom и ratio, если они не заданы и не загружены
+    if params['I_nom'] is None:
+        params['I_nom'] = _prompt_float(
+            "Номинальный первичный ток датчика (А): ",
+            validator=lambda v: v > 0,
+            error_msg="Номинальный ток должен быть положительным числом.",
+        )
+    if params['ratio'] is None:
+        params['ratio'] = _prompt_float(
+            "Коэффициент преобразования 1:X (передайте X): ",
+            validator=lambda v: v > 0,
+            error_msg="Коэффициент должен быть положительным числом.",
+        )
 
     # --- label ---
     if params['label'] is None:
@@ -252,6 +291,16 @@ def resolve_measure_params(args, config_mgr: ConfigManager) -> dict:
         label = input(f"Комментарий (датчик, пометка){hint}: ").strip()
         params['label'] = label if label else last_label
 
+    # Финальная проверка
+    errors = validate_measure_params(params, excitation_type)
+    if errors:
+        raise ValueError("Некорректные параметры измерения:\n  " + "\n  ".join(errors))
+
+    # Сохраняем конфиг датчика, если указано
+    if args.save_config and sensor_config_mgr:
+        sensor_config_mgr.save_sensor_config(args.save_config, params)
+        print(f"Конфиг датчика сохранён как '{args.save_config}'.")
+
     # Сохраняем итоговые параметры для следующего запуска
     config_mgr.save(params)
 
@@ -259,10 +308,6 @@ def resolve_measure_params(args, config_mgr: ConfigManager) -> dict:
 
 
 def make_csv_filename(data_dir: Path, label: str) -> Path:
-    """
-    Имя файла не содержит ветвь (positive/negative) — один CSV теперь
-    содержит обе полярности, а различие фиксируется в колонке Branch.
-    """
     label_safe = re.sub(r'[^a-zA-Z0-9_\- ]', '', label).replace(' ', '_') if label else 'nolabel'
     timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
     return data_dir / f"IVtrace_{label_safe}_{timestamp_str}.csv"

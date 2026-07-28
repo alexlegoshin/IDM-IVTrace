@@ -1,7 +1,7 @@
 import math
 import time
 from datetime import datetime
-from typing import Callable, List, Dict, Optional, Union
+from typing import Callable, List, Dict, Optional, Union, Tuple
 
 import pyvisa
 
@@ -23,27 +23,25 @@ def _measure_branch(dmm: DMM, src: Union[CurrentSource, VoltageSource],
                      delay: float, cooling_delay: float,
                      sign: int, branch_name: str,
                      range_reset: bool = False,
-                     should_stop: Optional[Callable[[], bool]] = None) -> List[Dict]:
+                     should_stop: Optional[Callable[[], bool]] = None,
+                     # Новые параметры для контроля погрешности и инверсии
+                     I_nom: Optional[float] = None,
+                     ratio: Optional[float] = None,
+                     stop_on_error: bool = False,
+                     error_threshold: float = 1.0,
+                     invert_input: bool = False,
+                     log_callback: Optional[Callable[[str], None]] = None) -> Tuple[List[Dict], Optional[str]]:
     """
-    Выполняет один проход измерения (0..X_max) для уже установленного реле
-    (направление задаётся снаружи через relay.forward()/reverse()).
+    Выполняет один проход измерения (0..X_max) для уже установленного реле.
 
-    excitation_type определяет, что именно выставляется на источнике —
-    ток (src.set_current) или напряжение (src.set_voltage). Измеряемая
-    датчиком величина всегда ток (см. измерение в run_measurement).
-    sign используется только для записи знака в X_set.
-
-    should_stop — необязательный колбэк без аргументов; если он возвращает
-    True, проход прерывается между точками (источник уже выключен на
-    предыдущем шаге). Используется GUI для кнопки «Стоп»; при None (по
-    умолчанию, как в CLI) поведение прежнее.
+    Возвращает (results, aborted_reason), где aborted_reason — строка с причиной
+    прерывания (если цикл был остановлен из-за превышения погрешности) или None.
     """
     num_steps = int(round((X_stop - X_start) / X_step)) + 1
     results = []
+    aborted_reason = None
 
     if range_reset:
-        # При смене направления датчик перемагничивается заново, поэтому
-        # выбор диапазона вольтметра лучше начать заново с первой точки.
         dmm.current_range_idx = len(dmm.ranges) - 1
         dmm.set_range(dmm.ranges[dmm.current_range_idx])
 
@@ -83,52 +81,66 @@ def _measure_branch(dmm: DMM, src: Union[CurrentSource, VoltageSource],
             i_avg = sum(currents) / len(currents)
             dmm.auto_range(i_avg, is_first=(step == 0))
         else:
-            # Все попытки чтения провалились — точку помечаем NaN, а не
-            # тихим нулём, чтобы не выдать сбой связи за реальный провал
-            # характеристики. auto_range не трогаем: нет данных, по которым
-            # выбирать диапазон.
             i_avg = math.nan
 
         src.output_off()
         time.sleep(cooling_delay)
 
+        # Проверка погрешности в реальном времени
+        if stop_on_error and ratio and ratio > 0 and not math.isnan(i_avg):
+            # Ожидаемый выходной ток: I_expected = abs(X_set) / ratio
+            X_abs = abs(signed_value)
+            if X_abs > 0:
+                I_expected = X_abs / ratio
+                error_percent = abs((i_avg - I_expected) / I_expected) * 100.0
+                if error_percent > error_threshold:
+                    aborted_reason = (f"Погрешность {error_percent:.2f}% превысила порог {error_threshold}% "
+                                      f"на X_set = {signed_value:.4f} {EXCITATION_UNITS[excitation_type]}")
+                    if log_callback:
+                        log_callback(f"  [{branch_name}] {aborted_reason} — точка не записана, измерение прервано.")
+                    else:
+                        print(f"  [{branch_name}] {aborted_reason} — точка не записана, измерение прервано.")
+                    # Не добавляем точку, выходим из цикла
+                    break
+
+        # Если инверсия включена, меняем знак X_set при записи (но не влияем на физическое возбуждение)
+        recorded_X = -signed_value if invert_input else signed_value
+
         results.append({
             'Timestamp': datetime.now().isoformat(),
             'Branch': branch_name,
-            'X_set': signed_value,
+            'X_set': recorded_X,
             'I_meas_A': i_avg,
         })
 
         unit = EXCITATION_UNITS[excitation_type]
-        print(f"  [{branch_name}] X_уст = {signed_value:+.4f} {unit}  ->  I_изм = {i_avg:.6f} А")
+        msg = f"  [{branch_name}] X_уст = {signed_value:+.4f} {unit}  ->  I_изм = {i_avg:.6f} А"
+        if log_callback:
+            log_callback(msg)
+        else:
+            print(msg)
 
-    return results
+    return results, aborted_reason
 
 
 def run_measurement(dmm: DMM, src: Union[CurrentSource, VoltageSource], relay: RelayController,
                      excitation_type: str,
                      X_start: float, X_stop: float, X_step: float,
                      V_limit: float, delay: float, cooling_delay: float,
-                     should_stop: Optional[Callable[[], bool]] = None) -> List[Dict]:
+                     should_stop: Optional[Callable[[], bool]] = None,
+                     # Новые параметры
+                     I_nom: Optional[float] = None,
+                     ratio: Optional[float] = None,
+                     stop_on_error: bool = False,
+                     error_threshold: float = 1.0,
+                     use_relay: bool = True,
+                     invert_input: bool = False,
+                     log_callback: Optional[Callable[[str], None]] = None) -> Tuple[List[Dict], Optional[str]]:
     """
-    Полный двусторонний цикл измерения амплитудной характеристики датчика тока
-    с автоматическим переключением полярности через плату реле:
+    Полный цикл измерения амплитудной характеристики датчика.
 
-        1) relay.forward() -> проход 0..X_max (положительная ветвь, sign=+1)
-        2) relay.reverse() -> проход 0..X_max (отрицательная ветвь, sign=-1)
-        3) relay.off()
-
-    excitation_type: 'current' — на источник тока подаётся уставка тока
-                      (V_limit используется как ограничение по напряжению);
-                      'voltage' — на источник напряжения подаётся уставка
-                      напряжения (V_limit в этом случае не используется для
-                      настройки источника, X_stop и есть максимальное
-                      напряжение цикла).
-
-    Выход датчика (измеряемая величина) всегда ток — читается мультиметром
-    независимо от типа возбуждения.
-
-    Направление (Branch) сохраняется в каждой записи результата.
+    Если use_relay == False, измеряется только прямое направление (без реле).
+    Возвращает (results, aborted_reason).
     """
     if excitation_type == 'current':
         src.setup(voltage_limit=V_limit)
@@ -138,29 +150,53 @@ def run_measurement(dmm: DMM, src: Union[CurrentSource, VoltageSource], relay: R
         raise ValueError(f"Неизвестный тип возбуждения: {excitation_type!r} (ожидается 'current' или 'voltage')")
 
     results = []
+    aborted_reason = None
 
     try:
-        print("\nПереключаю реле: прямое направление (IFW)...")
-        resp = relay.forward()
-        print(f"  Ответ реле: {resp}")
-        results += _measure_branch(
+        if use_relay:
+            print("\nПереключаю реле: прямое направление (IFW)...")
+            resp = relay.forward()
+            print(f"  Ответ реле: {resp}")
+
+        branch_results, branch_aborted = _measure_branch(
             dmm, src, excitation_type, X_start, X_stop, X_step, delay, cooling_delay,
-            sign=+1, branch_name='forward', should_stop=should_stop,
+            sign=+1, branch_name='forward',
+            should_stop=should_stop,
+            I_nom=I_nom, ratio=ratio,
+            stop_on_error=stop_on_error, error_threshold=error_threshold,
+            invert_input=invert_input,
+            log_callback=log_callback,
         )
+        results.extend(branch_results)
+        if branch_aborted:
+            aborted_reason = branch_aborted
+            return results, aborted_reason
 
         if should_stop is not None and should_stop():
             print("\nИзмерение прервано пользователем до обратной ветви.")
-            return results
+            return results, None
 
-        print("\nПереключаю реле: обратное направление (IRW)...")
-        resp = relay.reverse()
-        print(f"  Ответ реле: {resp}")
-        results += _measure_branch(
-            dmm, src, excitation_type, X_start, X_stop, X_step, delay, cooling_delay,
-            sign=-1, branch_name='reverse', range_reset=True, should_stop=should_stop,
-        )
+        if use_relay:
+            print("\nПереключаю реле: обратное направление (IRW)...")
+            resp = relay.reverse()
+            print(f"  Ответ реле: {resp}")
+            branch_results, branch_aborted = _measure_branch(
+                dmm, src, excitation_type, X_start, X_stop, X_step, delay, cooling_delay,
+                sign=-1, branch_name='reverse', range_reset=True,
+                should_stop=should_stop,
+                I_nom=I_nom, ratio=ratio,
+                stop_on_error=stop_on_error, error_threshold=error_threshold,
+                invert_input=invert_input,
+                log_callback=log_callback,
+            )
+            results.extend(branch_results)
+            if branch_aborted:
+                aborted_reason = branch_aborted
+                return results, aborted_reason
+
     finally:
         src.shutdown()
-        relay.off()
+        if use_relay:
+            relay.off()
 
-    return results
+    return results, aborted_reason
