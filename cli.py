@@ -9,6 +9,7 @@ from limits import (
     relay_current_block_reason,
     relay_current_warning,
     strictest_current_source_limits,
+    strictest_voltage_source_limits,
 )
 
 
@@ -141,13 +142,15 @@ def current_sweep_max_abs(params: dict, excitation_type: str) -> Optional[float]
 
 
 def validate_measure_params(params: dict, excitation_type: str,
-                             current_source_limits: Optional[dict] = None) -> list:
+                             current_source_limits: Optional[dict] = None,
+                             voltage_source_limits: Optional[dict] = None) -> list:
     """
-    current_source_limits — {'max_current': ..., 'max_voltage': ...}
-    паспортные пределы источника (см. limits.strictest_current_source_limits).
-    По умолчанию читаются из instruments/current_sources/*.json; параметр
-    существует в основном для тестов — чтобы не зависеть от содержимого
-    реальных конфигов на диске.
+    current_source_limits/voltage_source_limits — паспортные пределы
+    источника (см. limits.strictest_current_source_limits /
+    strictest_voltage_source_limits). По умолчанию читаются из
+    instruments/{current,voltage}_sources/*.json; параметры существуют в
+    основном для тестов — чтобы не зависеть от содержимого реальных
+    конфигов на диске.
     """
     errors = []
     if params.get('X_step') is None or params['X_step'] <= 0:
@@ -180,6 +183,20 @@ def validate_measure_params(params: dict, excitation_type: str,
             errors.append(
                 f"Уставка тока {max_abs:.1f} А превышает паспортный предел источника "
                 f"({max_i:.1f} А) — физически недостижимо."
+            )
+
+    if excitation_type == 'voltage':
+        if voltage_source_limits is None:
+            voltage_source_limits = strictest_voltage_source_limits()
+        max_v = voltage_source_limits.get('max_voltage')
+        # X_stop — сама уставка источника напряжения при возбуждении
+        # 'voltage' (V_limit здесь не используется вовсе, см.
+        # measurement.run_measurement), поэтому сверяем именно его.
+        X_stop = params.get('X_stop')
+        if max_v is not None and X_stop is not None and X_stop > max_v:
+            errors.append(
+                f"Уставка напряжения {X_stop} В превышает паспортный предел источника "
+                f"({max_v} В) — физически недостижимо."
             )
 
     return errors

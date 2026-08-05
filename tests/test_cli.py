@@ -69,9 +69,12 @@ def test_validate_allows_current_at_exactly_relay_hard_limit():
 
 def test_validate_does_not_block_on_relay_limit_for_voltage_excitation():
     # Лимит реле — про ток. Возбуждение напряжением им не ограничивается.
+    # voltage_source_limits={} изолирует тест от отдельной, но тоже вполне
+    # реальной проверки паспортного напряжения источника (см. тесты ниже) —
+    # 900 В здесь превысил бы и её, что было бы уже про другую причину.
     pv = {'X_start': 0.0, 'X_stop': 900.0, 'X_step': 4.0,
           'delay': 1.0, 'cooling_delay': 0.5, 'V_limit': 0.0}
-    assert validate_measure_params(pv, 'voltage', current_source_limits={}) == []
+    assert validate_measure_params(pv, 'voltage', current_source_limits={}, voltage_source_limits={}) == []
 
 
 def test_validate_ignores_relay_warning_threshold_it_is_not_an_error():
@@ -111,6 +114,58 @@ def test_validate_reads_real_current_source_configs_by_default():
     # (cli.resolve_measure_params, gui._gather_params).
     p = _good_current_params(); p['V_limit'] = 10_000.0
     errors = validate_measure_params(p, 'current')
+    assert any('источника' in e for e in errors)
+
+
+# ----------------------------------------------------------------------
+# validate_measure_params — паспортный потолок источника напряжения (Ф1 п.5)
+# ----------------------------------------------------------------------
+
+def _voltage_params(**overrides):
+    p = {'X_start': 0.0, 'X_stop': 30.0, 'X_step': 5.0,
+         'delay': 0.5, 'cooling_delay': 0.5, 'V_limit': 0.0}
+    p.update(overrides)
+    return p
+
+
+def test_validate_rejects_x_stop_above_voltage_source_max_voltage():
+    p = _voltage_params(X_stop=70.0)
+    errors = validate_measure_params(
+        p, 'voltage', voltage_source_limits={'max_voltage': 64.0},
+    )
+    assert any('64' in e and 'напряжен' in e for e in errors)
+
+
+def test_validate_allows_x_stop_at_exactly_voltage_source_max_voltage():
+    p = _voltage_params(X_stop=64.0)
+    errors = validate_measure_params(
+        p, 'voltage', voltage_source_limits={'max_voltage': 64.0},
+    )
+    assert errors == []
+
+
+def test_validate_missing_voltage_source_limit_field_is_not_checked():
+    p = _voltage_params(X_stop=10_000.0)
+    errors = validate_measure_params(
+        p, 'voltage', voltage_source_limits={'max_voltage': None},
+    )
+    assert errors == []
+
+
+def test_validate_voltage_source_limit_not_checked_for_current_excitation():
+    # Предел источника напряжения не имеет отношения к возбуждению током.
+    p = _good_current_params()
+    errors = validate_measure_params(
+        p, 'current', current_source_limits={}, voltage_source_limits={'max_voltage': 1.0},
+    )
+    assert errors == []
+
+
+def test_validate_reads_real_voltage_source_configs_by_default():
+    # Без явного voltage_source_limits функция сама читает
+    # instruments/voltage_sources/*.json (сейчас — GPP-4323, 64 В).
+    p = _voltage_params(X_stop=100.0)
+    errors = validate_measure_params(p, 'voltage', current_source_limits={})
     assert any('источника' in e for e in errors)
 
 

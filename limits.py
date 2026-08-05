@@ -26,7 +26,7 @@ RELAY_WARN_CURRENT_A — по мануалу производителя стен
 """
 import json
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 RELAY_MAX_CURRENT_A = 800.0
 RELAY_WARN_CURRENT_A = 400.0
@@ -76,6 +76,31 @@ def relay_current_warning(max_abs_current_a: Optional[float]) -> Optional[str]:
     return None
 
 
+def _strictest_source_limits(config_dir: Path, fields: Tuple[str, ...]) -> Dict[str, Optional[float]]:
+    """
+    Минимум по каждому полю из `fields` среди всех *.json в config_dir.
+
+    На момент проверки параметров ввода ещё не известно, какой конкретно
+    источник подключится (автообнаружение происходит позже, при открытии
+    приборов), поэтому берётся минимум по всем сконфигурированным моделям —
+    консервативная граница, которая не пропустит значение, недостижимое ни
+    на одном из них. Значение None для поля означает "не заявлено ни в
+    одном конфиге" — соответствующая проверка тогда просто не выполняется,
+    а не трактуется как "предела нет".
+    """
+    values: Dict[str, list] = {f: [] for f in fields}
+    for json_file in sorted(Path(config_dir).glob("*.json")):
+        try:
+            cfg = json.loads(json_file.read_text(encoding='utf-8'))
+        except (json.JSONDecodeError, OSError):
+            continue
+        for f in fields:
+            if f in cfg:
+                values[f].append(cfg[f])
+
+    return {f: (min(vs) if vs else None) for f, vs in values.items()}
+
+
 def strictest_current_source_limits(config_dir: Optional[Path] = None) -> Dict[str, Optional[float]]:
     """
     Возвращает {'max_current': ..., 'max_voltage': ...} — минимум паспортных
@@ -84,33 +109,25 @@ def strictest_current_source_limits(config_dir: Optional[Path] = None) -> Dict[s
     Это отдельный от реле предел: у АКИП-1162-10-1020 паспортные 10 В/1020 А
     (см. instruments/current_sources/akip1162.json), и задание, скажем,
     V_limit = 15 В физически недостижимо независимо от реле — источник
-    выше 10 В не поднимется. На момент проверки параметров ввода ещё
-    неизвестно, какой конкретно источник подключится (автообнаружение
-    происходит позже, при открытии приборов), поэтому берётся минимум по
-    всем известным конфигам — консервативная граница, которая не пропустит
-    значение, недостижимое ни на одном из них.
-
-    Значения None для ключа означают "предел не заявлен ни в одном
-    конфиге" — тогда соответствующая проверка в cli.validate_measure_params
-    просто не выполняется, а не трактуется как "предела нет".
+    выше 10 В не поднимется.
     """
     if config_dir is None:
         from apppaths import current_source_cfg_dir
         config_dir = current_source_cfg_dir()
+    return _strictest_source_limits(config_dir, ('max_current', 'max_voltage'))
 
-    max_currents = []
-    max_voltages = []
-    for json_file in sorted(Path(config_dir).glob("*.json")):
-        try:
-            cfg = json.loads(json_file.read_text(encoding='utf-8'))
-        except (json.JSONDecodeError, OSError):
-            continue
-        if 'max_current' in cfg:
-            max_currents.append(cfg['max_current'])
-        if 'max_voltage' in cfg:
-            max_voltages.append(cfg['max_voltage'])
 
-    return {
-        'max_current': min(max_currents) if max_currents else None,
-        'max_voltage': min(max_voltages) if max_voltages else None,
-    }
+def strictest_voltage_source_limits(config_dir: Optional[Path] = None) -> Dict[str, Optional[float]]:
+    """
+    Возвращает {'max_voltage': ...} — минимум паспортного напряжения среди
+    всех сконфигурированных источников напряжения (GPP-4323: 64.0 В в
+    tracking-series, см. instruments/voltage_sources/gpp74323.json).
+
+    Задание X_stop выше max_voltage при возбуждении 'voltage' физически
+    недостижимо: X_stop и есть уставка источника напряжения (см.
+    measurement.run_measurement — 'voltage' не использует V_limit вовсе).
+    """
+    if config_dir is None:
+        from apppaths import voltage_source_cfg_dir
+        config_dir = voltage_source_cfg_dir()
+    return _strictest_source_limits(config_dir, ('max_voltage',))

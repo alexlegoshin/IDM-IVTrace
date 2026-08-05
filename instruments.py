@@ -1,10 +1,24 @@
 import json
 import math
+import re
 import time
 from pathlib import Path
 from typing import List, Optional, Tuple
 
 import pyvisa
+
+# Некоторые приборы (GW Instek GPP-серия — VOUT1?/IOUT1?) отвечают на
+# измерительные запросы с суффиксом единиц ("00.000V", "0.0000A"), а не
+# голым числом — plain float() на таком ответе падает (см. IDM-DNKMetr).
+_NUMBER_RE = re.compile(r'[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?')
+
+
+def parse_scpi_number(text: str) -> float:
+    """Извлекает число из ответа прибора, даже если оно снабжено суффиксом единиц."""
+    match = _NUMBER_RE.search(text)
+    if match is None:
+        raise ValueError(f"Не удалось извлечь число из ответа прибора: {text!r}")
+    return float(match.group())
 
 # Реальный ток датчика на этом стенде никогда не приблизится к этому
 # порядку величины. Значение такого масштаба (~9.9e37 у большинства
@@ -49,6 +63,14 @@ class Multimeter:
         self.instr = self.rm.open_resource(resource_addr)
         self.instr.encoding = self.config.get('encoding', 'utf-8')
         self.instr.timeout = self.config.get('timeout', 5000)
+        # Не все приборы довольствуются VISA-умолчаниями терминатора строки
+        # (см. RIGOL DM3068 в режиме вольтметра — требует явных '\n' на
+        # запись и на чтение). Поле необязательное — большинству USB-TMC
+        # приборов оно не нужно вовсе.
+        if 'write_termination' in self.config:
+            self.instr.write_termination = self.config['write_termination']
+        if 'read_termination' in self.config:
+            self.instr.read_termination = self.config['read_termination']
         self.ranges = self.config['ranges']
         self.current_range_idx = len(self.ranges) - 1  # начинаем с максимального
         self._init_device()
@@ -91,14 +113,30 @@ class Multimeter:
         if delay > 0:
             time.sleep(delay)
 
-    def measure_current(self) -> float:
-        # В ручном режиме (manual_range: true) measure_command обязан быть
-        # 'READ?' (или 'FETC?'), а не 'MEAS:CURR:DC?': MEAS?/CONF? по SCPI
-        # переконфигурируют прибор и сбрасывают диапазон обратно в AUTO при
-        # каждом вызове, из-за чего set_range()/auto_range() становятся
-        # no-op. В авто-режиме (по умолчанию) это ограничение не действует.
+    def measure(self) -> float:
+        """
+        Снимает одно показание по measure_command из конфига — тока,
+        напряжения или чего угодно ещё, чем прибор настроен измерять
+        (SENS:FUNC в init_commands). Класс сам единиц измерения не знает и
+        не проверяет: это ответственность конфига и вызывающего кода.
+
+        В ручном режиме (manual_range: true) measure_command обязан быть
+        'READ?' (или 'FETC?'), а не 'MEAS:CURR:DC?'/'MEAS:VOLT:DC?': MEAS?/
+        CONF? по SCPI переконфигурируют прибор и сбрасывают диапазон обратно
+        в AUTO при каждом вызове, из-за чего set_range()/auto_range()
+        становятся no-op. В авто-режиме (по умолчанию) это ограничение не
+        действует.
+        """
         cmd = self.config['measure_command']
-        return float(self.instr.query(cmd))
+        return parse_scpi_number(self.instr.query(cmd))
+
+    def measure_current(self) -> float:
+        """Историческое имя measure() — сохранено для обратной совместимости с измерительным циклом (см. measurement.py)."""
+        return self.measure()
+
+    def measure_voltage(self) -> float:
+        """Алиас measure() для семантической ясности, когда прибор явно настроен как вольтметр (см. п.4)."""
+        return self.measure()
 
     def _covering_range_index(self, abs_value: float) -> int:
         """Наименьший индекс диапазона, покрывающего |value|; максимум, если такого нет."""
@@ -211,6 +249,15 @@ class VoltageSource:
 
     ВАЖНО: IDN? прибора этой серии возвращает модель БЕЗ ведущей цифры,
     например GPP-74323 представляется как "GPP-4323".
+
+    ВАЖНО (см. IDM-DNKMetr): подключение — не USB-TMC, а ASRL (COM-порт)
+    через vendor-specific USB-serial мост (VID_2184 — обычный CH340/CH341
+    CDC-драйвер не подходит, нужен официальный драйвер GW Instek), скорость
+    115200 8N1. Официально проверены вживую: ALLOUTON/ALLOUTOFF (глобальное
+    включение/выключение выхода — а НЕ :OUTPut{ch}:STATe ON/OFF, который
+    никогда не тестировался на реальном приборе) и то, что VOUT?/IOUT?
+    отвечают С СУФФИКСОМ ЕДИНИЦ ("00.000V", "0.0000A") — обычный float() на
+    таком ответе падает, см. parse_scpi_number() выше.
     """
 
     def __init__(self, resource_addr: str, config_path: Path, rm: Optional[pyvisa.ResourceManager] = None):
@@ -219,6 +266,12 @@ class VoltageSource:
         self.instr = self.rm.open_resource(resource_addr)
         self.instr.encoding = self.config.get('encoding', 'utf-8')
         self.instr.timeout = self.config.get('timeout', 5000)
+        if 'baud_rate' in self.config:
+            # ASRL-приборы не подхватывают нужную скорость сами (GW Instek
+            # GPP-серия требует 115200, а не типичные VISA-умолчания). Поле
+            # необязательное — для USB-TMC/GPIB источников в конфиге его
+            # просто нет, и эта строка ничего не делает.
+            self.instr.baud_rate = self.config['baud_rate']
         self.primary_ch = self.config.get('channels', {}).get('primary', 1)
         self._init_device()
 
@@ -250,10 +303,30 @@ class VoltageSource:
         self.instr.write(cmd)
 
     def output_on(self):
-        self.instr.write(self.config['output_on'].format(ch=self.primary_ch))
+        # ALLOUTON — проверено вживую в IDM-DNKMetr, приоритетный вариант.
+        # Резервный :OUTPut{ch}:STATe ON никогда не тестировался на реальном
+        # GPP-4323 (см. docstring класса) — оставлен только для конфигов,
+        # которые ALLOUTON/ALLOUTOFF не объявляют вовсе.
+        cmd = self.config.get('all_output_on')
+        if cmd is None:
+            cmd = self.config['output_on'].format(ch=self.primary_ch)
+        self.instr.write(cmd)
 
     def output_off(self):
-        self.instr.write(self.config['output_off'].format(ch=self.primary_ch))
+        cmd = self.config.get('all_output_off')
+        if cmd is None:
+            cmd = self.config['output_off'].format(ch=self.primary_ch)
+        self.instr.write(cmd)
+
+    def measure_voltage(self) -> float:
+        """Фактическое напряжение на выходе (VOUT?) — не путать с уставкой set_voltage()."""
+        cmd = self.config['measure_voltage_command'].format(ch=self.primary_ch)
+        return parse_scpi_number(self.instr.query(cmd))
+
+    def measure_current(self) -> float:
+        """Фактический ток на выходе (IOUT?)."""
+        cmd = self.config['measure_current_command'].format(ch=self.primary_ch)
+        return parse_scpi_number(self.instr.query(cmd))
 
     def shutdown(self):
         self.set_voltage(0)

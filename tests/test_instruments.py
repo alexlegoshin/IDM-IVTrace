@@ -4,7 +4,7 @@ import pytest
 
 from instruments import (
     Multimeter, CurrentSource, VoltageSource,
-    find_config_for_idn, discover_instruments, is_overflow_reading,
+    find_config_for_idn, discover_instruments, is_overflow_reading, parse_scpi_number,
 )
 from tests.conftest import FakeVisaResource, FakeResourceManager
 
@@ -119,6 +119,100 @@ def test_multimeter_measure_current_uses_configured_command(akip2101_cfg, make_f
 
     assert value == pytest.approx(0.001234)
     assert fake.queried[-1] == "READ?"
+
+
+def test_multimeter_measure_and_measure_current_are_the_same_call(akip2101_cfg, make_fake_rm):
+    fake = FakeVisaResource(query_responses=["0.5", "0.5"])
+    rm = make_fake_rm({"FAKE::ADDR": fake})
+    dmm = Multimeter("FAKE::ADDR", akip2101_cfg, rm=rm)
+
+    assert dmm.measure() == pytest.approx(0.5)
+    assert dmm.measure_current() == pytest.approx(0.5)
+
+
+def test_multimeter_measure_voltage_is_an_alias_for_measure(instruments_dir, make_fake_rm):
+    """
+    Ф1 п.4: measure_voltage() — тот же самый запрос, что measure(), просто
+    семантически понятное имя, когда прибор явно настроен как вольтметр.
+    Используется здесь конфиг АКИП-2101 из multimeters_voltage/ (см. п.4).
+    """
+    cfg_path = instruments_dir / "multimeters_voltage" / "akip2101.json"
+    fake = FakeVisaResource(query_responses=["12.345"])
+    rm = make_fake_rm({"FAKE::ADDR": fake})
+
+    dmm = Multimeter("FAKE::ADDR", cfg_path, rm=rm)
+    value = dmm.measure_voltage()
+
+    assert value == pytest.approx(12.345)
+    assert fake.queried[-1] == "MEAS:VOLT:DC?"
+
+
+# ----------------------------------------------------------------------
+# write_termination/read_termination (Ф1 п.4 — RIGOL DM3068 voltmeter)
+# ----------------------------------------------------------------------
+
+def test_multimeter_applies_configured_terminations(instruments_dir, make_fake_rm):
+    cfg_path = instruments_dir / "multimeters_voltage" / "rigol_dm3068.json"
+    fake = FakeVisaResource(query_responses=[])
+    rm = make_fake_rm({"FAKE::ADDR": fake})
+
+    Multimeter("FAKE::ADDR", cfg_path, rm=rm)
+
+    assert fake.write_termination == '\n'
+    assert fake.read_termination == '\n'
+
+
+def test_multimeter_without_termination_fields_leaves_visa_defaults(akip2101_cfg, make_fake_rm):
+    fake = FakeVisaResource()
+    rm = make_fake_rm({"FAKE::ADDR": fake})
+
+    Multimeter("FAKE::ADDR", akip2101_cfg, rm=rm)
+
+    assert not hasattr(fake, 'write_termination')
+    assert not hasattr(fake, 'read_termination')
+
+
+# ----------------------------------------------------------------------
+# multimeters_voltage/*.json — работают как реальные конфиги (Ф1 п.4)
+# ----------------------------------------------------------------------
+
+def test_voltmeter_rigol_dm3068_index_style_range_command(instruments_dir, tmp_path, make_fake_rm):
+    """Конфиг из репозитория, а не синтетика — тот самый {index}-стиль, проверенный в IDM-DNKMetr."""
+    cfg = json.loads((instruments_dir / "multimeters_voltage" / "rigol_dm3068.json").read_text(encoding='utf-8'))
+    cfg['manual_range'] = True  # по умолчанию выключен; здесь целенаправленно проверяем сам стиль команды
+    cfg['range_settle_delay'] = 0
+    path = tmp_path / "rigol_voltmeter_manual.json"
+    path.write_text(json.dumps(cfg), encoding='utf-8')
+
+    fake = FakeVisaResource()
+    rm = make_fake_rm({"FAKE::ADDR": fake})
+    dmm = Multimeter("FAKE::ADDR", path, rm=rm)
+
+    dmm.current_range_idx = 3
+    dmm.set_range(dmm.ranges[3])
+
+    assert fake.written[-1] == ':MEASure:VOLTage:DC 3'
+
+
+def test_voltmeter_akip2101_measures_voltage_via_meas_command(instruments_dir, make_fake_rm):
+    cfg_path = instruments_dir / "multimeters_voltage" / "akip2101.json"
+    fake = FakeVisaResource(query_responses=["3.3000"])
+    rm = make_fake_rm({"FAKE::ADDR": fake})
+
+    dmm = Multimeter("FAKE::ADDR", cfg_path, rm=rm)
+
+    assert dmm.measure_voltage() == pytest.approx(3.3)
+    assert fake.queried[-1] == "MEAS:VOLT:DC?"
+
+
+def test_voltmeter_akipb778_ranges_match_agilent_34401a_platform(instruments_dir):
+    """
+    Регрессия конкретного факта из IDM-DTCal: шкалы DCV у этого прибора
+    0.1/1/10/100/1000 В (платформа Agilent 34401A), НЕ 0.2/2/20/200/1000
+    как у Siglent/Rigol — раньше эта путаница резала разрешение измерения.
+    """
+    cfg = json.loads((instruments_dir / "multimeters_voltage" / "akipb778.json").read_text(encoding='utf-8'))
+    assert cfg['ranges'] == [0.1, 1.0, 10.0, 100.0, 1000.0]
 
 
 def test_auto_range_is_first_picks_smallest_covering_range(akip2101_manual_range_cfg, make_fake_rm):
@@ -278,6 +372,35 @@ def test_is_overflow_reading_false_for_nan():
     # NaN — сбой связи (см. measurement._measure_branch), не переполнение.
     # Не должен путаться с сентинелом при агрегированной обработке.
     assert is_overflow_reading(float('nan')) is False
+
+
+# ----------------------------------------------------------------------
+# parse_scpi_number (Ф1 п.5 — GPP-4323 VOUT?/IOUT? отвечают с суффиксом единиц)
+# ----------------------------------------------------------------------
+
+def test_parse_scpi_number_plain_float_string():
+    assert parse_scpi_number("0.001234") == pytest.approx(0.001234)
+
+
+def test_parse_scpi_number_strips_voltage_suffix():
+    assert parse_scpi_number("00.000V") == pytest.approx(0.0)
+
+
+def test_parse_scpi_number_strips_current_suffix():
+    assert parse_scpi_number("0.0000A") == pytest.approx(0.0)
+
+
+def test_parse_scpi_number_handles_negative_values_with_suffix():
+    assert parse_scpi_number("-12.340V") == pytest.approx(-12.34)
+
+
+def test_parse_scpi_number_handles_scientific_notation():
+    assert parse_scpi_number("1.5E-03") == pytest.approx(0.0015)
+
+
+def test_parse_scpi_number_raises_on_no_number_at_all():
+    with pytest.raises(ValueError):
+        parse_scpi_number("ERROR")
 
 
 # ----------------------------------------------------------------------
@@ -451,7 +574,12 @@ def test_voltage_source_set_voltage_uses_primary_channel(instruments_dir, make_f
     assert fake.written[-1] == "VSET1:12.5"
 
 
-def test_voltage_source_output_on_off_uses_primary_channel(instruments_dir, make_fake_rm):
+def test_voltage_source_output_on_off_prefers_verified_all_output_commands(instruments_dir, make_fake_rm):
+    """
+    Регрессия Ф1 п.5: ALLOUTON/ALLOUTOFF проверены вживую в IDM-DNKMetr,
+    :OUTPut{ch}:STATe ON/OFF — никогда. gpp74323.json объявляет
+    all_output_on/all_output_off, поэтому именно они должны уйти в порт.
+    """
     cfg_path = instruments_dir / "voltage_sources" / "gpp74323.json"
     fake = FakeVisaResource()
     rm = make_fake_rm({"A": fake})
@@ -459,8 +587,92 @@ def test_voltage_source_output_on_off_uses_primary_channel(instruments_dir, make
     src = VoltageSource("A", cfg_path, rm=rm)
     src.output_on()
     src.output_off()
+    assert "ALLOUTON" in fake.written
+    assert "ALLOUTOFF" in fake.written
+    assert ":OUTPut1:STATe ON" not in fake.written
+    assert ":OUTPut1:STATe OFF" not in fake.written
+
+
+def test_voltage_source_output_on_off_falls_back_to_per_channel_command(instruments_dir, tmp_path, make_fake_rm):
+    """Конфиг без all_output_on/off (гипотетическая другая модель) должен продолжать работать через {ch}."""
+    cfg = json.loads((instruments_dir / "voltage_sources" / "gpp74323.json").read_text(encoding='utf-8'))
+    del cfg['all_output_on']
+    del cfg['all_output_off']
+    path = tmp_path / "gpp_no_allout.json"
+    path.write_text(json.dumps(cfg), encoding='utf-8')
+
+    fake = FakeVisaResource()
+    rm = make_fake_rm({"A": fake})
+    src = VoltageSource("A", path, rm=rm)
+    src.output_on()
+    src.output_off()
+
     assert ":OUTPut1:STATe ON" in fake.written
     assert ":OUTPut1:STATe OFF" in fake.written
+
+
+# ----------------------------------------------------------------------
+# VoltageSource — readback с суффиксом единиц (Ф1 п.5)
+# ----------------------------------------------------------------------
+
+def test_voltage_source_measure_voltage_strips_unit_suffix(instruments_dir, make_fake_rm):
+    cfg_path = instruments_dir / "voltage_sources" / "gpp74323.json"
+    fake = FakeVisaResource(query_responses=["00.000V"])
+    rm = make_fake_rm({"A": fake})
+
+    src = VoltageSource("A", cfg_path, rm=rm)
+    value = src.measure_voltage()
+
+    assert value == pytest.approx(0.0)
+    assert fake.queried[-1] == "VOUT1?"
+
+
+def test_voltage_source_measure_current_strips_unit_suffix(instruments_dir, make_fake_rm):
+    cfg_path = instruments_dir / "voltage_sources" / "gpp74323.json"
+    fake = FakeVisaResource(query_responses=["0.0000A"])
+    rm = make_fake_rm({"A": fake})
+
+    src = VoltageSource("A", cfg_path, rm=rm)
+    value = src.measure_current()
+
+    assert value == pytest.approx(0.0)
+    assert fake.queried[-1] == "IOUT1?"
+
+
+def test_voltage_source_measure_voltage_handles_nonzero_reading_with_suffix(instruments_dir, make_fake_rm):
+    cfg_path = instruments_dir / "voltage_sources" / "gpp74323.json"
+    fake = FakeVisaResource(query_responses=["12.3400V"])
+    rm = make_fake_rm({"A": fake})
+
+    src = VoltageSource("A", cfg_path, rm=rm)
+    assert src.measure_voltage() == pytest.approx(12.34)
+
+
+# ----------------------------------------------------------------------
+# VoltageSource — baud_rate для ASRL (Ф1 п.5)
+# ----------------------------------------------------------------------
+
+def test_voltage_source_sets_baud_rate_from_config(instruments_dir, make_fake_rm):
+    cfg_path = instruments_dir / "voltage_sources" / "gpp74323.json"
+    fake = FakeVisaResource()
+    rm = make_fake_rm({"A": fake})
+
+    src = VoltageSource("A", cfg_path, rm=rm)
+
+    assert fake.baud_rate == 115200
+
+
+def test_voltage_source_without_baud_rate_field_does_not_set_it(instruments_dir, tmp_path, make_fake_rm):
+    cfg = json.loads((instruments_dir / "voltage_sources" / "gpp74323.json").read_text(encoding='utf-8'))
+    del cfg['baud_rate']
+    path = tmp_path / "gpp_no_baud.json"
+    path.write_text(json.dumps(cfg), encoding='utf-8')
+
+    fake = FakeVisaResource()
+    rm = make_fake_rm({"A": fake})
+    VoltageSource("A", path, rm=rm)
+
+    assert not hasattr(fake, 'baud_rate')
 
 
 # ----------------------------------------------------------------------

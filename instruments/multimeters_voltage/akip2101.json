@@ -1,0 +1,17 @@
+{
+    "model_name": "АКИП-2101 / Siglent SDM3055",
+    "keywords": ["AKIP-2101", "SIGLENT", "SDM3055", "SDM3045", "SDM3065"],
+    "timeout": 5000,
+    "encoding": "utf-8",
+    "init_commands": [
+        "*RST",
+        "SENS:FUNC \"VOLT:DC\"",
+        "SENS:VOLT:DC:NPLC 1"
+    ],
+    "measure_command": "MEAS:VOLT:DC?",
+    "manual_range": false,
+    "disable_autorange_command": "SENS:VOLT:DC:RANG:AUTO OFF",
+    "range_command": "SENS:VOLT:DC:RANG {range_val}",
+    "ranges": [0.2, 2.0, 20.0, 200.0, 1000.0],
+    "notes": "Вольтметровый режим того же прибора, что и instruments/multimeters/akip2101.json (амперметровый) — команды переведены из IDM-DTCal (instruments/multimeters/akip2101.json), где шкалы DCV 0.2/2/20/200/1000 В сверены по User Manual SDM3055. Основная команда MEAS:VOLT:DC? проверена по документации, самодостаточна (сама включает функцию и авто-диапазон при каждом вызове) — на реальном приборе этой модели в стенде не проверялась (в стенде подключён АКИП-B7-78/1, см. akipb778.json). manual_range по умолчанию выключен, как и везде в проекте (см. README) — disable_autorange_command/range_command взяты по прямой аналогии с уже проверенным ТОКОВЫМ режимом того же прибора (SENS:CURR:DC:RANG:AUTO OFF -> SENS:VOLT:DC:RANG:AUTO OFF), но именно ОТКЛЮЧЕНИЕ автодиапазона в вольтметровом режиме на реальном АКИП-2101 отдельно не проверялось. При включении manual_range: true measure_command нужно сменить на READ? (см. instruments.Multimeter.measure)."
+}

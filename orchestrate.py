@@ -23,6 +23,7 @@ from instruments import (
 from relay import RelayController, discover_relay_port
 from measurement import run_measurement, EXCITATION_UNITS
 from safety import emergency_shutdown
+from calibration import CalibrationStatus, check_calibration
 
 
 LogFn = Callable[[str], None]
@@ -101,12 +102,51 @@ def _resolve_instruments(rm, excitation_type: str, dmm_addr: Optional[str],
     )
 
 
+def _log_calibration_warnings(instrument_configs, log: LogFn) -> None:
+    """
+    Уведомление при подключении прибора (п. 3): молчим, если поверка
+    в порядке или в конфиге просто нет даты (сейчас так для всех
+    приборов — реальные даты поверки не выдуманы, их должен внести
+    оператор из подлинных свидетельств, см. calibration.py). Громко —
+    только если до окончания поверки осталось меньше 3 месяцев или она
+    уже просрочена.
+
+    Не блокирует измерение ни при каком статусе — это решение оператора
+    (доверять ли результату как метрологически точному), а не то, что
+    программа вправе принять за него.
+    """
+    for cfg in instrument_configs:
+        info = check_calibration(cfg)
+        if info.status in (CalibrationStatus.DUE_SOON, CalibrationStatus.OVERDUE):
+            log(f"⚠ {info.message}")
+
+
 def write_results_csv(csv_path: Path, df: pd.DataFrame, params: dict,
                       excitation_type: str, unit: str,
-                      aborted_reason: Optional[str] = None) -> None:
-    """Пишет CSV с шапкой метаданных (# ...) и данными измерения."""
+                      aborted_reason: Optional[str] = None,
+                      instrument_configs: Optional[list] = None) -> None:
+    """
+    Пишет CSV с шапкой метаданных (# ...) и данными измерения.
+
+    instrument_configs — конфиги использованных приборов (dmm.config,
+    src.config), по одному на прибор; для каждого пишется модель и, если в
+    конфиге есть дата поверки, её статус (см. calibration.py, п. 3). S/N
+    сюда пока не попадает — *IDN? прибора в текущем коде опрашивается
+    транзитно при автообнаружении и никуда не сохраняется, а формат ответа
+    (порядок полей) у каждого вендора свой; вытаскивать из него серийный
+    номер надёжно — отдельная небольшая задача, не смешана с этой правкой.
+    """
     with open(csv_path, 'w', encoding='utf-8') as f:
         f.write(f"# Датчик: {params['label']}\n")
+        for cfg in (instrument_configs or []):
+            info = check_calibration(cfg)
+            if info.status == CalibrationStatus.UNKNOWN:
+                f.write(f"# Прибор: {info.model_name} (дата поверки не указана в конфиге)\n")
+            else:
+                f.write(f"# Прибор: {info.model_name}\n")
+                f.write(f"#   поверка: {info.last_date.isoformat()}, "
+                        f"следующая: {info.next_date.isoformat()}"
+                        f"{' — ПРОСРОЧЕНА' if info.status == CalibrationStatus.OVERDUE else ''}\n")
         f.write(f"# Тип возбуждения: {excitation_type}\n")
         f.write(f"# Единица измерения возбуждения: {unit}\n")
         f.write(f"# Диапазон заданного возбуждения: {params['X_start']}..{params['X_stop']} {unit}, "
@@ -191,6 +231,7 @@ def run_measurement_session(
     relay = handle.relay = RelayController(relay_port)
 
     log("Приборы и реле инициализированы. Начинаю измерения...")
+    _log_calibration_warnings([dmm.config, src.config], log)
 
     aborted_reason = None
     # Накопитель точек живёт снаружи вызова: аварийный останов обесточивает
@@ -237,7 +278,8 @@ def run_measurement_session(
         log("Измерения завершены, источник и реле выключены.")
 
     df = pd.DataFrame(results)
-    write_results_csv(csv_path, df, params, excitation_type, unit, aborted_reason)
+    write_results_csv(csv_path, df, params, excitation_type, unit, aborted_reason,
+                      instrument_configs=[dmm.config, src.config])
     log(f"Данные сохранены в {csv_path}")
 
     return df
