@@ -14,19 +14,19 @@ from tests.conftest import FakeVisaResource, FakeResourceManager
 # ----------------------------------------------------------------------
 
 def test_find_config_for_idn_matches_by_keyword(instruments_dir):
-    cfg = find_config_for_idn("Instrument reply: SIGLENT,SDM3055,...", instruments_dir / "multimeters")
+    cfg = find_config_for_idn("Instrument reply: SIGLENT,SDM3055,...", instruments_dir / "multimeters_current")
     assert cfg is not None
     assert cfg.name == "akip2101.json"
 
 
 def test_find_config_for_idn_case_insensitive(instruments_dir):
-    cfg = find_config_for_idn("picotest model v7-78/1", instruments_dir / "multimeters")
+    cfg = find_config_for_idn("picotest model v7-78/1", instruments_dir / "multimeters_current")
     assert cfg is not None
     assert cfg.name == "akipb778.json"
 
 
 def test_find_config_for_idn_no_match_returns_none(instruments_dir):
-    cfg = find_config_for_idn("SOME,UNRELATED,DEVICE", instruments_dir / "multimeters")
+    cfg = find_config_for_idn("SOME,UNRELATED,DEVICE", instruments_dir / "multimeters_current")
     assert cfg is None
 
 
@@ -43,7 +43,7 @@ def test_gpp_idn_missing_leading_digit_still_matches(instruments_dir):
 
 @pytest.fixture
 def akip2101_cfg(instruments_dir):
-    return instruments_dir / "multimeters" / "akip2101.json"
+    return instruments_dir / "multimeters_current" / "akip2101.json"
 
 
 @pytest.fixture
@@ -55,7 +55,7 @@ def akip2101_manual_range_cfg(instruments_dir, tmp_path):
     управление диапазоном (set_range/auto_range), поэтому включают его
     явно поверх реального конфига, во временном файле.
     """
-    cfg = json.loads((instruments_dir / "multimeters" / "akip2101.json").read_text(encoding='utf-8'))
+    cfg = json.loads((instruments_dir / "multimeters_current" / "akip2101.json").read_text(encoding='utf-8'))
     cfg['manual_range'] = True
     # По умолчанию set_range() спит DEFAULT_RANGE_SETTLE_DELAY (0.7 с) после
     # каждой смены диапазона — это сознательная задержка на устаканивание
@@ -685,7 +685,7 @@ def test_discover_instruments_finds_dmm_and_source(instruments_dir):
     rm = FakeResourceManager({"DMM_ADDR": dmm_res, "SRC_ADDR": src_res})
 
     dmm_addr, dmm_cfg, src_addr, src_cfg = discover_instruments(
-        instruments_dir / "multimeters", instruments_dir / "current_sources", rm=rm,
+        instruments_dir / "multimeters_current", instruments_dir / "current_sources", rm=rm,
     )
 
     assert dmm_addr == "DMM_ADDR"
@@ -698,7 +698,7 @@ def test_discover_instruments_raises_when_no_resources(instruments_dir):
     from tests.conftest import FakeResourceManager
     rm = FakeResourceManager({})
     with pytest.raises(RuntimeError):
-        discover_instruments(instruments_dir / "multimeters", instruments_dir / "current_sources", rm=rm)
+        discover_instruments(instruments_dir / "multimeters_current", instruments_dir / "current_sources", rm=rm)
 
 
 def test_discover_instruments_raises_when_source_missing(instruments_dir):
@@ -706,4 +706,4 @@ def test_discover_instruments_raises_when_source_missing(instruments_dir):
     rm = FakeResourceManager({"DMM_ADDR": dmm_res})
 
     with pytest.raises(RuntimeError, match="источник"):
-        discover_instruments(instruments_dir / "multimeters", instruments_dir / "current_sources", rm=rm)
+        discover_instruments(instruments_dir / "multimeters_current", instruments_dir / "current_sources", rm=rm)

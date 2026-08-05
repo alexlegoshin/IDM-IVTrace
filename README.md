@@ -255,7 +255,7 @@ pip install -r requirements-dev.txt
 
 ## Приборы
 
-### Мультиметры (`instruments/multimeters/`)
+### Мультиметры (`instruments/multimeters_current/`)
 
 | Файл | Модель | Диапазоны, А | Диапазон по умолчанию |
 |---|---|---|---|

@@ -148,10 +148,14 @@ def test_log_stays_silent_for_ok_status():
     assert lines == []
 
 
-def test_log_stays_silent_when_no_calibration_data_at_all():
+def test_log_notifies_when_no_calibration_data_at_all():
+    # UNKNOWN — тоже не молчим: оператор должен узнать, что в конфиге
+    # просто нет даты поверки, а не решить, что раз тихо — значит всё ОК.
     lines = []
     _log_calibration_warnings([{'model_name': 'X'}], lines.append)
-    assert lines == []
+    assert len(lines) == 1
+    assert lines[0].startswith('ℹ')
+    assert 'не указана' in lines[0]
 
 
 def test_log_warns_loudly_when_overdue():
@@ -173,3 +177,14 @@ def test_log_reports_each_instrument_independently():
     ], lines.append)
     assert len(lines) == 1
     assert 'Просрочен' in lines[0]
+
+
+def test_log_notifies_for_unknown_alongside_overdue_as_separate_lines():
+    lines = []
+    _log_calibration_warnings([
+        {'model_name': 'Без даты'},
+        {'model_name': 'Просрочен', 'calibration_date': '2020-01-01', 'calibration_interval_months': 12},
+    ], lines.append)
+    assert len(lines) == 2
+    assert any(l.startswith('ℹ') and 'Без даты' in l for l in lines)
+    assert any(l.startswith('⚠') and 'Просрочен' in l for l in lines)

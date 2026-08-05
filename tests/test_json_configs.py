@@ -8,7 +8,7 @@ def _load(path):
 
 
 def _multimeter_configs(instruments_dir):
-    return sorted((instruments_dir / "multimeters").glob("*.json"))
+    return sorted((instruments_dir / "multimeters_current").glob("*.json"))
 
 
 def _voltmeter_configs(instruments_dir):

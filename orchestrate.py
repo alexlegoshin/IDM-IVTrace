@@ -104,12 +104,16 @@ def _resolve_instruments(rm, excitation_type: str, dmm_addr: Optional[str],
 
 def _log_calibration_warnings(instrument_configs, log: LogFn) -> None:
     """
-    Уведомление при подключении прибора (п. 3): молчим, если поверка
-    в порядке или в конфиге просто нет даты (сейчас так для всех
-    приборов — реальные даты поверки не выдуманы, их должен внести
-    оператор из подлинных свидетельств, см. calibration.py). Громко —
-    только если до окончания поверки осталось меньше 3 месяцев или она
-    уже просрочена.
+    Уведомление при подключении прибора (п. 3). Молчим только если поверка
+    в порядке (статус OK) — во всех остальных случаях оператор должен
+    узнать об этом сразу, а не долистывать до шапки CSV после измерения:
+
+      - UNKNOWN — в конфиге нет даты поверки вовсе. Сейчас так для всех
+        приборов в репозитории: реальные даты не выдуманы, их должен
+        внести оператор из подлинных свидетельств (см. calibration.py) —
+        и до тех пор "нет данных" само по себе стоит проговорить, а не
+        молча пропускать;
+      - DUE_SOON/OVERDUE — громко, с ⚠.
 
     Не блокирует измерение ни при каком статусе — это решение оператора
     (доверять ли результату как метрологически точному), а не то, что
@@ -117,7 +121,9 @@ def _log_calibration_warnings(instrument_configs, log: LogFn) -> None:
     """
     for cfg in instrument_configs:
         info = check_calibration(cfg)
-        if info.status in (CalibrationStatus.DUE_SOON, CalibrationStatus.OVERDUE):
+        if info.status == CalibrationStatus.UNKNOWN:
+            log(f"ℹ {info.message}")
+        elif info.status in (CalibrationStatus.DUE_SOON, CalibrationStatus.OVERDUE):
             log(f"⚠ {info.message}")
 
 
