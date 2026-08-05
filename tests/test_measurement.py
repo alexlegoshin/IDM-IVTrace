@@ -80,7 +80,7 @@ def test_measure_branch_averages_three_readings_and_signs_x_set():
     dmm = FakeDMM(readings=[1.0, 1.1, 1.2] * 3)  # 3 точки по 3 чтения
     src = FakeSource()
 
-    results = _measure_branch(
+    results, _ = _measure_branch(
         dmm, src, 'current',
         X_start=0, X_stop=2, X_step=1,
         delay=0, cooling_delay=0,
@@ -97,7 +97,7 @@ def test_measure_branch_negative_sign_produces_negative_x_set():
     dmm = FakeDMM(readings=[0.5] * 9)
     src = FakeSource()
 
-    results = _measure_branch(
+    results, _ = _measure_branch(
         dmm, src, 'current',
         X_start=0, X_stop=2, X_step=1,
         delay=0, cooling_delay=0,
@@ -131,7 +131,7 @@ def test_measure_branch_all_reads_failing_yields_nan_not_zero():
     dmm = FakeDMM(readings=[Exception("comm error")] * 3)
     src = FakeSource()
 
-    results = _measure_branch(
+    results, _ = _measure_branch(
         dmm, src, 'current',
         X_start=0, X_stop=0, X_step=1,
         delay=0, cooling_delay=0,
@@ -146,7 +146,7 @@ def test_measure_branch_partial_failure_averages_successful_reads():
     dmm = FakeDMM(readings=[Exception("timeout"), 2.0, 2.2])
     src = FakeSource()
 
-    results = _measure_branch(
+    results, _ = _measure_branch(
         dmm, src, 'current',
         X_start=0, X_stop=0, X_step=1,
         delay=0, cooling_delay=0,
@@ -181,7 +181,7 @@ def test_run_measurement_runs_forward_then_reverse_and_shuts_down():
     src = FakeSource()
     relay = FakeRelay()
 
-    results = run_measurement(
+    results, _ = run_measurement(
         dmm, src, relay, 'current',
         X_start=0, X_stop=1, X_step=1,
         V_limit=5.0, delay=0, cooling_delay=0,
@@ -209,7 +209,7 @@ def test_run_measurement_all_zero_sweep_never_touches_relay_or_source_output():
     src = FakeSource()
     relay = FakeRelay()
 
-    results = run_measurement(
+    results, _ = run_measurement(
         dmm, src, relay, 'current',
         X_start=0, X_stop=0, X_step=1,
         V_limit=5.0, delay=0, cooling_delay=0,
@@ -286,3 +286,161 @@ def test_run_measurement_unknown_excitation_type_raises_value_error():
 
 def test_excitation_units_mapping():
     assert EXCITATION_UNITS == {'current': 'A', 'voltage': 'V'}
+
+
+# ----------------------------------------------------------------------
+# Отсечка по погрешности (stop_on_error) — пришло из ветки
+# test_deepseek_hermes без единого теста, покрывается здесь.
+# ----------------------------------------------------------------------
+
+def test_stop_on_error_aborts_branch_and_drops_the_bad_point():
+    # ratio=1000 -> ожидаемый выход X/1000. Точки 1 и 2 А в допуске,
+    # на 3 А датчик отдаёт вдвое меньше положенного (0.0015 вместо 0.003).
+    dmm = FakeDMM(readings=[0.001] * 3 + [0.002] * 3 + [0.0015] * 3)
+    src = FakeSource()
+
+    results, aborted = _measure_branch(
+        dmm, src, 'current',
+        X_start=1, X_stop=3, X_step=1,
+        delay=0, cooling_delay=0,
+        sign=+1, branch_name='forward',
+        ratio=1000.0, stop_on_error=True, error_threshold=1.0,
+    )
+
+    # Точка, на которой сработала отсечка, в результат НЕ попадает: она не
+    # характеристика датчика, а свидетельство того, что мерить дальше нечего.
+    assert [r['X_set'] for r in results] == [1.0, 2.0]
+    assert aborted is not None
+    assert '3' in aborted  # причина называет точку, на которой встали
+
+
+def test_stop_on_error_does_not_fire_when_sensor_is_within_threshold():
+    dmm = FakeDMM(readings=[0.001] * 3 + [0.002] * 3)
+    src = FakeSource()
+
+    results, aborted = _measure_branch(
+        dmm, src, 'current',
+        X_start=1, X_stop=2, X_step=1,
+        delay=0, cooling_delay=0,
+        sign=+1, branch_name='forward',
+        ratio=1000.0, stop_on_error=True, error_threshold=1.0,
+    )
+
+    assert len(results) == 2
+    assert aborted is None
+
+
+def test_stop_on_error_without_ratio_is_silently_skipped():
+    # Без коэффициента преобразования ожидаемый выход посчитать не из чего,
+    # поэтому проверка не должна ни падать, ни рубить измерение.
+    dmm = FakeDMM(readings=[999.0] * 3)
+    src = FakeSource()
+
+    results, aborted = _measure_branch(
+        dmm, src, 'current',
+        X_start=1, X_stop=1, X_step=1,
+        delay=0, cooling_delay=0,
+        sign=+1, branch_name='forward',
+        ratio=None, stop_on_error=True, error_threshold=1.0,
+    )
+
+    assert len(results) == 1
+    assert aborted is None
+
+
+def test_stop_on_error_ignores_nan_readings():
+    # NaN — это сбой связи, а не выход датчика за допуск. Рубить измерение
+    # по нему нельзя: иначе одна потерянная посылка обрывает весь прогон.
+    dmm = FakeDMM(readings=[Exception("timeout")] * 3)
+    src = FakeSource()
+
+    results, aborted = _measure_branch(
+        dmm, src, 'current',
+        X_start=1, X_stop=1, X_step=1,
+        delay=0, cooling_delay=0,
+        sign=+1, branch_name='forward',
+        ratio=1000.0, stop_on_error=True, error_threshold=1.0,
+    )
+
+    assert aborted is None
+    assert math.isnan(results[0]['I_meas_A'])
+
+
+def test_run_measurement_propagates_abort_and_skips_reverse_branch():
+    dmm = FakeDMM(readings=[0.5] * 100)  # заведомо мимо ожидаемых 0.001
+    src = FakeSource()
+    relay = FakeRelay()
+
+    results, aborted = run_measurement(
+        dmm, src, relay, 'current',
+        X_start=0, X_stop=1, X_step=1,
+        V_limit=5.0, delay=0, cooling_delay=0,
+        ratio=1000.0, stop_on_error=True, error_threshold=1.0,
+    )
+
+    assert aborted is not None
+    # Обратную ветвь не начинали — датчик уже признан негодным.
+    assert 'reverse' not in relay.calls
+    # Но источник и реле всё равно погашены (finally).
+    assert ('shutdown',) in src.calls
+    assert 'off' in relay.calls
+
+
+# ----------------------------------------------------------------------
+# Режим без реле (use_relay=False)
+# ----------------------------------------------------------------------
+
+def test_use_relay_false_measures_only_forward_and_never_commutates():
+    dmm = FakeDMM(readings=[1.0] * 100)
+    src = FakeSource()
+    relay = FakeRelay()
+
+    results, aborted = run_measurement(
+        dmm, src, relay, 'current',
+        X_start=0, X_stop=1, X_step=1,
+        V_limit=5.0, delay=0, cooling_delay=0,
+        use_relay=False,
+    )
+
+    assert aborted is None
+    assert relay.calls == []  # ни forward, ни reverse, ни даже off
+    # Ноль реле не нужен в любом случае, поэтому снимается как обычно.
+    assert [r['Branch'] for r in results] == ['zero', 'forward']
+
+
+def test_use_relay_false_still_shuts_down_source():
+    dmm = FakeDMM(readings=[1.0] * 100)
+    src = FakeSource()
+    relay = FakeRelay()
+
+    run_measurement(
+        dmm, src, relay, 'current',
+        X_start=0, X_stop=1, X_step=1,
+        V_limit=5.0, delay=0, cooling_delay=0,
+        use_relay=False,
+    )
+
+    assert ('shutdown',) in src.calls
+
+
+# ----------------------------------------------------------------------
+# log_callback
+# ----------------------------------------------------------------------
+
+def test_log_callback_receives_progress_instead_of_stdout(capsys):
+    dmm = FakeDMM(readings=[1.0] * 100)
+    src = FakeSource()
+    relay = FakeRelay()
+    lines = []
+
+    run_measurement(
+        dmm, src, relay, 'current',
+        X_start=0, X_stop=1, X_step=1,
+        V_limit=5.0, delay=0, cooling_delay=0,
+        log_callback=lines.append,
+    )
+
+    assert any('forward' in line for line in lines)
+    assert any('zero' in line for line in lines)
+    # При заданном колбэке ход измерения в stdout не дублируется.
+    assert capsys.readouterr().out == ''

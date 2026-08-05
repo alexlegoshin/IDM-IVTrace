@@ -25,7 +25,7 @@ import tkinter as tk
 from tkinter import ttk, scrolledtext, messagebox
 
 from apppaths import default_data_dir
-from config import ConfigManager
+from config import ConfigManager, SensorConfigManager
 from cli import make_csv_filename, validate_measure_params
 from measurement import EXCITATION_UNITS
 
@@ -62,6 +62,7 @@ class IVTraceGUI:
         self.data_dir = Path(getattr(args, "data_dir", None) or default_data_dir())
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.config_mgr = ConfigManager(self.data_dir / "ivtrace_config.json")
+        self.sensor_config_mgr = SensorConfigManager(self.data_dir)
 
         self.events = queue.Queue()
         self.stop_event = threading.Event()
@@ -179,9 +180,16 @@ class IVTraceGUI:
         self.e_delay, self.u_delay = self._param_row(pf, 4, "Задержка установки", unit="с")
         self.e_cool, self.u_cool = self._param_row(pf, 5, "Задержка охлаждения", unit="с")
 
-        ttk.Label(pf, text="Комментарий").grid(row=6, column=0, sticky="w", pady=(6, 0))
+        ttk.Label(pf, text="I ном., А").grid(row=6, column=0, sticky="w", pady=3)
+        self.e_inom = ttk.Entry(pf, width=12)
+        self.e_inom.grid(row=6, column=1, sticky="ew", pady=3, padx=(8, 6))
+        ttk.Label(pf, text="Коэфф. 1:X").grid(row=7, column=0, sticky="w", pady=3)
+        self.e_ratio = ttk.Entry(pf, width=12)
+        self.e_ratio.grid(row=7, column=1, sticky="ew", pady=3, padx=(8, 6))
+
+        ttk.Label(pf, text="Комментарий").grid(row=8, column=0, sticky="w", pady=(6, 0))
         self.e_label = ttk.Entry(pf)
-        self.e_label.grid(row=6, column=1, columnspan=2, sticky="ew", pady=(6, 0))
+        self.e_label.grid(row=8, column=1, columnspan=2, sticky="ew", pady=(6, 0))
 
         # --- optional instrument addresses ---
         adv = ttk.Labelframe(left, text="Приборы (необязательно, иначе автопоиск)", padding=10)
@@ -191,9 +199,38 @@ class IVTraceGUI:
         self.e_src = self._addr_row(adv, 1, "Источник VISA")
         self.e_relay = self._addr_row(adv, 2, "Порт реле (COMx)")
 
+        # --- additional options ---
+        opts = ttk.Labelframe(left, text="Дополнительные опции", padding=10)
+        opts.grid(row=3, column=0, sticky="ew", pady=(10, 0))
+        opts.columnconfigure(1, weight=1)
+
+        self.stop_on_error_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(opts, text="Остановить при превышении погрешности",
+                        variable=self.stop_on_error_var).grid(row=0, column=0, columnspan=2, sticky="w")
+        ttk.Label(opts, text="Порог погрешности, %").grid(row=1, column=0, sticky="w", pady=3)
+        self.e_error_threshold = ttk.Entry(opts, width=10)
+        self.e_error_threshold.grid(row=1, column=1, sticky="w", pady=3, padx=(8, 0))
+        self.e_error_threshold.insert(0, "1.0")
+
+        self.no_relay_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(opts, text="Измерять без реле (одна полярность)",
+                        variable=self.no_relay_var).grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+        # --- sensor configuration ---
+        cfg = ttk.Labelframe(left, text="Конфигурация датчика", padding=10)
+        cfg.grid(row=4, column=0, sticky="ew", pady=(10, 0))
+        cfg.columnconfigure(1, weight=1)
+        ttk.Label(cfg, text="Имя конфига").grid(row=0, column=0, sticky="w", pady=3)
+        self.e_config_name = ttk.Entry(cfg)
+        self.e_config_name.grid(row=0, column=1, sticky="ew", pady=3, padx=(8, 0))
+        btn_frame = ttk.Frame(cfg)
+        btn_frame.grid(row=1, column=0, columnspan=2, sticky="ew", pady=3)
+        ttk.Button(btn_frame, text="Сохранить конфиг", command=self._save_config).pack(side="left", padx=(0, 6))
+        ttk.Button(btn_frame, text="Загрузить конфиг", command=self._load_config).pack(side="left")
+
         # --- action buttons ---
         actions = ttk.Frame(left)
-        actions.grid(row=3, column=0, sticky="ew", pady=(12, 0))
+        actions.grid(row=5, column=0, sticky="ew", pady=(12, 0))
         actions.columnconfigure(0, weight=1)
         actions.columnconfigure(1, weight=1)
         self.start_btn = ttk.Button(actions, text="▶  Старт измерения", style="Accent.TButton",
@@ -205,7 +242,7 @@ class IVTraceGUI:
 
         ttk.Checkbutton(left, text="Игнорировать самотесты (не рекомендуется)",
                         variable=self.skip_selftest_var,
-                        command=self._run_preflight).grid(row=4, column=0, sticky="w", pady=(8, 0))
+                        command=self._run_preflight).grid(row=6, column=0, sticky="w", pady=(8, 0))
 
         self._on_excitation_change()
 
@@ -338,6 +375,66 @@ class IVTraceGUI:
         except Exception as e:
             self.events.put(("preflight", (False, "Ошибка проверки", str(e))))
 
+    # -------------------------------------------------------------- sensor config
+    def _save_config(self):
+        name = self.e_config_name.get().strip()
+        if not name:
+            messagebox.showwarning("Имя конфига", "Введите имя для сохранения конфига.")
+            return
+        params = self._gather_params()
+        if params is None:
+            return
+        # Сохраняем также I_nom и ratio, если они есть
+        try:
+            inom = float(self.e_inom.get().strip().replace(",", ".")) if self.e_inom.get().strip() else None
+            ratio = float(self.e_ratio.get().strip().replace(",", ".")) if self.e_ratio.get().strip() else None
+        except ValueError:
+            messagebox.showerror("Ошибка", "I ном. и коэффициент должны быть числами.")
+            return
+        params['I_nom'] = inom
+        params['ratio'] = ratio
+        # Добавляем дополнительные опции
+        params['stop_on_error'] = self.stop_on_error_var.get()
+        try:
+            params['error_threshold'] = float(self.e_error_threshold.get().strip().replace(",", "."))
+        except ValueError:
+            messagebox.showerror("Ошибка", "Порог погрешности должен быть числом.")
+            return
+        params['use_relay'] = not self.no_relay_var.get()
+
+        path = self.sensor_config_mgr.save_sensor_config(name, params)
+        self._append_log(f"Конфиг датчика сохранён: {path}\n")
+        messagebox.showinfo("Успех", f"Конфиг сохранён как '{name}'.")
+
+    def _load_config(self):
+        name = self.e_config_name.get().strip()
+        if not name:
+            messagebox.showwarning("Имя конфига", "Введите имя конфига для загрузки.")
+            return
+        params = self.sensor_config_mgr.load_sensor_config(name)
+        if params is None:
+            messagebox.showerror("Ошибка", f"Конфиг '{name}' не найден или повреждён.")
+            return
+
+        # Заполняем поля интерфейса
+        self.excitation_var.set(params.get('excitation_type', 'current'))
+        self.e_start.delete(0, 'end'); self.e_start.insert(0, str(params.get('X_start', '')))
+        self.e_stop.delete(0, 'end'); self.e_stop.insert(0, str(params.get('X_stop', '')))
+        self.e_step.delete(0, 'end'); self.e_step.insert(0, str(params.get('X_step', '')))
+        self.e_vlimit.delete(0, 'end'); self.e_vlimit.insert(0, str(params.get('V_limit', '')))
+        self.e_delay.delete(0, 'end'); self.e_delay.insert(0, str(params.get('delay', '')))
+        self.e_cool.delete(0, 'end'); self.e_cool.insert(0, str(params.get('cooling_delay', '')))
+        self.e_label.delete(0, 'end'); self.e_label.insert(0, params.get('label', ''))
+        self.e_inom.delete(0, 'end'); self.e_inom.insert(0, str(params.get('I_nom', '')))
+        self.e_ratio.delete(0, 'end'); self.e_ratio.insert(0, str(params.get('ratio', '')))
+        self.stop_on_error_var.set(params.get('stop_on_error', False))
+        self.e_error_threshold.delete(0, 'end'); self.e_error_threshold.insert(0, str(params.get('error_threshold', 1.0)))
+        self.no_relay_var.set(not params.get('use_relay', True))
+
+        self._on_excitation_change()
+        self._append_log(f"Конфиг датчика загружен: {name}\n")
+        messagebox.showinfo("Успех", f"Конфиг '{name}' загружен.")
+
     # -------------------------------------------------------------- measurement
     def _gather_params(self):
         excitation_type = self.excitation_var.get()
@@ -346,6 +443,12 @@ class IVTraceGUI:
             raw = entry.get().strip().replace(",", ".")
             if raw == "":
                 raise ValueError(f"Поле «{name}» не заполнено.")
+            return float(raw)
+
+        def optional_num(entry):
+            raw = entry.get().strip().replace(",", ".")
+            if raw == "":
+                return None
             return float(raw)
 
         try:
@@ -362,6 +465,21 @@ class IVTraceGUI:
                 params["V_limit"] = num(self.e_vlimit, "Огр. напряжения")
             else:
                 params["V_limit"] = 0.0
+
+            # Новые параметры
+            params["I_nom"] = optional_num(self.e_inom)
+            params["ratio"] = optional_num(self.e_ratio)
+            params["stop_on_error"] = self.stop_on_error_var.get()
+            params["error_threshold"] = optional_num(self.e_error_threshold) or 1.0
+            params["use_relay"] = not self.no_relay_var.get()
+
+            # I_nom — только метаданные датчика для шапки CSV, для измерения
+            # он не нужен. А вот без коэффициента преобразования нечем считать
+            # ожидаемый выход датчика, поэтому отсечка по погрешности без него
+            # работать не может.
+            if params["stop_on_error"] and params["ratio"] is None:
+                raise ValueError("Для отсечки по погрешности необходимо указать коэффициент преобразования.")
+
         except ValueError as e:
             messagebox.showerror("Проверьте параметры", str(e))
             return None

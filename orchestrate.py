@@ -66,7 +66,8 @@ def _resolve_instruments(rm, excitation_type: str, dmm_addr: Optional[str],
 
 
 def write_results_csv(csv_path: Path, df: pd.DataFrame, params: dict,
-                      excitation_type: str, unit: str) -> None:
+                      excitation_type: str, unit: str,
+                      aborted_reason: Optional[str] = None) -> None:
     """Пишет CSV с шапкой метаданных (# ...) и данными измерения."""
     with open(csv_path, 'w', encoding='utf-8') as f:
         f.write(f"# Датчик: {params['label']}\n")
@@ -76,8 +77,20 @@ def write_results_csv(csv_path: Path, df: pd.DataFrame, params: dict,
                 f"шаг {params['X_step']} {unit}\n")
         if excitation_type == 'current':
             f.write(f"# Ограничение напряжения: {params['V_limit']} В\n")
-        f.write(f"# Обе полярности сняты автоматически через плату реле; точка X=0 — отдельно, "
-                f"без реле (см. колонку Branch)\n")
+        if params.get('I_nom'):
+            f.write(f"# Номинальный первичный ток: {params['I_nom']} А\n")
+        if params.get('ratio'):
+            f.write(f"# Коэффициент преобразования 1:{params['ratio']}\n")
+        if params.get('use_relay', True):
+            f.write("# Обе полярности сняты автоматически через плату реле; точка X=0 — "
+                    "отдельно, без реле (см. колонку Branch)\n")
+        else:
+            f.write("# Режим без реле: снята только одна полярность; точка X=0 — "
+                    "без источника (см. колонку Branch)\n")
+        if params.get('stop_on_error', False):
+            f.write(f"# Остановка при превышении погрешности: {params.get('error_threshold', 1.0)}%\n")
+        if aborted_reason:
+            f.write(f"# Измерение прервано досрочно: {aborted_reason}\n")
         f.write(f"# Задержка установки: {params['delay']} с\n")
         f.write(f"# Задержка охлаждения: {params['cooling_delay']} с\n")
         f.write(f"# Время измерения: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
@@ -97,8 +110,8 @@ def run_measurement_session(
     should_stop: StopFn = None,
 ) -> pd.DataFrame:
     """
-    Полный цикл: подобрать/открыть приборы и реле, снять обе ветви, записать
-    CSV по пути csv_path. Возвращает DataFrame результатов.
+    Полный цикл: подобрать/открыть приборы и реле, снять обе ветви (или одну, если use_relay=False),
+    записать CSV по пути csv_path. Возвращает DataFrame результатов.
 
     rm             — уже созданный pyvisa.ResourceManager (см. visa_backend).
     params         — словарь параметров из cli.resolve_measure_params.
@@ -130,22 +143,31 @@ def run_measurement_session(
 
     log("Приборы и реле инициализированы. Начинаю измерения...")
 
+    aborted_reason = None
     try:
-        results = run_measurement(
+        results, aborted_reason = run_measurement(
             dmm, src, relay, excitation_type,
             X_start=params['X_start'], X_stop=params['X_stop'], X_step=params['X_step'],
             V_limit=params['V_limit'], delay=params['delay'], cooling_delay=params['cooling_delay'],
             should_stop=should_stop,
+            ratio=params.get('ratio'),
+            stop_on_error=params.get('stop_on_error', False),
+            error_threshold=params.get('error_threshold', 1.0),
+            use_relay=params.get('use_relay', True),
+            log_callback=log,
         )
     finally:
         dmm.close()
         src.close()
         relay.close()
 
-    log("Измерения завершены, источник и реле выключены.")
+    if aborted_reason:
+        log(f"Измерение прервано досрочно: {aborted_reason}")
+    else:
+        log("Измерения завершены, источник и реле выключены.")
 
     df = pd.DataFrame(results)
-    write_results_csv(csv_path, df, params, excitation_type, unit)
+    write_results_csv(csv_path, df, params, excitation_type, unit, aborted_reason)
     log(f"Данные сохранены в {csv_path}")
 
     return df
