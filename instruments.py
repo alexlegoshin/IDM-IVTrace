@@ -1,9 +1,43 @@
 import json
+import math
 import time
 from pathlib import Path
 from typing import List, Optional, Tuple
 
 import pyvisa
+
+# Реальный ток датчика на этом стенде никогда не приблизится к этому
+# порядку величины. Значение такого масштаба (~9.9e37 у большинства
+# SCPI-совместимых DMM) — это не измерение, а сентинел переполнения:
+# прибор отдаёт его вместо ошибки, когда измеряемая величина выходит за
+# пределы текущего установленного диапазона (см. issue #3 — крупный шаг
+# развёртки на датчике с большим коэффициентом преобразования). Раньше это
+# число принималось за обычное показание и попадало и в среднее, и в CSV.
+OVERFLOW_SENTINEL_THRESHOLD = 1e30
+
+# Пауза после смены диапазона в РУЧНОМ режиме (manual_range: true) — прибор
+# физически переключает реле входного делителя и не успевает устояться
+# мгновенно. В авто-режиме прибор делает это сам и синхронно с измерением,
+# поэтому здесь эта пауза не участвует (см. Multimeter.set_range).
+# Регулируется полем "range_settle_delay" в конфиге прибора.
+DEFAULT_RANGE_SETTLE_DELAY = 0.7
+
+# Гистерезис auto_range(): порог подъёма — доля от ВЕРХНЕГО (текущего)
+# диапазона; порог спуска — доля от НИЖНЕГО (на ступень меньше текущего)
+# диапазона. Раньше оба порога считались от текущего диапазона (95% вверх,
+# 10% вниз) — а на декадных шкалах 10% текущего это ровно 100% диапазона
+# на ступень ниже, то есть сразу после спуска показание оказывалось на
+# самой верхней границе НОВОГО диапазона и тут же провоцировало обратный
+# подъём (автоколебания). Проверка порога спуска по диапазону назначения,
+# а не текущему, убирает этот нахлёст: после спуска значение занимает не
+# больше DOWN_SAFE_FRACTION нового диапазона — заведомо ниже порога подъёма.
+UP_THRESHOLD_FRACTION = 0.95
+DOWN_SAFE_FRACTION = 0.5
+
+
+def is_overflow_reading(value: float) -> bool:
+    """True, если value похоже на SCPI-сентинел переполнения диапазона, а не на реальное измерение."""
+    return not math.isnan(value) and abs(value) > OVERFLOW_SENTINEL_THRESHOLD
 
 
 class Multimeter:
@@ -41,8 +75,21 @@ class Multimeter:
     def set_range(self, range_val: float):
         if not self.config.get('manual_range', False):
             return
+        # range_command может параметризоваться и значением диапазона
+        # ({range_val}, большинство приборов, например АКИП: "...RANG
+        # {range_val}"), и его ПОРЯДКОВЫМ ИНДЕКСОМ ({index}) — так у RIGOL
+        # DM3068 в режиме вольтметра (":MEASure:VOLTage:DC {index}", индекс
+        # 0..4, проверено в IDM-DNKMetr). Плейсхолдер, которого нет в
+        # строке команды, str.format() просто игнорирует, поэтому оба можно
+        # передавать всегда, не завися от того, какой стиль в конфиге.
         cmd = self.config['range_command']
-        self.instr.write(cmd.format(range_val=range_val))
+        self.instr.write(cmd.format(range_val=range_val, index=self.current_range_idx))
+        # Задержка на устаканивание — только в ручном режиме: в авто прибор
+        # переключает диапазон сам, синхронно с собственным измерением, и
+        # эта пауза ему ни к чему (см. DEFAULT_RANGE_SETTLE_DELAY выше).
+        delay = self.config.get('range_settle_delay', DEFAULT_RANGE_SETTLE_DELAY)
+        if delay > 0:
+            time.sleep(delay)
 
     def measure_current(self) -> float:
         # В ручном режиме (manual_range: true) measure_command обязан быть
@@ -53,34 +100,50 @@ class Multimeter:
         cmd = self.config['measure_command']
         return float(self.instr.query(cmd))
 
+    def _covering_range_index(self, abs_value: float) -> int:
+        """Наименьший индекс диапазона, покрывающего |value|; максимум, если такого нет."""
+        for i, r in enumerate(self.ranges):
+            if r >= abs_value:
+                return i
+        return len(self.ranges) - 1
+
     def auto_range(self, measured_current: float, is_first: bool = False):
         """
-        Динамическая подстройка диапазона по модулю измеренного тока.
-        При is_first=True выбирается наименьший диапазон, покрывающий измеренное значение.
-        Иначе — подъём при >95% предела, спуск при <10% предела.
+        Подстройка диапазона по модулю measured_current.
+
+        is_first=True — диапазон выбирается заново, без оглядки на текущий:
+        наименьший, покрывающий |measured_current|. Используется не только
+        для самой первой точки прохода, но и как ПРЕДСКАЗАНИЕ диапазона под
+        СЛЕДУЮЩУЮ точку по её ожидаемому значению (X_set/ratio) — см.
+        measurement.py. Раньше диапазон выбирался только по факту ПРЕДЫДУЩЕЙ
+        точки, и на резком скачке возбуждения (issue #3) заведомо не
+        подходил для новой, гораздо большей точки.
+
+        is_first=False — плавная подстройка вокруг уже выбранного диапазона:
+        подъём на одну ступень при >95% его предела, спуск на одну ступень,
+        если значение уместится не более чем в DOWN_SAFE_FRACTION диапазона
+        НИЖЕ текущего (не самого текущего — см. DOWN_SAFE_FRACTION выше).
+        Одной ступени вверх достаточно: значения, которым нужно больше,
+        перехватываются как переполнение (is_overflow_reading) ДО вызова
+        auto_range() и обрабатываются прыжком на максимум отдельно — сюда
+        такие значения не попадают вовсе (см. measurement.py).
         """
         abs_i = abs(measured_current)
         if is_first:
-            for i, r in enumerate(self.ranges):
-                if r >= abs_i:
-                    self.current_range_idx = i
-                    self.set_range(r)
-                    return
-            # Ток больше всех известных пределов — остаёмся на максимальном
-            self.current_range_idx = len(self.ranges) - 1
+            self.current_range_idx = self._covering_range_index(abs_i)
             self.set_range(self.ranges[self.current_range_idx])
-        else:
-            current_limit = self.ranges[self.current_range_idx]
-            if abs_i > current_limit * 0.95:
-                if self.current_range_idx < len(self.ranges) - 1:
-                    self.current_range_idx += 1
-                    self.set_range(self.ranges[self.current_range_idx])
-            elif abs_i < current_limit * 0.1 and self.current_range_idx > 0:
-                for i in reversed(range(self.current_range_idx)):
-                    if self.ranges[i] >= abs_i:
-                        self.current_range_idx = i
-                        self.set_range(self.ranges[i])
-                        break
+            return
+
+        current_limit = self.ranges[self.current_range_idx]
+        if abs_i > current_limit * UP_THRESHOLD_FRACTION:
+            if self.current_range_idx < len(self.ranges) - 1:
+                self.current_range_idx += 1
+                self.set_range(self.ranges[self.current_range_idx])
+        elif self.current_range_idx > 0:
+            lower_limit = self.ranges[self.current_range_idx - 1]
+            if abs_i <= lower_limit * DOWN_SAFE_FRACTION:
+                self.current_range_idx -= 1
+                self.set_range(self.ranges[self.current_range_idx])
 
     def close(self):
         try:

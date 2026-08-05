@@ -4,7 +4,7 @@ import pytest
 
 from instruments import (
     Multimeter, CurrentSource, VoltageSource,
-    find_config_for_idn, discover_instruments,
+    find_config_for_idn, discover_instruments, is_overflow_reading,
 )
 from tests.conftest import FakeVisaResource, FakeResourceManager
 
@@ -57,6 +57,11 @@ def akip2101_manual_range_cfg(instruments_dir, tmp_path):
     """
     cfg = json.loads((instruments_dir / "multimeters" / "akip2101.json").read_text(encoding='utf-8'))
     cfg['manual_range'] = True
+    # По умолчанию set_range() спит DEFAULT_RANGE_SETTLE_DELAY (0.7 с) после
+    # каждой смены диапазона — это сознательная задержка на устаканивание
+    # прибора (см. instruments.py), а не то, что должно тормозить тесты
+    # логики переключения. Сама задержка проверяется отдельным тестом.
+    cfg['range_settle_delay'] = 0
     path = tmp_path / "akip2101_manual.json"
     path.write_text(json.dumps(cfg), encoding='utf-8')
     return path
@@ -165,6 +170,213 @@ def test_auto_range_stays_put_within_normal_band(akip2101_cfg, make_fake_rm):
     before = dmm.current_range_idx
     dmm.auto_range(0.05, is_first=False)  # between 10% and 95% of 0.2
     assert dmm.current_range_idx == before
+
+
+# ----------------------------------------------------------------------
+# auto_range — гистерезис не должен провоцировать автоколебания (Ф1 п.6)
+# ----------------------------------------------------------------------
+
+def test_auto_range_step_down_does_not_land_at_the_upper_edge_of_new_range(akip2101_cfg, make_fake_rm):
+    """
+    Регрессия на автоколебания: старый порог спуска (<10% ТЕКУЩЕГО
+    диапазона) на декадных шкалах совпадал со 100% диапазона на ступень
+    ниже — сразу после спуска значение оказывалось на самой верхней границе
+    нового диапазона и тут же провоцировало обратный подъём.
+
+    ranges = [0.0002, 0.002, 0.02, 0.2, 2.0, 10.0]. current_range_idx=3
+    (0.2), значение 0.0195 — это чуть МЕНЬШЕ старого порога спуска (0.02),
+    но 97.5% диапазона на ступень ниже (0.02). Старый алгоритм спустился бы
+    сюда и тут же снова поднялся бы на следующем вызове. Новый — не должен
+    спускаться вовсе, раз значение не уместится с запасом в диапазон ниже.
+    """
+    fake = FakeVisaResource()
+    rm = make_fake_rm({"FAKE::ADDR": fake})
+    dmm = Multimeter("FAKE::ADDR", akip2101_cfg, rm=rm)
+
+    dmm.current_range_idx = 3  # range 0.2
+    dmm.auto_range(0.0195, is_first=False)
+
+    assert dmm.current_range_idx == 3, "не должен был спуститься — 0.0195 не влезает с запасом в 0.02"
+
+
+def test_auto_range_step_down_lands_comfortably_below_the_up_threshold(akip2101_cfg, make_fake_rm):
+    """
+    Когда спуск всё же происходит, новое показание должно оказаться далеко
+    от порога обратного подъёма — иначе шум на границе снова закачает
+    диапазон туда-сюда.
+    """
+    fake = FakeVisaResource()
+    rm = make_fake_rm({"FAKE::ADDR": fake})
+    dmm = Multimeter("FAKE::ADDR", akip2101_cfg, rm=rm)
+
+    dmm.current_range_idx = 3  # range 0.2
+    dmm.auto_range(0.001, is_first=False)  # 5% диапазона ступенью ниже (0.02)
+
+    assert dmm.current_range_idx == 2
+    new_range = dmm.ranges[dmm.current_range_idx]
+    assert 0.001 <= new_range * 0.95, "приземлились слишком близко к порогу обратного подъёма"
+
+
+def test_auto_range_never_oscillates_around_a_decade_boundary(akip2101_cfg, make_fake_rm):
+    """
+    Прогоняем auto_range() многократно на значении ровно у старой границы
+    (10% текущего диапазона = 100% диапазона ниже) — диапазон должен
+    зафиксироваться и больше не переключаться, а не бегать туда-сюда.
+    """
+    fake = FakeVisaResource()
+    rm = make_fake_rm({"FAKE::ADDR": fake})
+    dmm = Multimeter("FAKE::ADDR", akip2101_cfg, rm=rm)
+    dmm.current_range_idx = 3  # range 0.2
+
+    boundary_value = 0.02  # старая граница переключения
+    seen_indices = set()
+    for _ in range(10):
+        dmm.auto_range(boundary_value, is_first=False)
+        seen_indices.add(dmm.current_range_idx)
+
+    assert len(seen_indices) == 1, f"диапазон переключался туда-сюда: {seen_indices}"
+
+
+# ----------------------------------------------------------------------
+# auto_range — подъём на большой единичный скачок (issue #3, Ф1 п.6)
+# ----------------------------------------------------------------------
+
+def test_auto_range_is_first_jumps_directly_across_multiple_decades(akip2101_manual_range_cfg, make_fake_rm):
+    """
+    is_first=True (в т.ч. предсказание диапазона по X_set/ratio, см.
+    measurement.py) обязано прыгать сразу на нужный диапазон, а не
+    подниматься по одной ступени — именно так теперь чинится основной
+    сценарий issue #3 (0 -> 50 А на датчике 1:2000).
+    """
+    fake = FakeVisaResource()
+    rm = make_fake_rm({"FAKE::ADDR": fake})
+    dmm = Multimeter("FAKE::ADDR", akip2101_manual_range_cfg, rm=rm)
+    dmm.current_range_idx = 0  # range 0.0002 — заведомо занижен
+
+    dmm.auto_range(0.015, is_first=True)  # реальный выход, соответствующий 50А/1:2000 = 0.025, здесь просто похожая величина
+
+    assert dmm.ranges[dmm.current_range_idx] == 0.02
+    assert fake.written[-1] == 'SENS:CURR:DC:RANG 0.02'
+
+
+# ----------------------------------------------------------------------
+# is_overflow_reading
+# ----------------------------------------------------------------------
+
+def test_is_overflow_reading_detects_scpi_sentinel():
+    assert is_overflow_reading(9.9e37) is True
+    assert is_overflow_reading(-9.9e37) is True
+
+
+def test_is_overflow_reading_false_for_real_currents():
+    assert is_overflow_reading(0.0) is False
+    assert is_overflow_reading(-2.5) is False
+    assert is_overflow_reading(1020.0) is False  # даже паспортный максимум источника — не сентинел
+
+
+def test_is_overflow_reading_false_for_nan():
+    # NaN — сбой связи (см. measurement._measure_branch), не переполнение.
+    # Не должен путаться с сентинелом при агрегированной обработке.
+    assert is_overflow_reading(float('nan')) is False
+
+
+# ----------------------------------------------------------------------
+# set_range — задержка на устаканивание в ручном режиме (Ф1 п.6)
+# ----------------------------------------------------------------------
+
+def test_set_range_sleeps_default_delay_in_manual_mode(akip2101_manual_range_cfg, make_fake_rm, monkeypatch):
+    import instruments as instruments_module
+
+    sleeps = []
+    monkeypatch.setattr(instruments_module.time, 'sleep', lambda s: sleeps.append(s))
+
+    fake = FakeVisaResource()
+    rm = make_fake_rm({"FAKE::ADDR": fake})
+    # Фикстура зануляет range_settle_delay ради скорости остальных тестов —
+    # здесь проверяем именно ненулевую задержку, поэтому убираем override.
+    cfg = json.loads(akip2101_manual_range_cfg.read_text(encoding='utf-8'))
+    del cfg['range_settle_delay']
+    override_path = akip2101_manual_range_cfg.parent / "akip2101_manual_default_delay.json"
+    override_path.write_text(json.dumps(cfg), encoding='utf-8')
+
+    dmm = Multimeter("FAKE::ADDR", override_path, rm=rm)
+    sleeps.clear()  # интересует только вызов из set_range(), не из _init_device()
+
+    dmm.set_range(0.02)
+
+    assert 0.7 in sleeps
+
+
+def test_set_range_delay_is_configurable(akip2101_manual_range_cfg, make_fake_rm, monkeypatch):
+    import instruments as instruments_module
+
+    sleeps = []
+    monkeypatch.setattr(instruments_module.time, 'sleep', lambda s: sleeps.append(s))
+
+    cfg = json.loads(akip2101_manual_range_cfg.read_text(encoding='utf-8'))
+    cfg['range_settle_delay'] = 1.5
+    override_path = akip2101_manual_range_cfg.parent / "akip2101_manual_custom_delay.json"
+    override_path.write_text(json.dumps(cfg), encoding='utf-8')
+
+    fake = FakeVisaResource()
+    rm = make_fake_rm({"FAKE::ADDR": fake})
+    dmm = Multimeter("FAKE::ADDR", override_path, rm=rm)
+    sleeps.clear()
+
+    dmm.set_range(0.02)
+
+    assert 1.5 in sleeps
+
+
+def test_set_range_does_not_sleep_in_auto_mode(akip2101_cfg, make_fake_rm, monkeypatch):
+    import instruments as instruments_module
+
+    sleeps = []
+    monkeypatch.setattr(instruments_module.time, 'sleep', lambda s: sleeps.append(s))
+
+    fake = FakeVisaResource()
+    rm = make_fake_rm({"FAKE::ADDR": fake})
+    dmm = Multimeter("FAKE::ADDR", akip2101_cfg, rm=rm)
+    sleeps.clear()
+
+    dmm.set_range(0.02)  # no-op в авто-режиме — не должен ни писать в порт, ни спать
+
+    assert sleeps == []
+
+
+# ----------------------------------------------------------------------
+# set_range — стиль {index} (RIGOL DM3068 в режиме вольтметра, Ф1 п.6)
+# ----------------------------------------------------------------------
+
+def test_set_range_supports_index_style_command(instruments_dir, tmp_path, make_fake_rm):
+    """
+    range_command может параметризоваться либо значением диапазона
+    ({range_val} — стиль АКИП), либо его порядковым индексом ({index} —
+    стиль RIGOL DM3068 в режиме вольтметра, см. IDM-DNKMetr). Оба
+    плейсхолдера должны поддерживаться без завязки на то, какой из них
+    реально есть в строке команды.
+    """
+    cfg = {
+        "model_name": "synthetic index-style DMM",
+        "keywords": ["SYNTH"],
+        "init_commands": [],
+        "measure_command": "MEAS?",
+        "manual_range": True,
+        "range_command": ":MEASure:VOLTage:DC {index}",
+        "range_settle_delay": 0,
+        "ranges": [0.2, 2.0, 20.0, 200.0, 1000.0],
+    }
+    path = tmp_path / "index_style.json"
+    path.write_text(json.dumps(cfg), encoding='utf-8')
+
+    fake = FakeVisaResource()
+    rm = make_fake_rm({"FAKE::ADDR": fake})
+    dmm = Multimeter("FAKE::ADDR", path, rm=rm)
+
+    dmm.current_range_idx = 2
+    dmm.set_range(dmm.ranges[2])  # значение здесь не используется командой вовсе
+
+    assert fake.written[-1] == ':MEASure:VOLTage:DC 2'
 
 
 def test_multimeter_close_does_not_raise(akip2101_cfg, make_fake_rm):

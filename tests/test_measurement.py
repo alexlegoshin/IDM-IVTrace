@@ -2,7 +2,10 @@ import math
 
 import pytest
 
-from measurement import run_measurement, _measure_branch, EXCITATION_UNITS
+from measurement import (
+    run_measurement, _measure_branch, _read_attempts, _read_averaged_current,
+    EXCITATION_UNITS,
+)
 
 
 class FakeDMM:
@@ -170,6 +173,175 @@ def test_measure_branch_range_reset_starts_from_max_range():
 
     assert dmm.current_range_idx == len(dmm.ranges) - 1
     assert dmm.set_range_calls[0] == dmm.ranges[-1]
+
+
+# ----------------------------------------------------------------------
+# _read_attempts / _read_averaged_current — сентинел переполнения (issue #3)
+# ----------------------------------------------------------------------
+
+def test_read_attempts_excludes_overflow_and_jumps_straight_to_max_range():
+    dmm = FakeDMM(readings=[9.9e37, 0.02, 0.021])
+    dmm.current_range_idx = 0
+
+    valid, overflowed = _read_attempts(dmm, attempts=3)
+
+    assert valid == [0.02, 0.021]
+    assert overflowed is True
+    # Прыжок сразу на максимум, а не на одну ступень: по факту сентинела
+    # невозможно понять, насколько именно ушли за предел.
+    assert dmm.current_range_idx == len(dmm.ranges) - 1
+    assert dmm.set_range_calls[0] == dmm.ranges[-1]
+
+
+def test_read_attempts_excludes_negative_overflow_sentinel_too():
+    dmm = FakeDMM(readings=[-9.9e37, 1.0, 1.0])
+
+    valid, overflowed = _read_attempts(dmm, attempts=3)
+
+    assert valid == [1.0, 1.0]
+    assert overflowed is True
+
+
+def test_read_attempts_no_overflow_flag_on_clean_readings():
+    dmm = FakeDMM(readings=[1.0, 1.0, 1.0])
+    valid, overflowed = _read_attempts(dmm, attempts=3)
+    assert overflowed is False
+    assert valid == [1.0, 1.0, 1.0]
+
+
+def test_read_averaged_current_retries_once_after_full_overflow():
+    # Первый заход (3 попытки) — сплошное переполнение, диапазон
+    # исправляется на максимум внутри самого захода; второй заход на уже
+    # исправленном диапазоне даёт настоящие показания.
+    dmm = FakeDMM(readings=[9.9e37, 9.9e37, 9.9e37, 0.5, 0.51, 0.49])
+    currents = _read_averaged_current(dmm, attempts=3)
+    assert currents == [0.5, 0.51, 0.49]
+
+
+def test_read_averaged_current_gives_up_after_second_round_still_overflowing():
+    # Ни один из двух заходов не дал валидного чтения — сдаёмся (пустой
+    # список превратится в NaN точку выше по стеку, а не в мусорное число).
+    dmm = FakeDMM(readings=[9.9e37] * 6)
+    assert _read_averaged_current(dmm, attempts=3) == []
+
+
+def test_read_averaged_current_does_not_retry_when_no_overflow_happened():
+    # Если сбои — это просто обычные исключения (сбой связи), а не
+    # переполнение, повторного захода быть не должно: это уже поведение
+    # "все чтения провалились", а не "диапазон был занижен".
+    dmm = FakeDMM(readings=[Exception("timeout")] * 3)
+    assert _read_averaged_current(dmm, attempts=3) == []
+
+
+# ----------------------------------------------------------------------
+# _measure_branch — переполнение не должно попасть в результат (issue #3)
+# ----------------------------------------------------------------------
+
+def test_measure_branch_excludes_overflow_reading_from_the_average():
+    dmm = FakeDMM(readings=[9.9e37, 0.02, 0.021])
+    src = FakeSource()
+
+    results, _ = _measure_branch(
+        dmm, src, 'current',
+        X_start=1, X_stop=1, X_step=1,
+        delay=0, cooling_delay=0,
+        sign=+1, branch_name='forward',
+    )
+
+    assert results[0]['I_meas_A'] == pytest.approx((0.02 + 0.021) / 2)
+
+
+def test_measure_branch_records_nan_not_the_sentinel_when_permanently_saturated():
+    dmm = FakeDMM(readings=[9.9e37] * 6)
+    src = FakeSource()
+
+    results, _ = _measure_branch(
+        dmm, src, 'current',
+        X_start=1, X_stop=1, X_step=1,
+        delay=0, cooling_delay=0,
+        sign=+1, branch_name='forward',
+    )
+
+    # Ключевая регрессия issue #3: раньше сюда попадало ~9.9e37 как будто
+    # это настоящее измерение. Теперь — честный NaN, а не гигантское число.
+    assert math.isnan(results[0]['I_meas_A'])
+
+
+# ----------------------------------------------------------------------
+# Предсказание диапазона по ожидаемому значению (Ф1 п.6, defect #1)
+# ----------------------------------------------------------------------
+
+def test_measure_branch_preselects_range_from_expected_value_when_ratio_known():
+    dmm = FakeDMM(readings=[0.025] * 3)  # X_set=50, ratio=2000 -> ожидаемый выход 0.025
+    src = FakeSource()
+
+    _measure_branch(
+        dmm, src, 'current',
+        X_start=50, X_stop=50, X_step=1,
+        delay=0, cooling_delay=0,
+        sign=+1, branch_name='forward',
+        ratio=2000.0,
+    )
+
+    assert (0.025, True) in dmm.auto_range_calls
+
+
+def test_measure_branch_preselection_happens_before_excitation_and_measurement():
+    """
+    Это и есть сама починка defect #1: диапазон должен выбираться ДО того,
+    как выставлено возбуждение и снято показание — по ожидаемому значению
+    следующей точки, а не по факту предыдущей.
+    """
+    order = []
+
+    class OrderedDMM(FakeDMM):
+        def auto_range(self, measured_current, is_first=False):
+            order.append(('auto_range', measured_current, is_first))
+            super().auto_range(measured_current, is_first)
+
+        def measure_current(self):
+            order.append(('measure',))
+            return super().measure_current()
+
+    class OrderedSource(FakeSource):
+        def set_current(self, current):
+            order.append(('set_current', current))
+            super().set_current(current)
+
+    dmm = OrderedDMM(readings=[0.025] * 3)
+    src = OrderedSource()
+
+    _measure_branch(
+        dmm, src, 'current',
+        X_start=50, X_stop=50, X_step=1,
+        delay=0, cooling_delay=0,
+        sign=+1, branch_name='forward',
+        ratio=2000.0,
+    )
+
+    predict_idx = order.index(('auto_range', 0.025, True))
+    excite_idx = order.index(('set_current', 50))
+    measure_idx = order.index(('measure',))
+    assert predict_idx < excite_idx < measure_idx
+
+
+def test_measure_branch_skips_preselection_without_ratio():
+    # Без ratio предсказывать нечего — остаётся только подстройка по факту
+    # после измерения (is_first только на первой точке прохода), как раньше.
+    dmm = FakeDMM(readings=[1.0] * 3)
+    src = FakeSource()
+
+    _measure_branch(
+        dmm, src, 'current',
+        X_start=1, X_stop=1, X_step=1,
+        delay=0, cooling_delay=0,
+        sign=+1, branch_name='forward',
+    )
+
+    # Единственный auto_range-вызов — послеизмерительный (is_first=True для
+    # первой точки прохода), не предсказательный.
+    assert len(dmm.auto_range_calls) == 1
+    assert dmm.auto_range_calls[0] == (1.0, True)
 
 
 # ----------------------------------------------------------------------

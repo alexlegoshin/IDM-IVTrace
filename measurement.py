@@ -7,6 +7,7 @@ import pyvisa
 
 from instruments import CurrentSource, VoltageSource
 from instruments import Multimeter as DMM
+from instruments import is_overflow_reading
 from relay import RelayController
 
 # Единицы измерения задаваемой величины возбуждения — используются и в
@@ -15,6 +16,68 @@ EXCITATION_UNITS = {
     'current': 'A',
     'voltage': 'V',
 }
+
+
+def _read_attempts(dmm: DMM, attempts: int) -> Tuple[List[float], bool]:
+    """
+    Один заход из `attempts` попыток чтения. Возвращает (валидные показания,
+    было ли хоть одно переполнение).
+
+    Сбой связи (VisaIOError) — как и раньше: если диапазон ещё не на
+    максимуме, поднимаем на одну ступень и пробуем прочитать ещё раз, не
+    выходя за пределы этой попытки.
+
+    Переполнение (is_overflow_reading, см. instruments.py) — SCPI-сентинел
+    вроде ~9.9e37 вместо ошибки, когда величина вышла за пределы текущего
+    диапазона (issue #3). Такое показание НЕ идёт в среднее: оно не несёт
+    информации о реальной величине, усреднять его с настоящими отсчётами —
+    портить каждую точку рядом с переполнением. Диапазон при этом прыгает
+    сразу на максимум, а не поднимается на одну ступень, как раньше: по
+    самому факту сентинела невозможно понять, насколько именно ушли за
+    предел, поэтому гадать (и получать ещё одно переполнение) бессмысленно.
+    """
+    valid: List[float] = []
+    overflowed = False
+    for _ in range(attempts):
+        try:
+            i = dmm.measure_current()
+        except pyvisa.errors.VisaIOError:
+            if dmm.current_range_idx < len(dmm.ranges) - 1:
+                dmm.current_range_idx += 1
+                dmm.set_range(dmm.ranges[dmm.current_range_idx])
+                try:
+                    i = dmm.measure_current()
+                except Exception:
+                    continue
+            else:
+                continue
+        except Exception:
+            continue
+
+        if is_overflow_reading(i):
+            overflowed = True
+            if dmm.current_range_idx < len(dmm.ranges) - 1:
+                dmm.current_range_idx = len(dmm.ranges) - 1
+                dmm.set_range(dmm.ranges[dmm.current_range_idx])
+            continue
+
+        valid.append(i)
+    return valid, overflowed
+
+
+def _read_averaged_current(dmm: DMM, attempts: int = 3) -> List[float]:
+    """
+    Снимает до `attempts` валидных показаний тока для одной точки.
+
+    Если весь первый заход ушёл в переполнение (валидных показаний нет, но
+    хотя бы одно было отброшено как сентинел), диапазон уже поднят на
+    максимум внутри _read_attempts — даём один повторный заход тем же
+    числом попыток на исправленном диапазоне, а не сразу сдаёмся в NaN.
+    """
+    valid, overflowed = _read_attempts(dmm, attempts)
+    if not valid and overflowed:
+        valid, _ = _read_attempts(dmm, attempts)
+    return valid
 
 
 def _log(message: str, log_callback: Optional[Callable[[str], None]]) -> None:
@@ -129,6 +192,13 @@ def _measure_branch(dmm: DMM, src: Union[CurrentSource, VoltageSource],
             continue
         signed_value = abs_value * sign
 
+        # Диапазон под ЭТУ точку — по ожидаемому выходу датчика
+        # (|X_set|/ratio), ДО того как что-то измерено, а не по факту
+        # предыдущей точки (issue #3). Без ratio предсказать нечего —
+        # остаётся только подстройка по факту после измерения, как раньше.
+        if ratio and ratio > 0:
+            dmm.auto_range(abs_value / ratio, is_first=True)
+
         if excitation_type == 'current':
             src.set_current(abs_value)
         else:
@@ -136,22 +206,7 @@ def _measure_branch(dmm: DMM, src: Union[CurrentSource, VoltageSource],
         src.output_on()
         time.sleep(delay)
 
-        currents = []
-        for _ in range(3):
-            try:
-                i = dmm.measure_current()
-                currents.append(i)
-            except pyvisa.errors.VisaIOError:
-                if dmm.current_range_idx < len(dmm.ranges) - 1:
-                    dmm.current_range_idx += 1
-                    dmm.set_range(dmm.ranges[dmm.current_range_idx])
-                    try:
-                        i = dmm.measure_current()
-                        currents.append(i)
-                    except Exception:
-                        pass
-            except Exception:
-                pass
+        currents = _read_averaged_current(dmm)
 
         if currents:
             i_avg = sum(currents) / len(currents)
