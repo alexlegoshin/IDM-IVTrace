@@ -54,6 +54,11 @@ def test_multimeter_measure_command_does_not_reset_range(instruments_dir):
     """
     for f in _multimeter_configs(instruments_dir):
         cfg = _load(f)
+        if cfg.get("range_command") is False:
+            # Явный отказ от ручного диапазона (прибор не поддерживает SCPI
+            # SENS:...:RANG вовсе, см. rigol_dm3068.json) — сброс диапазона
+            # на MEAS? тут не проблема, т.к. set_range() всё равно no-op.
+            continue
         cmd = cfg["measure_command"].strip().upper()
         assert not cmd.startswith("MEAS"), f"{f.name}: measure_command не должен быть MEAS? (сбрасывает диапазон)"
         assert not cmd.startswith("CONF"), f"{f.name}: measure_command не должен быть CONF? (сбрасывает диапазон)"
@@ -68,6 +73,8 @@ def test_multimeter_init_disables_autorange(instruments_dir):
     """
     for f in _multimeter_configs(instruments_dir):
         cfg = _load(f)
+        if cfg.get("range_command") is False:
+            continue
         commands_upper = [c.upper() for c in cfg["init_commands"]]
         assert any("RANG:AUTO" in c and "OFF" in c for c in commands_upper), \
             f"{f.name}: init_commands должны явно отключать авто-диапазон (RANG:AUTO OFF)"

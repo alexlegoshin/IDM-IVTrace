@@ -27,7 +27,16 @@ class Multimeter:
         self.set_range(self.ranges[self.current_range_idx])
 
     def set_range(self, range_val: float):
-        self.instr.write(f'SENS:CURR:DC:RANG {range_val}')
+        # Костыль для приборов без поддержки SENS:CURR:DC:RANG по SCPI
+        # (например, RIGOL DM3068 — отвечает -113 Undefined header на всю
+        # подсистему SENS:, работает только самодостаточный MEAS:CURR:DC?,
+        # который сам авто-диапазонируется). range_command в конфиге:
+        # опущен — прежнее поведение (SENS:CURR:DC:RANG), false/null —
+        # ручная установка диапазона отключена (no-op).
+        cmd = self.config.get('range_command', 'SENS:CURR:DC:RANG {range_val}')
+        if not cmd:
+            return
+        self.instr.write(cmd.format(range_val=range_val))
 
     def measure_current(self) -> float:
         # measure_command должен быть 'READ?' (или 'FETC?'), а не 'MEAS:CURR:DC?':
