@@ -55,6 +55,34 @@ class _QueueWriter(io.TextIOBase):
         pass
 
 
+class _SessionSlot:
+    """
+    Ссылка на приборы идущего измерения, разделяемая двумя потоками.
+
+    Заполняет её рабочий поток (когда orchestrate откроет приборы), читает
+    UI-поток (когда оператор жмёт «Стоп» или закрывает окно). Замок нужен не
+    столько от гонки за саму ссылку — присваивание атрибута в CPython
+    атомарно, — сколько чтобы «Стоп», нажатый дважды подряд, не запустил две
+    аварийные последовательности внахлёст.
+    """
+
+    def __init__(self):
+        self._handle = None
+        self._lock = threading.Lock()
+
+    def set(self, handle):
+        with self._lock:
+            self._handle = handle
+
+    def get(self):
+        with self._lock:
+            return self._handle
+
+    def clear(self):
+        with self._lock:
+            self._handle = None
+
+
 class IVTraceGUI:
     def __init__(self, root: tk.Tk, args):
         self.root = root
@@ -66,6 +94,9 @@ class IVTraceGUI:
 
         self.events = queue.Queue()
         self.stop_event = threading.Event()
+        # Ручка на приборы идущего измерения — через неё «Стоп» обесточивает
+        # стенд, не дожидаясь, пока цикл дойдёт до проверки stop_event.
+        self._session = _SessionSlot()
         self.worker = None
         self._preflight_ok = False
         self.last_csv = None
@@ -535,12 +566,16 @@ class IVTraceGUI:
                 rm, params, csv_path,
                 dmm_addr=addr["dmm_addr"], src_addr=addr["src_addr"], relay_port=addr["relay_port"],
                 should_stop=self.stop_event.is_set,
+                on_session_open=self._session.set,
             )
             self.events.put(("done", str(csv_path)))
         except Exception as e:
             traceback.print_exc()
             self.events.put(("error", str(e)))
         finally:
+            # Приборы этой сессии закрыты — ручка больше не должна вести на
+            # мёртвые сессии, иначе следующий «Стоп» попытается писать в них.
+            self._session.clear()
             if rm is not None:
                 try:
                     rm.close()
@@ -549,9 +584,29 @@ class IVTraceGUI:
             sys.stdout, sys.stderr = old_out, old_err
 
     def _request_stop(self):
-        self.stop_event.set()
-        self._append_log("\n… запрошена остановка, завершаю текущую точку/ветвь…\n")
+        """
+        Кнопка «Стоп» = аварийное обесточивание, а не вежливая просьба.
+
+        Раньше здесь выставлялся только флаг, и стенд оставался под током,
+        пока измерительный цикл не доберётся до ближайшей проверки между
+        точками — то есть до конца текущей точки со всеми её задержками.
+        Оператор жмёт «Стоп», когда что-то идёт не так прямо сейчас, поэтому
+        сначала гасим железо (из этого же потока, немедленно), и только
+        потом просим цикл свернуться.
+        """
         self.stop_btn.configure(state="disabled")
+        self._append_log("\n… СТОП: обесточиваю стенд…\n")
+
+        handle = self._session.get()
+        if handle is not None:
+            for step in handle.emergency_stop():
+                self._append_log(f"  {step}\n")
+            self._append_log("Стенд обесточен.\n")
+
+        # Флаг всё равно выставляем: если аварийная последовательность
+        # почему-то не свалила цикл (например, приборы успели ответить),
+        # он должен свернуться сам, а не идти дальше по точкам.
+        self.stop_event.set()
 
     def _set_running(self, running):
         self.start_btn.configure(state="disabled" if running else ("normal" if self._preflight_ok else "disabled"))
@@ -617,6 +672,16 @@ class IVTraceGUI:
         # не ловить "invalid command name ..._drain_events" на уже
         # уничтоженном окне.
         self._closing = True
+        # Закрытие окна во время измерения обесточивает стенд так же жёстко,
+        # как кнопка «Стоп»: рабочий поток — daemon, он умрёт вместе с
+        # процессом и никаких finally не выполнит, а стенд останется под
+        # током с замкнутым реле.
+        handle = self._session.get()
+        if handle is not None:
+            try:
+                handle.emergency_stop()
+            except Exception:
+                pass
         self.stop_event.set()
         if self._after_id is not None:
             try:

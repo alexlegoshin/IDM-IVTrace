@@ -75,6 +75,7 @@ def _measure_branch(dmm: DMM, src: Union[CurrentSource, VoltageSource],
                      stop_on_error: bool = False,
                      error_threshold: float = 1.0,
                      log_callback: Optional[Callable[[str], None]] = None,
+                     results_sink: Optional[List[Dict]] = None,
                      ) -> Tuple[List[Dict], Optional[str]]:
     """
     Выполняет один проход измерения (0..X_max) для уже установленного реле
@@ -97,6 +98,11 @@ def _measure_branch(dmm: DMM, src: Union[CurrentSource, VoltageSource],
     ушёл за допустимую погрешность: дальше мерить нечего, только тратить
     время. Ожидаемый выход считается как |X_set| / ratio, поэтому без ratio
     проверка не работает и молча пропускается.
+
+    results_sink — необязательный внешний список, куда точка кладётся сразу
+    после измерения, а не по возвращении из функции. Нужен, чтобы уже снятые
+    точки пережили аварийный останов: он обесточивает стенд из другого потока
+    и закрывает сессии, после чего цикл падает, не успев ничего вернуть.
 
     Возвращает (results, aborted_reason): aborted_reason — текст причины
     досрочной остановки по погрешности, либо None (проход завершён штатно
@@ -177,12 +183,15 @@ def _measure_branch(dmm: DMM, src: Union[CurrentSource, VoltageSource],
                      log_callback)
                 break
 
-        results.append({
+        point = {
             'Timestamp': datetime.now().isoformat(),
             'Branch': branch_name,
             'X_set': signed_value,
             'I_meas_A': i_avg,
-        })
+        }
+        results.append(point)
+        if results_sink is not None:
+            results_sink.append(point)
 
         _log(f"  [{branch_name}] X_уст = {signed_value:+.4f} {unit}  ->  I_изм = {i_avg:.6f} А",
              log_callback)
@@ -200,6 +209,7 @@ def run_measurement(dmm: DMM, src: Union[CurrentSource, VoltageSource], relay: R
                      error_threshold: float = 1.0,
                      use_relay: bool = True,
                      log_callback: Optional[Callable[[str], None]] = None,
+                     results_sink: Optional[List[Dict]] = None,
                      ) -> Tuple[List[Dict], Optional[str]]:
     """
     Полный двусторонний цикл измерения амплитудной характеристики датчика
@@ -252,6 +262,7 @@ def run_measurement(dmm: DMM, src: Union[CurrentSource, VoltageSource], relay: R
         stop_on_error=stop_on_error,
         error_threshold=error_threshold,
         log_callback=log_callback,
+        results_sink=results_sink,
     )
 
     # Ноль входит в свип только если X_start == 0 (обычный случай — свип
@@ -264,7 +275,10 @@ def run_measurement(dmm: DMM, src: Union[CurrentSource, VoltageSource], relay: R
     try:
         if skip_zero:
             _log("\nТочка X=0: без источника и без коммутации реле...", log_callback)
-            results += _measure_zero_point(dmm, src, excitation_type, log_callback=log_callback)
+            zero = _measure_zero_point(dmm, src, excitation_type, log_callback=log_callback)
+            results += zero
+            if results_sink is not None:
+                results_sink += zero
 
         if not branch_has_points:
             return results, None
@@ -298,8 +312,19 @@ def run_measurement(dmm: DMM, src: Union[CurrentSource, VoltageSource], relay: R
         )
         results += branch_results
     finally:
-        src.shutdown()
+        # Штатное завершение. Каждый шаг отдельно: если аварийный останов уже
+        # погасил стенд и закрыл сессии (см. safety.emergency_shutdown), эти
+        # вызовы упадут на закрытых сессиях — и не должны при этом ни
+        # помешать друг другу, ни подменить собой настоящую причину выхода
+        # из try.
+        try:
+            src.shutdown()
+        except Exception:
+            pass
         if use_relay:
-            relay.off()
+            try:
+                relay.off()
+            except Exception:
+                pass
 
     return results, aborted_reason

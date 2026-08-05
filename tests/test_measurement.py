@@ -444,3 +444,110 @@ def test_log_callback_receives_progress_instead_of_stdout(capsys):
     assert any('zero' in line for line in lines)
     # При заданном колбэке ход измерения в stdout не дублируется.
     assert capsys.readouterr().out == ''
+
+
+# ----------------------------------------------------------------------
+# results_sink — точки должны пережить аварийный останов
+# ----------------------------------------------------------------------
+
+class DyingSource(FakeSource):
+    """Источник, у которого сессию закрыли снаружи после N уставок."""
+
+    def __init__(self, alive_setpoints):
+        super().__init__()
+        self.alive_setpoints = alive_setpoints
+
+    def set_current(self, current):
+        if self.alive_setpoints <= 0:
+            raise RuntimeError("сессия источника закрыта аварийным остановом")
+        self.alive_setpoints -= 1
+        super().set_current(current)
+
+
+def test_results_sink_keeps_points_measured_before_the_loop_blows_up():
+    # Аварийный останов закрывает сессии из другого потока, после чего цикл
+    # падает, не успев ничего вернуть. Всё, что было снято до этого момента,
+    # обязано уцелеть — как раз эти точки и объясняют, почему нажали «Стоп».
+    #
+    # Падает именно источник, а не мультиметр: чтения обёрнуты в
+    # «except Exception: pass» (сбой связи = NaN, а не обрыв измерения), а
+    # уставка на источник — нет. Так же и в жизни: safety.emergency_shutdown
+    # гасит и закрывает источник первым.
+    dmm = FakeDMM(readings=[1.0] * 100)
+    src = DyingSource(alive_setpoints=2)
+    relay = FakeRelay()
+    sink = []
+
+    with pytest.raises(RuntimeError):
+        run_measurement(
+            dmm, src, relay, 'current',
+            X_start=1, X_stop=10, X_step=1,
+            V_limit=5.0, delay=0, cooling_delay=0,
+            results_sink=sink,
+        )
+
+    assert [r['X_set'] for r in sink] == [1.0, 2.0]
+
+
+def test_dead_dmm_yields_nan_points_instead_of_crashing_the_sweep():
+    # Обратная сторона того же решения, зафиксирована сознательно: закрытый
+    # мультиметр не обрывает проход, а даёт NaN. Сбой связи не должен
+    # выдаваться за провал характеристики, но и ронять измерение из-за одной
+    # потерянной посылки нельзя.
+    class DeadDMM(FakeDMM):
+        def measure_current(self):
+            raise RuntimeError("сессия мультиметра закрыта")
+
+    dmm = DeadDMM(readings=[])
+    src = FakeSource()
+    relay = FakeRelay()
+
+    results, aborted = run_measurement(
+        dmm, src, relay, 'current',
+        X_start=1, X_stop=2, X_step=1,
+        V_limit=5.0, delay=0, cooling_delay=0,
+    )
+
+    assert aborted is None
+    assert all(math.isnan(r['I_meas_A']) for r in results)
+
+
+def test_results_sink_gets_the_same_points_as_the_return_value():
+    dmm = FakeDMM(readings=[1.0] * 100)
+    src = FakeSource()
+    relay = FakeRelay()
+    sink = []
+
+    results, _ = run_measurement(
+        dmm, src, relay, 'current',
+        X_start=0, X_stop=1, X_step=1,
+        V_limit=5.0, delay=0, cooling_delay=0,
+        results_sink=sink,
+    )
+
+    assert sink == results
+
+
+def test_cleanup_failures_do_not_mask_the_real_error():
+    # Если аварийный останов уже закрыл сессии, src.shutdown()/relay.off() в
+    # finally тоже упадут. Наружу должна уйти настоящая причина выхода из
+    # цикла, а не вторичное падение уборки — иначе в журнале оператора вместо
+    # «источник не отвечает» окажется «порт реле закрыт», и разбираться он
+    # будет не с тем.
+    class DeadEverything(FakeSource):
+        def set_current(self, current):
+            raise RuntimeError("НАСТОЯЩАЯ ПРИЧИНА: сессия источника закрыта")
+
+        def shutdown(self):
+            raise RuntimeError("вторичное падение уборки")
+
+    class DeadRelay(FakeRelay):
+        def off(self):
+            raise RuntimeError("вторичное падение уборки")
+
+    with pytest.raises(RuntimeError, match="НАСТОЯЩАЯ ПРИЧИНА"):
+        run_measurement(
+            FakeDMM(readings=[1.0] * 100), DeadEverything(), DeadRelay(), 'current',
+            X_start=1, X_stop=1, X_step=1,
+            V_limit=5.0, delay=0, cooling_delay=0,
+        )

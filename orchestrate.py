@@ -22,10 +22,46 @@ from instruments import (
 )
 from relay import RelayController, discover_relay_port
 from measurement import run_measurement, EXCITATION_UNITS
+from safety import emergency_shutdown
 
 
 LogFn = Callable[[str], None]
 StopFn = Optional[Callable[[], bool]]
+
+
+class SessionHandle:
+    """
+    Ручка на открытые приборы текущей сессии.
+
+    Нужна ровно для одного: дать возможность обесточить стенд **снаружи**
+    измерительного цикла — из обработчика кнопки «Стоп», который живёт в
+    UI-потоке, пока рабочий поток занят внутри run_measurement().
+
+    Без такой ручки остановка может быть только кооперативной: выставить
+    флаг и ждать, пока цикл сам доберётся до проверки между точками. На
+    стенде с сотнями ампер это ожидание недопустимо — оператор нажимает
+    «Стоп», когда что-то идёт не так прямо сейчас.
+
+    О потоках. emergency_stop() намеренно выполняется в потоке вызывающего,
+    а не передаётся в рабочий: смысл аварийного останова в том, что он не
+    ждёт рабочий поток. Рабочий поток в этот момент почти всегда либо спит
+    (задержки установки/охлаждения), либо читает мультиметр — то есть занят
+    другой VISA-сессией, не той, в которую пишет аварийная
+    последовательность (источник) и не портом реле. Риск наложения на
+    редкую запись в источник сознательно принят: разомкнутое реле важнее
+    аккуратности VISA-обмена.
+    """
+
+    def __init__(self):
+        self.dmm = None
+        self.src = None
+        self.relay = None
+        self.stopped = False
+
+    def emergency_stop(self, log: Optional[LogFn] = None):
+        """Обесточивает стенд немедленно. Повторные вызовы безвредны."""
+        self.stopped = True
+        return emergency_shutdown(src=self.src, relay=self.relay, dmm=self.dmm, log=log)
 
 
 def _resolve_instruments(rm, excitation_type: str, dmm_addr: Optional[str],
@@ -108,16 +144,21 @@ def run_measurement_session(
     relay_port: Optional[str] = None,
     log: LogFn = print,
     should_stop: StopFn = None,
+    on_session_open: Optional[Callable[['SessionHandle'], None]] = None,
 ) -> pd.DataFrame:
     """
     Полный цикл: подобрать/открыть приборы и реле, снять обе ветви (или одну, если use_relay=False),
     записать CSV по пути csv_path. Возвращает DataFrame результатов.
 
-    rm             — уже созданный pyvisa.ResourceManager (см. visa_backend).
-    params         — словарь параметров из cli.resolve_measure_params.
-    dmm/src/relay  — необязательные ручные адреса (иначе автообнаружение).
-    log            — колбэк вывода (по умолчанию print).
-    should_stop    — колбэк кооперативной остановки (для GUI).
+    rm               — уже созданный pyvisa.ResourceManager (см. visa_backend).
+    params           — словарь параметров из cli.resolve_measure_params.
+    dmm/src/relay    — необязательные ручные адреса (иначе автообнаружение).
+    log              — колбэк вывода (по умолчанию print).
+    should_stop      — колбэк кооперативной остановки (для GUI).
+    on_session_open  — вызывается сразу после открытия приборов и получает
+                       SessionHandle. Через него вызывающий код (GUI) может
+                       обесточить стенд немедленно, не дожидаясь, пока
+                       измерительный цикл дойдёт до проверки should_stop.
 
     Гарантирует выключение источника и реле в блоке finally, даже при ошибке.
     """
@@ -135,17 +176,31 @@ def run_measurement_session(
     else:
         relay_port = discover_relay_port()
 
-    dmm = Multimeter(dmm_addr, dmm_cfg, rm=rm)
-    src = (CurrentSource(src_addr, src_cfg, rm=rm)
-           if excitation_type == 'current'
-           else VoltageSource(src_addr, src_cfg, rm=rm))
-    relay = RelayController(relay_port)
+    # Ручка публикуется по мере открытия приборов, а не одним куском в конце:
+    # если инициализация упадёт на середине (например, реле не отвечает),
+    # уже открытый источник всё равно должен быть доступен для аварийного
+    # обесточивания.
+    handle = SessionHandle()
+    if on_session_open is not None:
+        on_session_open(handle)
+
+    dmm = handle.dmm = Multimeter(dmm_addr, dmm_cfg, rm=rm)
+    src = handle.src = (CurrentSource(src_addr, src_cfg, rm=rm)
+                        if excitation_type == 'current'
+                        else VoltageSource(src_addr, src_cfg, rm=rm))
+    relay = handle.relay = RelayController(relay_port)
 
     log("Приборы и реле инициализированы. Начинаю измерения...")
 
     aborted_reason = None
+    # Накопитель точек живёт снаружи вызова: аварийный останов обесточивает
+    # стенд из другого потока и закрывает сессии, после чего цикл падает,
+    # не успев ничего вернуть. Точки, снятые до нажатия «Стоп», от этого
+    # теряться не должны — как раз они обычно и объясняют, почему оператор
+    # нажал «Стоп».
+    results = []
     try:
-        results, aborted_reason = run_measurement(
+        run_measurement(
             dmm, src, relay, excitation_type,
             X_start=params['X_start'], X_stop=params['X_stop'], X_step=params['X_step'],
             V_limit=params['V_limit'], delay=params['delay'], cooling_delay=params['cooling_delay'],
@@ -155,13 +210,28 @@ def run_measurement_session(
             error_threshold=params.get('error_threshold', 1.0),
             use_relay=params.get('use_relay', True),
             log_callback=log,
+            results_sink=results,
         )
+        # Возвращаемый список намеренно игнорируется: его содержимое
+        # совпадает с накопителем, а накопитель переживает аварийный останов.
+    except Exception:
+        # Аварийный останов закрывает сессии из другого потока, поэтому
+        # падение цикла здесь — ожидаемое следствие нажатия «Стоп», а не
+        # сбой. Всё, что успели снять, лежит в results и будет записано.
+        if not handle.stopped:
+            raise
     finally:
-        dmm.close()
-        src.close()
-        relay.close()
+        # По одному в try: аварийный останов мог уже закрыть часть сессий,
+        # и падение на первой не должно оставить остальные открытыми.
+        for instrument in (dmm, src, relay):
+            try:
+                instrument.close()
+            except Exception:
+                pass
 
-    if aborted_reason:
+    if handle.stopped:
+        log("Измерение прервано аварийным остановом: стенд обесточен.")
+    elif aborted_reason:
         log(f"Измерение прервано досрочно: {aborted_reason}")
     else:
         log("Измерения завершены, источник и реле выключены.")
