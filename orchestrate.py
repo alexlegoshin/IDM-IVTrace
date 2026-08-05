@@ -76,7 +76,8 @@ def write_results_csv(csv_path: Path, df: pd.DataFrame, params: dict,
                 f"шаг {params['X_step']} {unit}\n")
         if excitation_type == 'current':
             f.write(f"# Ограничение напряжения: {params['V_limit']} В\n")
-        f.write(f"# Обе полярности сняты автоматически через плату реле (см. колонку Branch)\n")
+        f.write(f"# Обе полярности сняты автоматически через плату реле; точка X=0 — отдельно, "
+                f"без реле (см. колонку Branch)\n")
         f.write(f"# Задержка установки: {params['delay']} с\n")
         f.write(f"# Задержка охлаждения: {params['cooling_delay']} с\n")
         f.write(f"# Время измерения: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")

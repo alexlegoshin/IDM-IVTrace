@@ -17,13 +17,50 @@ EXCITATION_UNITS = {
 }
 
 
+def _measure_zero_point(dmm: DMM, src: Union[CurrentSource, VoltageSource],
+                         excitation_type: str) -> List[Dict]:
+    """
+    Точка X=0: возбуждения нет, поэтому нет смысла ни включать выход
+    источника, ни коммутировать реле — полярность физически неразличима
+    при нулевом сигнале. Снимается один раз (не по разу на каждую ветвь),
+    с выключенным выходом источника и без обращения к forward()/reverse().
+    """
+    src.output_off()  # на всякий случай — вдруг остался включён с прошлого раза
+    dmm.current_range_idx = len(dmm.ranges) - 1
+    dmm.set_range(dmm.ranges[dmm.current_range_idx])
+
+    currents = []
+    for _ in range(3):
+        try:
+            currents.append(dmm.measure_current())
+        except Exception:
+            pass
+
+    if currents:
+        i_avg = sum(currents) / len(currents)
+        dmm.auto_range(i_avg, is_first=True)
+    else:
+        i_avg = math.nan
+
+    unit = EXCITATION_UNITS[excitation_type]
+    print(f"  [zero] X_уст = +0.0000 {unit}  ->  I_изм = {i_avg:.6f} А (без источника и реле)")
+
+    return [{
+        'Timestamp': datetime.now().isoformat(),
+        'Branch': 'zero',
+        'X_set': 0.0,
+        'I_meas_A': i_avg,
+    }]
+
+
 def _measure_branch(dmm: DMM, src: Union[CurrentSource, VoltageSource],
                      excitation_type: str,
                      X_start: float, X_stop: float, X_step: float,
                      delay: float, cooling_delay: float,
                      sign: int, branch_name: str,
                      range_reset: bool = False,
-                     should_stop: Optional[Callable[[], bool]] = None) -> List[Dict]:
+                     should_stop: Optional[Callable[[], bool]] = None,
+                     skip_zero: bool = False) -> List[Dict]:
     """
     Выполняет один проход измерения (0..X_max) для уже установленного реле
     (направление задаётся снаружи через relay.forward()/reverse()).
@@ -32,6 +69,9 @@ def _measure_branch(dmm: DMM, src: Union[CurrentSource, VoltageSource],
     ток (src.set_current) или напряжение (src.set_voltage). Измеряемая
     датчиком величина всегда ток (см. измерение в run_measurement).
     sign используется только для записи знака в X_set.
+
+    skip_zero — пропустить точку X=0 (она уже снята один раз отдельно,
+    см. _measure_zero_point и run_measurement).
 
     should_stop — необязательный колбэк без аргументов; если он возвращает
     True, проход прерывается между точками (источник уже выключен на
@@ -53,6 +93,8 @@ def _measure_branch(dmm: DMM, src: Union[CurrentSource, VoltageSource],
             break
 
         abs_value = X_start + step * X_step
+        if skip_zero and abs_value == 0:
+            continue
         signed_value = abs_value * sign
 
         if excitation_type == 'current':
@@ -114,9 +156,17 @@ def run_measurement(dmm: DMM, src: Union[CurrentSource, VoltageSource], relay: R
     Полный двусторонний цикл измерения амплитудной характеристики датчика тока
     с автоматическим переключением полярности через плату реле:
 
-        1) relay.forward() -> проход 0..X_max (положительная ветвь, sign=+1)
-        2) relay.reverse() -> проход 0..X_max (отрицательная ветвь, sign=-1)
+        0) X=0 (если входит в диапазон) -> одна точка без источника и без
+           реле, полярность на нуле физически неразличима (см.
+           _measure_zero_point)
+        1) relay.forward() -> проход X_max..X_max (положительная ветвь,
+           sign=+1, без уже снятого нуля)
+        2) relay.reverse() -> проход по модулю (отрицательная ветвь, sign=-1,
+           без уже снятого нуля)
         3) relay.off()
+
+    Если после исключения нуля в какой-то ветви не остаётся точек (весь
+    свип — это просто X=0), реле для неё вообще не коммутируется.
 
     excitation_type: 'current' — на источник тока подаётся уставка тока
                       (V_limit используется как ограничение по напряжению);
@@ -139,13 +189,27 @@ def run_measurement(dmm: DMM, src: Union[CurrentSource, VoltageSource], relay: R
 
     results = []
 
+    # Ноль входит в свип только если X_start == 0 (обычный случай — свип
+    # от 0). Если после его исключения в ветви не остаётся шагов (весь свип
+    # — это только X=0), реле для этой ветви коммутировать незачем.
+    skip_zero = (X_start == 0)
+    num_steps = int(round((X_stop - X_start) / X_step)) + 1
+    branch_has_points = (not skip_zero) or (num_steps > 1)
+
     try:
+        if skip_zero:
+            print("\nТочка X=0: без источника и без коммутации реле...")
+            results += _measure_zero_point(dmm, src, excitation_type)
+
+        if not branch_has_points:
+            return results
+
         print("\nПереключаю реле: прямое направление (IFW)...")
         resp = relay.forward()
         print(f"  Ответ реле: {resp}")
         results += _measure_branch(
             dmm, src, excitation_type, X_start, X_stop, X_step, delay, cooling_delay,
-            sign=+1, branch_name='forward', should_stop=should_stop,
+            sign=+1, branch_name='forward', should_stop=should_stop, skip_zero=skip_zero,
         )
 
         if should_stop is not None and should_stop():
@@ -157,7 +221,7 @@ def run_measurement(dmm: DMM, src: Union[CurrentSource, VoltageSource], relay: R
         print(f"  Ответ реле: {resp}")
         results += _measure_branch(
             dmm, src, excitation_type, X_start, X_stop, X_step, delay, cooling_delay,
-            sign=-1, branch_name='reverse', range_reset=True, should_stop=should_stop,
+            sign=-1, branch_name='reverse', range_reset=True, should_stop=should_stop, skip_zero=skip_zero,
         )
     finally:
         src.shutdown()

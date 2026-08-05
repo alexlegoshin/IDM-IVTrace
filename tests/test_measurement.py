@@ -190,13 +190,34 @@ def test_run_measurement_runs_forward_then_reverse_and_shuts_down():
     assert relay.calls == ['forward', 'reverse', 'off']
     assert ('shutdown',) in src.calls
     branches = [r['Branch'] for r in results]
-    assert branches.count('forward') == 2
-    assert branches.count('reverse') == 2
+    # X=0 снимается один раз отдельно (без реле/источника), а не по разу
+    # на каждую ветвь — см. _measure_zero_point.
+    assert branches.count('zero') == 1
+    assert branches.count('forward') == 1
+    assert branches.count('reverse') == 1
     signs = {r['Branch']: [] for r in results}
     for r in results:
         signs[r['Branch']].append(r['X_set'])
-    assert signs['forward'] == [0, 1]
-    assert signs['reverse'] == [0, -1]
+    assert signs['zero'] == [0.0]
+    assert signs['forward'] == [1]
+    assert signs['reverse'] == [-1]
+
+
+def test_run_measurement_all_zero_sweep_never_touches_relay_or_source_output():
+    """Весь свип — это только X=0: реле вообще не коммутируется, выход источника не включается."""
+    dmm = FakeDMM(readings=[0.0] * 100)
+    src = FakeSource()
+    relay = FakeRelay()
+
+    results = run_measurement(
+        dmm, src, relay, 'current',
+        X_start=0, X_stop=0, X_step=1,
+        V_limit=5.0, delay=0, cooling_delay=0,
+    )
+
+    assert relay.calls == ['off']  # только финальный cleanup, ни forward, ни reverse
+    assert ('output_on',) not in src.calls
+    assert [r['Branch'] for r in results] == ['zero']
 
 
 def test_run_measurement_current_excitation_passes_v_limit_to_setup():
@@ -237,9 +258,12 @@ def test_run_measurement_shuts_down_source_and_relay_even_on_failure():
     relay = ExplodingRelay()
 
     with pytest.raises(RuntimeError):
+        # X_stop=0 сам по себе (без ненулевых точек) вообще не коммутирует
+        # реле — нужен хотя бы один шаг за пределами нуля, чтобы дойти до
+        # relay.reverse() и проверить, что failure тут не мешает cleanup.
         run_measurement(
             dmm, src, relay, 'current',
-            X_start=0, X_stop=0, X_step=1,
+            X_start=0, X_stop=1, X_step=1,
             V_limit=5.0, delay=0, cooling_delay=0,
         )
 
