@@ -2,8 +2,14 @@ import argparse
 import re
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
 from config import ConfigManager
+from limits import (
+    relay_current_block_reason,
+    relay_current_warning,
+    strictest_current_source_limits,
+)
 
 
 def build_parser(default_data_dir: Path = Path("data")) -> argparse.ArgumentParser:
@@ -111,7 +117,38 @@ def build_parser(default_data_dir: Path = Path("data")) -> argparse.ArgumentPars
 # Интерактивный ввод параметров measure (с подсказками из сохранённого конфига)
 # ----------------------------------------------------------------------
 
-def validate_measure_params(params: dict, excitation_type: str) -> list:
+def current_sweep_max_abs(params: dict, excitation_type: str) -> Optional[float]:
+    """
+    Наибольший по модулю ток, который реально пройдёт через провод и плату
+    реле за время измерения — то, что нужно сверять с лимитами limits.py.
+
+    Намеренно НЕ учитывает число витков (см. PLAN_V2.md, п. 37, появится в
+    Ф2): через реле течёт уставка источника, а не уставка, умноженная на
+    витки — витки умножают ампервитки внутри датчика, а не ток в проводе.
+    Когда параметр витков появится в params, здесь ничего менять не нужно —
+    менять нужно было бы в противоположном месте, если бы кто-то по ошибке
+    стал сверять лимит с X_set * turns.
+
+    None для возбуждения напряжением или при неполных params — сверять
+    нечего.
+    """
+    if excitation_type != 'current':
+        return None
+    X_start, X_stop = params.get('X_start'), params.get('X_stop')
+    if X_start is None or X_stop is None:
+        return None
+    return max(abs(X_start), abs(X_stop))
+
+
+def validate_measure_params(params: dict, excitation_type: str,
+                             current_source_limits: Optional[dict] = None) -> list:
+    """
+    current_source_limits — {'max_current': ..., 'max_voltage': ...}
+    паспортные пределы источника (см. limits.strictest_current_source_limits).
+    По умолчанию читаются из instruments/current_sources/*.json; параметр
+    существует в основном для тестов — чтобы не зависеть от содержимого
+    реальных конфигов на диске.
+    """
     errors = []
     if params.get('X_step') is None or params['X_step'] <= 0:
         errors.append("Шаг возбуждения должен быть положительным числом.")
@@ -123,6 +160,28 @@ def validate_measure_params(params: dict, excitation_type: str) -> list:
         errors.append("Задержка на охлаждение не может быть отрицательной.")
     if excitation_type == 'current' and (params.get('V_limit') is None or params['V_limit'] <= 0):
         errors.append("Ограничение напряжения должно быть положительным числом.")
+
+    if excitation_type == 'current':
+        block = relay_current_block_reason(current_sweep_max_abs(params, excitation_type))
+        if block:
+            errors.append(block)
+
+        if current_source_limits is None:
+            current_source_limits = strictest_current_source_limits()
+        max_v = current_source_limits.get('max_voltage')
+        if max_v is not None and params.get('V_limit') is not None and params['V_limit'] > max_v:
+            errors.append(
+                f"Ограничение напряжения {params['V_limit']} В превышает паспортный предел "
+                f"источника ({max_v} В) — физически недостижимо."
+            )
+        max_i = current_source_limits.get('max_current')
+        max_abs = current_sweep_max_abs(params, excitation_type)
+        if max_i is not None and max_abs is not None and max_abs > max_i:
+            errors.append(
+                f"Уставка тока {max_abs:.1f} А превышает паспортный предел источника "
+                f"({max_i:.1f} А) — физически недостижимо."
+            )
+
     return errors
 
 
@@ -293,6 +352,13 @@ def resolve_measure_params(args, config_mgr: ConfigManager, sensor_config_mgr=No
     errors = validate_measure_params(params, excitation_type)
     if errors:
         raise ValueError("Некорректные параметры измерения:\n  " + "\n  ".join(errors))
+
+    # Предупреждение (не запрет) о работе свыше паспортного тока реле.
+    # Печатается безусловно, даже под --yes: это техника безопасности, а не
+    # вопрос, на который можно молча ответить "да" за оператора.
+    warning = relay_current_warning(current_sweep_max_abs(params, excitation_type))
+    if warning:
+        print(f"\n⚠ {warning}\n")
 
     # Сохраняем конфиг датчика, если указано
     if args.save_config and sensor_config_mgr:

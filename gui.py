@@ -26,7 +26,8 @@ from tkinter import ttk, scrolledtext, messagebox
 
 from apppaths import default_data_dir
 from config import ConfigManager, SensorConfigManager
-from cli import make_csv_filename, validate_measure_params
+from cli import current_sweep_max_abs, make_csv_filename, validate_measure_params
+from limits import relay_current_warning
 from measurement import EXCITATION_UNITS
 
 
@@ -533,12 +534,21 @@ class IVTraceGUI:
         self.config_mgr.save(params)
         csv_path = make_csv_filename(self.data_dir, params["label"])
 
-        if not messagebox.askyesno(
-            "Запуск измерения",
+        confirm_text = (
             f"Возбуждение: {params['excitation_type']}\n"
             f"Диапазон: {params['X_start']}..{params['X_stop']} (шаг {params['X_step']})\n"
-            f"Обе полярности через реле.\n\nЗапустить измерение?",
-        ):
+            f"Обе полярности через реле.\n\nЗапустить измерение?"
+        )
+        # Жёсткий запрет (>800 А) сюда не дойдёт вообще: он уже отсеян
+        # в _gather_params -> validate_measure_params messagebox'ом с
+        # ошибкой. Здесь только предупреждение о работе свыше паспортных
+        # 400 А — оператор должен увидеть его непосредственно перед тем, как
+        # подтверждает запуск, а не потом в логе.
+        warning = relay_current_warning(current_sweep_max_abs(params, params["excitation_type"]))
+        if warning:
+            confirm_text = f"⚠ {warning}\n\n{confirm_text}"
+
+        if not messagebox.askyesno("Запуск измерения", confirm_text):
             return
 
         self.stop_event.clear()

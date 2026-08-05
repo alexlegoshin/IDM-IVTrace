@@ -1,6 +1,7 @@
 {
-    "model_name": "ITECH IT-M series",
-    "keywords": ["ITECH", "IT-M"],
+    "model_name": "АКИП-1162-10-1020",
+    "keywords": ["ITECH", "IT-M", "AKIP-1162", "1162"],
+    "registry_number": "92879-24",
     "timeout": 5000,
     "encoding": "utf-8",
     "init_commands": [
@@ -13,5 +14,8 @@
         "slew_rate": "SOUR:CURR:SLEW {rate}"
     },
     "output_on": "OUTP ON",
-    "output_off": "OUTP OFF"
+    "output_off": "OUTP OFF",
+    "max_voltage": 10.0,
+    "max_current": 1020.0,
+    "notes": "АКИП-1162-10-1020 (номер в госреестре СИ 92879-24) — ребрендинг ITECH IT-M, SCPI-набор идентичен, см. IDM-DTCal/instruments/current_sources/akip1162.json. Паспортные пределы источника: 10 В / 1020 А. Источник физически способен выдать больше, чем держит плата реле стенда (жёсткий предел 800 А, см. limits.py) — для тока связывающим ограничением является реле, а не источник."
 }

@@ -92,6 +92,17 @@ def test_current_source_configs_have_required_keys(instruments_dir):
             assert key in cfg["setup_commands"], f"{f.name}: setup_commands.{key} отсутствует"
 
 
+def test_current_source_configs_declare_hardware_limits(instruments_dir):
+    # max_current/max_voltage — паспортные пределы источника. Без них нечего
+    # проверять при вводе X_stop/V_limit (см. limits.py и cli.validate_measure_params).
+    for f in _current_source_configs(instruments_dir):
+        cfg = _load(f)
+        assert "max_current" in cfg, f"{f.name}: отсутствует max_current"
+        assert "max_voltage" in cfg, f"{f.name}: отсутствует max_voltage"
+        assert cfg["max_current"] > 0, f"{f.name}: max_current должен быть положительным"
+        assert cfg["max_voltage"] > 0, f"{f.name}: max_voltage должен быть положительным"
+
+
 def test_voltage_source_configs_have_required_keys(instruments_dir):
     for f in _voltage_source_configs(instruments_dir):
         cfg = _load(f)
