@@ -24,11 +24,15 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, scrolledtext, messagebox
 
-from apppaths import default_data_dir
+from apppaths import default_data_dir, sensor_config_dir
 from config import ConfigManager, SensorConfigManager
 from cli import current_sweep_max_abs, make_csv_filename, validate_measure_params
 from limits import relay_current_warning
-from measurement import EXCITATION_UNITS
+from measurement import (
+    EXCITATION_UNITS,
+    DEFAULT_AVERAGING_COUNT, DEFAULT_AVERAGING_DELAY, DEFAULT_DISCARD_FIRST,
+)
+from sweep import Branch, DirectionPreset
 
 
 ACCENT = "#2563eb"
@@ -91,7 +95,10 @@ class IVTraceGUI:
         self.data_dir = Path(getattr(args, "data_dir", None) or default_data_dir())
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.config_mgr = ConfigManager(self.data_dir / "ivtrace_config.json")
-        self.sensor_config_mgr = SensorConfigManager(self.data_dir)
+        # Конфигурационная папка, НЕ рабочая (self.data_dir) — см. п.39:
+        # рабочую папку оператор может перенастроить и засорить CSV,
+        # профили датчиков от этого не должны зависеть.
+        self.sensor_config_mgr = SensorConfigManager(sensor_config_dir())
 
         self.events = queue.Queue()
         self.stop_event = threading.Event()
@@ -218,10 +225,14 @@ class IVTraceGUI:
         ttk.Label(pf, text="Коэфф. 1:X").grid(row=7, column=0, sticky="w", pady=3)
         self.e_ratio = ttk.Entry(pf, width=12)
         self.e_ratio.grid(row=7, column=1, sticky="ew", pady=3, padx=(8, 6))
+        ttk.Label(pf, text="Витки").grid(row=8, column=0, sticky="w", pady=3)
+        self.e_turns = ttk.Entry(pf, width=12)
+        self.e_turns.grid(row=8, column=1, sticky="ew", pady=3, padx=(8, 6))
+        self.e_turns.insert(0, "1")
 
-        ttk.Label(pf, text="Комментарий").grid(row=8, column=0, sticky="w", pady=(6, 0))
+        ttk.Label(pf, text="Комментарий").grid(row=9, column=0, sticky="w", pady=(6, 0))
         self.e_label = ttk.Entry(pf)
-        self.e_label.grid(row=8, column=1, columnspan=2, sticky="ew", pady=(6, 0))
+        self.e_label.grid(row=9, column=1, columnspan=2, sticky="ew", pady=(6, 0))
 
         # --- optional instrument addresses ---
         adv = ttk.Labelframe(left, text="Приборы (необязательно, иначе автопоиск)", padding=10)
@@ -244,9 +255,39 @@ class IVTraceGUI:
         self.e_error_threshold.grid(row=1, column=1, sticky="w", pady=3, padx=(8, 0))
         self.e_error_threshold.insert(0, "1.0")
 
-        self.no_relay_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(opts, text="Измерять без реле (одна полярность)",
-                        variable=self.no_relay_var).grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        ttk.Label(opts, text="Полярность").grid(row=2, column=0, sticky="w", pady=(6, 3))
+        self.branch_var = tk.StringVar(value=Branch.BOTH.value)
+        ttk.Combobox(
+            opts, textvariable=self.branch_var, state="readonly", width=10,
+            values=[b.value for b in Branch],
+        ).grid(row=2, column=1, sticky="w", pady=(6, 3))
+
+        ttk.Label(opts, text="Схема прохода").grid(row=3, column=0, sticky="w", pady=3)
+        self.preset_var = tk.StringVar(value=DirectionPreset.DIVERGING.value)
+        ttk.Combobox(
+            opts, textvariable=self.preset_var, state="readonly", width=10,
+            values=[p.value for p in DirectionPreset],
+        ).grid(row=3, column=1, sticky="w", pady=3)
+        ttk.Label(opts, text="(имеет значение только при «both»)",
+                  foreground="gray").grid(row=4, column=0, columnspan=2, sticky="w")
+
+        ttk.Label(opts, text="Отсчётов на усреднение").grid(row=5, column=0, sticky="w", pady=(6, 3))
+        self.e_avg_count = ttk.Entry(opts, width=6)
+        self.e_avg_count.grid(row=5, column=1, sticky="w", pady=(6, 3))
+        self.e_avg_count.insert(0, str(DEFAULT_AVERAGING_COUNT))
+        ttk.Label(opts, text="Задержка между ними, с").grid(row=6, column=0, sticky="w", pady=3)
+        self.e_avg_delay = ttk.Entry(opts, width=6)
+        self.e_avg_delay.grid(row=6, column=1, sticky="w", pady=3)
+        self.e_avg_delay.insert(0, str(DEFAULT_AVERAGING_DELAY))
+        self.discard_first_var = tk.BooleanVar(value=DEFAULT_DISCARD_FIRST)
+        ttk.Checkbutton(opts, text="Отбрасывать первый отсчёт",
+                        variable=self.discard_first_var).grid(row=7, column=0, columnspan=2, sticky="w")
+
+        self.adaptive_cooling_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(opts, text="Адаптивное охлаждение (BETA, растёт с током)",
+                        variable=self.adaptive_cooling_var).grid(row=8, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        ttk.Label(opts, text="не проверено на реальном стенде",
+                  foreground="gray").grid(row=9, column=0, columnspan=2, sticky="w")
 
         # --- sensor configuration ---
         cfg = ttk.Labelframe(left, text="Конфигурация датчика", padding=10)
@@ -432,9 +473,13 @@ class IVTraceGUI:
         except ValueError:
             messagebox.showerror("Ошибка", "Порог погрешности должен быть числом.")
             return
-        params['use_relay'] = not self.no_relay_var.get()
+        # branch/preset/turns/averaging уже в params — их положил _gather_params()
 
-        path = self.sensor_config_mgr.save_sensor_config(name, params)
+        try:
+            path = self.sensor_config_mgr.save_sensor_config(name, params)
+        except ValueError as e:
+            messagebox.showerror("Недопустимое имя", str(e))
+            return
         self._append_log(f"Конфиг датчика сохранён: {path}\n")
         messagebox.showinfo("Успех", f"Конфиг сохранён как '{name}'.")
 
@@ -443,7 +488,10 @@ class IVTraceGUI:
         if not name:
             messagebox.showwarning("Имя конфига", "Введите имя конфига для загрузки.")
             return
-        params = self.sensor_config_mgr.load_sensor_config(name)
+        # Ищем именно в подпапке текущего выбранного типа возбуждения —
+        # профиль датчика напряжения физически неприменим к промеру током
+        # (см. config.SensorConfigManager, п.39).
+        params = self.sensor_config_mgr.load_sensor_config(name, excitation_type=self.excitation_var.get())
         if params is None:
             messagebox.showerror("Ошибка", f"Конфиг '{name}' не найден или повреждён.")
             return
@@ -459,9 +507,15 @@ class IVTraceGUI:
         self.e_label.delete(0, 'end'); self.e_label.insert(0, params.get('label', ''))
         self.e_inom.delete(0, 'end'); self.e_inom.insert(0, str(params.get('I_nom', '')))
         self.e_ratio.delete(0, 'end'); self.e_ratio.insert(0, str(params.get('ratio', '')))
+        self.e_turns.delete(0, 'end'); self.e_turns.insert(0, str(params.get('turns', 1.0)))
         self.stop_on_error_var.set(params.get('stop_on_error', False))
         self.e_error_threshold.delete(0, 'end'); self.e_error_threshold.insert(0, str(params.get('error_threshold', 1.0)))
-        self.no_relay_var.set(not params.get('use_relay', True))
+        self.branch_var.set(params.get('branch', Branch.BOTH.value))
+        self.preset_var.set(params.get('preset', DirectionPreset.DIVERGING.value))
+        self.e_avg_count.delete(0, 'end'); self.e_avg_count.insert(0, str(params.get('averaging_count', DEFAULT_AVERAGING_COUNT)))
+        self.e_avg_delay.delete(0, 'end'); self.e_avg_delay.insert(0, str(params.get('averaging_delay', DEFAULT_AVERAGING_DELAY)))
+        self.discard_first_var.set(params.get('discard_first', DEFAULT_DISCARD_FIRST))
+        self.adaptive_cooling_var.set(params.get('adaptive_cooling', False))
 
         self._on_excitation_change()
         self._append_log(f"Конфиг датчика загружен: {name}\n")
@@ -501,9 +555,15 @@ class IVTraceGUI:
             # Новые параметры
             params["I_nom"] = optional_num(self.e_inom)
             params["ratio"] = optional_num(self.e_ratio)
+            params["turns"] = optional_num(self.e_turns) or 1.0
             params["stop_on_error"] = self.stop_on_error_var.get()
             params["error_threshold"] = optional_num(self.e_error_threshold) or 1.0
-            params["use_relay"] = not self.no_relay_var.get()
+            params["branch"] = self.branch_var.get()
+            params["preset"] = self.preset_var.get()
+            params["averaging_count"] = int(optional_num(self.e_avg_count) or DEFAULT_AVERAGING_COUNT)
+            params["averaging_delay"] = optional_num(self.e_avg_delay) or 0.0
+            params["discard_first"] = self.discard_first_var.get()
+            params["adaptive_cooling"] = self.adaptive_cooling_var.get()
 
             # I_nom — только метаданные датчика для шапки CSV, для измерения
             # он не нужен. А вот без коэффициента преобразования нечем считать
@@ -534,10 +594,15 @@ class IVTraceGUI:
         self.config_mgr.save(params)
         csv_path = make_csv_filename(self.data_dir, params["label"])
 
+        branch_text = {
+            Branch.BOTH.value: "Обе полярности через реле",
+            Branch.POSITIVE.value: "Только положительная полярность",
+            Branch.NEGATIVE.value: "Только отрицательная полярность",
+        }.get(params.get("branch", Branch.BOTH.value), "Обе полярности через реле")
         confirm_text = (
             f"Возбуждение: {params['excitation_type']}\n"
             f"Диапазон: {params['X_start']}..{params['X_stop']} (шаг {params['X_step']})\n"
-            f"Обе полярности через реле.\n\nЗапустить измерение?"
+            f"{branch_text}.\n\nЗапустить измерение?"
         )
         # Жёсткий запрет (>800 А) сюда не дойдёт вообще: он уже отсеян
         # в _gather_params -> validate_measure_params messagebox'ом с

@@ -21,7 +21,12 @@ from instruments import (
     discover_instruments, find_config_for_idn,
 )
 from relay import RelayController, discover_relay_port
-from measurement import run_measurement, EXCITATION_UNITS
+from measurement import (
+    run_measurement, EXCITATION_UNITS,
+    DEFAULT_AVERAGING_COUNT, DEFAULT_AVERAGING_DELAY, DEFAULT_DISCARD_FIRST,
+    DEFAULT_ADAPTIVE_COOLING_MAX_MULTIPLIER,
+)
+from sweep import Branch, DirectionPreset
 from safety import emergency_shutdown
 from calibration import CalibrationStatus, check_calibration
 
@@ -163,11 +168,18 @@ def write_results_csv(csv_path: Path, df: pd.DataFrame, params: dict,
             f.write(f"# Номинальный первичный ток: {params['I_nom']} А\n")
         if params.get('ratio'):
             f.write(f"# Коэффициент преобразования 1:{params['ratio']}\n")
-        if params.get('use_relay', True):
+        if params.get('turns') and params['turns'] != 1.0 and excitation_type == 'current':
+            f.write(f"# Число витков через датчик: {params['turns']} "
+                    f"(реальный вход = X_set × витки, см. колонку X_real)\n")
+        branch = params.get('branch', Branch.BOTH.value)
+        if branch == Branch.BOTH.value:
             f.write("# Обе полярности сняты автоматически через плату реле; точка X=0 — "
                     "отдельно, без реле (см. колонку Branch)\n")
+            preset = params.get('preset', DirectionPreset.DIVERGING.value)
+            if preset != DirectionPreset.DIVERGING.value:
+                f.write(f"# Схема прохода: {preset}\n")
         else:
-            f.write("# Режим без реле: снята только одна полярность; точка X=0 — "
+            f.write(f"# Снята только одна полярность ({branch}) через плату реле; точка X=0 — "
                     "без источника (см. колонку Branch)\n")
         if params.get('stop_on_error', False):
             f.write(f"# Остановка при превышении погрешности: {params.get('error_threshold', 1.0)}%\n")
@@ -175,6 +187,10 @@ def write_results_csv(csv_path: Path, df: pd.DataFrame, params: dict,
             f.write(f"# Измерение прервано досрочно: {aborted_reason}\n")
         f.write(f"# Задержка установки: {params['delay']} с\n")
         f.write(f"# Задержка охлаждения: {params['cooling_delay']} с\n")
+        if params.get('adaptive_cooling', False):
+            f.write(f"# Адаптивная задержка охлаждения (BETA, растёт с током до ×"
+                    f"{params.get('adaptive_cooling_max_multiplier', DEFAULT_ADAPTIVE_COOLING_MAX_MULTIPLIER):.1f} "
+                    f"на максимуме развёртки)\n")
         f.write(f"# Время измерения: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
         f.write(f"# Всего точек: {len(df)}\n")
         f.write("#\n")
@@ -193,7 +209,7 @@ def run_measurement_session(
     on_session_open: Optional[Callable[['SessionHandle'], None]] = None,
 ) -> pd.DataFrame:
     """
-    Полный цикл: подобрать/открыть приборы и реле, снять обе ветви (или одну, если use_relay=False),
+    Полный цикл: подобрать/открыть приборы и реле, снять обе ветви (или одну, если params['branch'] != 'both'),
     записать CSV по пути csv_path. Возвращает DataFrame результатов.
 
     rm               — уже созданный pyvisa.ResourceManager (см. visa_backend).
@@ -251,11 +267,20 @@ def run_measurement_session(
             dmm, src, relay, excitation_type,
             X_start=params['X_start'], X_stop=params['X_stop'], X_step=params['X_step'],
             V_limit=params['V_limit'], delay=params['delay'], cooling_delay=params['cooling_delay'],
+            branch=Branch(params.get('branch', Branch.BOTH.value)),
+            preset=DirectionPreset(params.get('preset', DirectionPreset.DIVERGING.value)),
+            turns=params.get('turns') or 1.0,
+            averaging_count=params.get('averaging_count', DEFAULT_AVERAGING_COUNT),
+            averaging_delay=params.get('averaging_delay', DEFAULT_AVERAGING_DELAY),
+            discard_first=params.get('discard_first', DEFAULT_DISCARD_FIRST),
+            adaptive_cooling=params.get('adaptive_cooling', False),
+            adaptive_cooling_max_multiplier=params.get(
+                'adaptive_cooling_max_multiplier', DEFAULT_ADAPTIVE_COOLING_MAX_MULTIPLIER,
+            ),
             should_stop=should_stop,
             ratio=params.get('ratio'),
             stop_on_error=params.get('stop_on_error', False),
             error_threshold=params.get('error_threshold', 1.0),
-            use_relay=params.get('use_relay', True),
             log_callback=log,
             results_sink=results,
         )

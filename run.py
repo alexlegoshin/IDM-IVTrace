@@ -27,7 +27,7 @@ IVtrace — приложение для автоматизированного �
 """
 import sys
 
-from apppaths import default_data_dir
+from apppaths import default_data_dir, sensor_config_dir
 from cli import build_parser, resolve_measure_params, make_csv_filename
 from config import ConfigManager, SensorConfigManager
 from analysis import load_and_analyze, find_latest_csv
@@ -71,9 +71,13 @@ def cmd_measure(args) -> int:
     data_dir = args.data_dir
     data_dir.mkdir(parents=True, exist_ok=True)
     config_mgr = ConfigManager(data_dir / "ivtrace_config.json")
+    # Без этого --save-config/--load-config тихо ничего не делали (см.
+    # cli.resolve_measure_params: "if args.load_config and sensor_config_mgr"
+    # — без менеджера условие всегда ложно).
+    sensor_config_mgr = SensorConfigManager(sensor_config_dir())
 
     try:
-        params = resolve_measure_params(args, config_mgr)
+        params = resolve_measure_params(args, config_mgr, sensor_config_mgr)
     except ValueError as e:
         print(f"Ошибка параметров: {e}")
         return 1

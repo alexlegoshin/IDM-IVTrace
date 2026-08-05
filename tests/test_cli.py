@@ -31,10 +31,19 @@ def test_validate_rejects_zero_step():
     assert any('Шаг' in e for e in errors)
 
 
-def test_validate_rejects_stop_below_start():
+def test_validate_allows_stop_below_start_descending_sweep():
+    # п.17: 250->0 (по модулю убывающий проход) не менее корректен, чем
+    # 0->250 — планировщик (sweep.py) сам разбирается с порядком/знаком,
+    # validate_measure_params больше не блокирует это как ошибку ввода.
     p = _good_current_params(); p['X_start'] = 10; p['X_stop'] = 5
     errors = validate_measure_params(p, 'current', current_source_limits={})
-    assert any('Конечное' in e for e in errors)
+    assert errors == []
+
+
+def test_validate_still_rejects_missing_endpoints():
+    p = _good_current_params(); p['X_start'] = None
+    errors = validate_measure_params(p, 'current', current_source_limits={})
+    assert any('заданы' in e for e in errors)
 
 
 def test_validate_rejects_negative_delays():
@@ -169,6 +178,40 @@ def test_validate_reads_real_voltage_source_configs_by_default():
     assert any('источника' in e for e in errors)
 
 
+def test_validate_voltage_limit_uses_max_abs_of_start_and_stop():
+    # X_stop=0, X_start=-70: раньше проверялся только X_stop (=0, "прошёл
+    # бы"), хотя реально уставка источника на этой развёртке доходит до 70 В.
+    p = _voltage_params(X_start=-70.0, X_stop=0.0)
+    errors = validate_measure_params(p, 'voltage', voltage_source_limits={'max_voltage': 64.0})
+    assert any('70' in e for e in errors)
+
+
+def test_validate_voltage_limit_ok_when_max_abs_within_bounds():
+    p = _voltage_params(X_start=-50.0, X_stop=50.0)
+    errors = validate_measure_params(p, 'voltage', voltage_source_limits={'max_voltage': 64.0})
+    assert errors == []
+
+
+# ----------------------------------------------------------------------
+# validate_measure_params — витки (п.37)
+# ----------------------------------------------------------------------
+
+def test_validate_rejects_nonpositive_turns():
+    p = _good_current_params(); p['turns'] = 0
+    errors = validate_measure_params(p, 'current', current_source_limits={})
+    assert any('витк' in e for e in errors)
+
+    p['turns'] = -1
+    errors = validate_measure_params(p, 'current', current_source_limits={})
+    assert any('витк' in e for e in errors)
+
+
+def test_validate_allows_missing_turns_defaults_elsewhere():
+    p = _good_current_params()
+    assert 'turns' not in p
+    assert validate_measure_params(p, 'current', current_source_limits={}) == []
+
+
 # ----------------------------------------------------------------------
 # current_sweep_max_abs
 # ----------------------------------------------------------------------
@@ -238,6 +281,36 @@ def test_resolve_measure_params_from_full_cli_args(tmp_path):
     assert params['V_limit'] == 5
     assert params['label'] == 'TestSensor'
     assert mgr.load() == params
+    # Значения по умолчанию для новых параметров (п.8/19/37/29), когда флаги
+    # вообще не передавались.
+    assert params['branch'] == 'both'
+    assert params['preset'] == 'diverging'
+    assert params['turns'] == 1.0
+    assert params['averaging_count'] == 4
+    assert params['averaging_delay'] == 0.0
+    assert params['discard_first'] is True
+
+
+def test_resolve_measure_params_branch_preset_turns_averaging_from_cli(tmp_path):
+    parser = build_parser()
+    args = _measure_args(parser, [
+        "--excitation", "current",
+        "--start", "0", "--stop", "10", "--step", "1",
+        "--vlimit", "5", "--delay", "0.1", "--cool", "0.1",
+        "--label", "TestSensor", "--yes",
+        "--branch", "positive", "--preset", "converging", "--turns", "2000",
+        "--avg-count", "8", "--avg-delay", "0.05", "--avg-keep-first",
+    ])
+    mgr = ConfigManager(tmp_path / "cfg.json")
+
+    params = resolve_measure_params(args, mgr)
+
+    assert params['branch'] == 'positive'
+    assert params['preset'] == 'converging'
+    assert params['turns'] == 2000.0
+    assert params['averaging_count'] == 8
+    assert params['averaging_delay'] == 0.05
+    assert params['discard_first'] is False
 
 
 def test_resolve_measure_params_step_zero_raises_value_error(tmp_path):
@@ -254,18 +327,19 @@ def test_resolve_measure_params_step_zero_raises_value_error(tmp_path):
         resolve_measure_params(args, mgr)
 
 
-def test_resolve_measure_params_stop_less_than_start_raises_value_error(tmp_path):
+def test_resolve_measure_params_stop_less_than_start_is_a_valid_descending_sweep(tmp_path):
     parser = build_parser()
     args = _measure_args(parser, [
         "--excitation", "current",
         "--start", "10", "--stop", "5", "--step", "1",
         "--vlimit", "5", "--delay", "0.1", "--cool", "0.1",
-        "--label", "Bad", "--yes",
+        "--label", "Descending", "--yes",
     ])
     mgr = ConfigManager(tmp_path / "cfg.json")
 
-    with pytest.raises(ValueError, match="Конечное"):
-        resolve_measure_params(args, mgr)
+    params = resolve_measure_params(args, mgr)
+    assert params['X_start'] == 10
+    assert params['X_stop'] == 5
 
 
 def test_resolve_measure_params_negative_vlimit_raises_value_error(tmp_path):

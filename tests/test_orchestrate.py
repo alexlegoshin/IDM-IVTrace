@@ -62,6 +62,66 @@ def test_written_csv_is_analyzable(tmp_path):
 
 
 # ----------------------------------------------------------------------
+# write_results_csv — branch/preset/turns в шапке (Ф2 п.8/19/37)
+# ----------------------------------------------------------------------
+
+def test_default_branch_describes_both_polarities_via_relay(tmp_path):
+    csv_path = tmp_path / "IVtrace_branch_both_20260101_000000.csv"
+    write_results_csv(csv_path, _one_row_df(), _params(), excitation_type='current', unit='A')
+    text = csv_path.read_text(encoding='utf-8')
+    assert 'Обе полярности сняты автоматически через плату реле' in text
+
+
+def test_single_branch_names_which_polarity_was_measured(tmp_path):
+    csv_path = tmp_path / "IVtrace_branch_pos_20260101_000000.csv"
+    p = _params(); p['branch'] = 'positive'
+    write_results_csv(csv_path, _one_row_df(), p, excitation_type='current', unit='A')
+    text = csv_path.read_text(encoding='utf-8')
+    assert 'Снята только одна полярность (positive)' in text
+    assert 'Обе полярности' not in text
+
+
+def test_non_default_preset_is_noted_only_for_both_branch(tmp_path):
+    csv_path = tmp_path / "IVtrace_preset_20260101_000000.csv"
+    p = _params(); p['branch'] = 'both'; p['preset'] = 'full_cycle'
+    write_results_csv(csv_path, _one_row_df(), p, excitation_type='current', unit='A')
+    text = csv_path.read_text(encoding='utf-8')
+    assert 'Схема прохода: full_cycle' in text
+
+
+def test_default_preset_is_not_mentioned_to_avoid_noise(tmp_path):
+    csv_path = tmp_path / "IVtrace_preset_default_20260101_000000.csv"
+    p = _params(); p['preset'] = 'diverging'
+    write_results_csv(csv_path, _one_row_df(), p, excitation_type='current', unit='A')
+    text = csv_path.read_text(encoding='utf-8')
+    assert 'Схема прохода' not in text
+
+
+def test_turns_other_than_one_are_noted_for_current_excitation(tmp_path):
+    csv_path = tmp_path / "IVtrace_turns_20260101_000000.csv"
+    p = _params(); p['turns'] = 4.0
+    write_results_csv(csv_path, _one_row_df(), p, excitation_type='current', unit='A')
+    text = csv_path.read_text(encoding='utf-8')
+    assert 'Число витков через датчик: 4.0' in text
+
+
+def test_default_turns_line_absent(tmp_path):
+    csv_path = tmp_path / "IVtrace_turns_default_20260101_000000.csv"
+    write_results_csv(csv_path, _one_row_df(), _params(), excitation_type='current', unit='A')
+    text = csv_path.read_text(encoding='utf-8')
+    assert 'витк' not in text.lower()
+
+
+def test_turns_not_mentioned_for_voltage_excitation(tmp_path):
+    # Витки не имеют смысла для источника напряжения (см. PLAN_V2.md п.37).
+    csv_path = tmp_path / "IVtrace_turns_voltage_20260101_000000.csv"
+    p = _params(); p['turns'] = 4.0
+    write_results_csv(csv_path, _one_row_df(), p, excitation_type='voltage', unit='V')
+    text = csv_path.read_text(encoding='utf-8')
+    assert 'витк' not in text.lower()
+
+
+# ----------------------------------------------------------------------
 # write_results_csv — метаданные поверки приборов (Ф1 п.3)
 # ----------------------------------------------------------------------
 

@@ -11,6 +11,11 @@ from limits import (
     strictest_current_source_limits,
     strictest_voltage_source_limits,
 )
+from measurement import (
+    DEFAULT_AVERAGING_COUNT, DEFAULT_AVERAGING_DELAY, DEFAULT_DISCARD_FIRST,
+    DEFAULT_ADAPTIVE_COOLING_MAX_MULTIPLIER,
+)
+from sweep import Branch, DirectionPreset
 
 
 def build_parser(default_data_dir: Path = Path("data")) -> argparse.ArgumentParser:
@@ -92,8 +97,45 @@ def build_parser(default_data_dir: Path = Path("data")) -> argparse.ArgumentPars
         help="Остановить измерение при превышении порога погрешности",
     )
     p_measure.add_argument(
-        "--no-relay", action="store_true",
-        help="Измерять без реле (одна полярность)",
+        "--branch", choices=[b.value for b in Branch], default=None,
+        help="Какая полярность измеряется: both (обе, через реле, по умолчанию), "
+             "positive или negative (только одна)",
+    )
+    p_measure.add_argument(
+        "--preset", choices=[p.value for p in DirectionPreset], default=None,
+        help="Схема прохода при --branch both (по умолчанию diverging — как в v1.4ae): "
+             "diverging (0→+X, затем 0→−X), converging (+X→0, затем 0→−X, непрерывно через ноль), "
+             "descending (+X→0, затем −X→0), full_cycle (0→+X→0→−X→0, петля гистерезиса)",
+    )
+    p_measure.add_argument(
+        "--turns", type=float, default=None,
+        help="Число витков провода через окно датчика (по умолчанию 1). "
+             "Реальный вход датчика = уставка × витки; в провод и реле при этом "
+             "идёт сама уставка, не умноженная на витки. Только для возбуждения током.",
+    )
+    p_measure.add_argument(
+        "--avg-count", type=int, default=None,
+        help="Число отсчётов на усреднение одной точки (по умолчанию 4)",
+    )
+    p_measure.add_argument(
+        "--avg-delay", type=float, default=None,
+        help="Задержка между отсчётами усреднения, с (по умолчанию 0)",
+    )
+    p_measure.add_argument(
+        "--avg-keep-first", action="store_true",
+        help="Не отбрасывать первый отсчёт усреднения (по умолчанию отбрасывается — "
+             "защита от случая, когда авто-диапазон ещё не устаканился)",
+    )
+    p_measure.add_argument(
+        "--adaptive-cooling", action="store_true",
+        help="BETA: задержка охлаждения растёт квадратично с током вместо фиксированной "
+             "(джоулево тепло ~ I^2). Алгоритм не проверен на реальном стенде.",
+    )
+    p_measure.add_argument(
+        "--adaptive-cooling-max-multiplier", type=float, default=None,
+        help="Потолок роста задержки охлаждения при --adaptive-cooling, "
+             f"во сколько раз от базовой на максимуме развёртки (по умолчанию "
+             f"{DEFAULT_ADAPTIVE_COOLING_MAX_MULTIPLIER:.0f})",
     )
     p_measure.add_argument(
         "--save-config", type=str, default=None,
@@ -155,8 +197,14 @@ def validate_measure_params(params: dict, excitation_type: str,
     errors = []
     if params.get('X_step') is None or params['X_step'] <= 0:
         errors.append("Шаг возбуждения должен быть положительным числом.")
-    if params.get('X_start') is None or params.get('X_stop') is None or params['X_stop'] < params['X_start']:
-        errors.append("Конечное значение должно быть не меньше начального.")
+    if params.get('X_start') is None or params.get('X_stop') is None:
+        errors.append("Начальное и конечное значения должны быть заданы.")
+    # X_stop < X_start больше НЕ ошибка (п.17): планировщик (sweep.py)
+    # поддерживает любой знак и порядок X_start/X_stop — 250→0 (по модулю
+    # убывающий проход) не менее корректен, чем 0→250. Порядок точек внутри
+    # развёртки определяет sweep.plan_sweep(), не эта проверка.
+    if params.get('turns') is not None and params['turns'] <= 0:
+        errors.append("Число витков должно быть положительным числом.")
     if params.get('delay') is not None and params['delay'] < 0:
         errors.append("Задержка на установку не может быть отрицательной.")
     if params.get('cooling_delay') is not None and params['cooling_delay'] < 0:
@@ -189,13 +237,16 @@ def validate_measure_params(params: dict, excitation_type: str,
         if voltage_source_limits is None:
             voltage_source_limits = strictest_voltage_source_limits()
         max_v = voltage_source_limits.get('max_voltage')
-        # X_stop — сама уставка источника напряжения при возбуждении
-        # 'voltage' (V_limit здесь не используется вовсе, см.
-        # measurement.run_measurement), поэтому сверяем именно его.
-        X_stop = params.get('X_stop')
-        if max_v is not None and X_stop is not None and X_stop > max_v:
+        # Наибольшая ПО МОДУЛЮ уставка — источник не умеет отрицательное
+        # напряжение напрямую, знак всегда отрабатывает реле (как и для
+        # тока, см. current_sweep_max_abs), поэтому и X_start, и X_stop
+        # в любом порядке/с любым знаком могут оказаться "тем самым"
+        # максимумом (например X_start=-60, X_stop=0).
+        X_start, X_stop = params.get('X_start'), params.get('X_stop')
+        max_abs_v = max(abs(X_start), abs(X_stop)) if X_start is not None and X_stop is not None else None
+        if max_v is not None and max_abs_v is not None and max_abs_v > max_v:
             errors.append(
-                f"Уставка напряжения {X_stop} В превышает паспортный предел источника "
+                f"Уставка напряжения {max_abs_v} В превышает паспортный предел источника "
                 f"({max_v} В) — физически недостижимо."
             )
 
@@ -276,11 +327,20 @@ def resolve_measure_params(args, config_mgr: ConfigManager, sensor_config_mgr=No
         'ratio': args.ratio if args.ratio is not None else loaded.get('ratio'),
         'error_threshold': args.error_threshold if args.error_threshold is not None else loaded.get('error_threshold', 1.0),
         'stop_on_error': args.stop_on_error or loaded.get('stop_on_error', False),
-        # --no-relay — это store_true, он НИКОГДА не бывает None (по умолчанию
-        # False), поэтому «args.no_relay if args.no_relay is not None else ...»
-        # молча затирал бы загруженный из конфига use_relay: false обратно в
-        # true. Флаг может только выключить реле, а включить — конфиг.
-        'use_relay': loaded.get('use_relay', True) and not args.no_relay,
+        'branch': args.branch if args.branch is not None else loaded.get('branch', Branch.BOTH.value),
+        'preset': args.preset if args.preset is not None else loaded.get('preset', DirectionPreset.DIVERGING.value),
+        'turns': args.turns if args.turns is not None else loaded.get('turns', 1.0),
+        'averaging_count': args.avg_count if args.avg_count is not None else loaded.get('averaging_count', DEFAULT_AVERAGING_COUNT),
+        'averaging_delay': args.avg_delay if args.avg_delay is not None else loaded.get('averaging_delay', DEFAULT_AVERAGING_DELAY),
+        # --avg-keep-first — это store_true, он НИКОГДА не бывает None (см.
+        # тот же нюанс, что раньше был с --no-relay): флаг может только
+        # ВЫКЛЮЧИТЬ отбрасывание первого отсчёта, а включить — конфиг.
+        'discard_first': loaded.get('discard_first', DEFAULT_DISCARD_FIRST) and not args.avg_keep_first,
+        'adaptive_cooling': args.adaptive_cooling or loaded.get('adaptive_cooling', False),
+        'adaptive_cooling_max_multiplier': (
+            args.adaptive_cooling_max_multiplier if args.adaptive_cooling_max_multiplier is not None
+            else loaded.get('adaptive_cooling_max_multiplier', DEFAULT_ADAPTIVE_COOLING_MAX_MULTIPLIER)
+        ),
     }
 
     # Для источника напряжения V_limit не используется
@@ -379,8 +439,11 @@ def resolve_measure_params(args, config_mgr: ConfigManager, sensor_config_mgr=No
 
     # Сохраняем конфиг датчика, если указано
     if args.save_config and sensor_config_mgr:
-        sensor_config_mgr.save_sensor_config(args.save_config, params)
-        print(f"Конфиг датчика сохранён как '{args.save_config}'.")
+        try:
+            sensor_config_mgr.save_sensor_config(args.save_config, params)
+            print(f"Конфиг датчика сохранён как '{args.save_config}'.")
+        except ValueError as e:
+            print(f"Не удалось сохранить конфиг датчика: {e}")
 
     # Сохраняем итоговые параметры для следующего запуска
     config_mgr.save(params)

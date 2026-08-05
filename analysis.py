@@ -90,6 +90,17 @@ def load_and_analyze(latest_csv: Path, I_nom: float, X: float, save_png: bool = 
     df['I_expected_A'] = df[excitation_col] * K
     df['Error_percent'] = np.abs(df['I_meas_A'] - df['I_expected_A']) / I_sec_nom * 100
 
+    # Забракованные контрольными промерами точки (см. measurement.py, п.9)
+    # остаются в df целиком — это сырые данные — но не идут в сводную
+    # статистику погрешности: строка со стабильно неверным показанием не
+    # характеризует датчик, а свидетельствует, что датчик/канал измерения
+    # барахлит именно в этой точке. Старые CSV (до Ф2) колонки Rejected не
+    # имеют вовсе — тогда все точки участвуют, как и раньше.
+    if 'Rejected' in df.columns:
+        accepted = df[~df['Rejected'].fillna(False).astype(bool)]
+    else:
+        accepted = df
+
     # ---------- Построение графиков ----------
     plt.style.use('default')
     fig, (ax1, ax2) = plt.subplots(
@@ -191,8 +202,9 @@ def load_and_analyze(latest_csv: Path, I_nom: float, X: float, save_png: bool = 
         'I_nom': I_nom,
         'X': X,
         'points': len(df),
-        'max_error_percent': float(df['Error_percent'].max()),
-        'mean_error_percent': float(df['Error_percent'].mean()),
+        'rejected_points': int(len(df) - len(accepted)),
+        'max_error_percent': float(accepted['Error_percent'].max()),
+        'mean_error_percent': float(accepted['Error_percent'].mean()),
         'dataframe': df,
         'figure': None if close_fig else fig,
     }

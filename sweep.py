@@ -1,0 +1,241 @@
+"""
+Планировщик развёртки — чистая функция без обращения к железу.
+
+Раньше развёртка считалась прямо в измерительном цикле:
+`num_steps = int(round((X_stop - X_start) / X_step)) + 1`, знак навешивался
+параметром `sign`, а обе полярности были жёстко зашиты как "сначала
+forward(0..X_stop), потом reverse(0..X_stop)". Этого не хватало ни для
+произвольного знака/порядка X_start/X_stop (п.17), ни для выбора одной
+полярности (п.8), ни для разных схем прохода (п.19).
+
+Здесь вся эта комбинаторика решается один раз, в отрыве от приборов:
+`plan_sweep()` принимает параметры развёртки и возвращает готовый список
+`SweepPoint` — что и в каком порядке измерять, какое положение реле для
+каждой точки. Измерительный цикл (`measurement.py`) становится тупым
+исполнителем этого плана: не принимает решений о комбинаторике сам.
+
+## Модель
+
+X_start/X_stop — ЗНАКОВЫЕ значения, буквально то, что ввёл оператор (любой
+знак, любой порядок: -250→250, 0→250, 250→-250, -25→25, 150→250, ...).
+X_step — положительная величина шага.
+
+Если интервал [X_start, X_stop] уже сам по себе захватывает оба знака
+(например -250→250) — это уже полное двуполярное описание, и `branch`
+работает как ФИЛЬТР (не порождает новых точек): 'positive' оставляет
+X_set >= 0, 'negative' — X_set <= 0, 'both' (по умолчанию) — всё как есть.
+
+Если интервал односторонний (X_start и X_stop одного знака, либо один из
+них равен нулю) — это "развёртка по модулю", и `branch='both'` порождает
+ВТОРУЮ, зеркальную по знаку развёртку через реле, применяя ОДИН из четырёх
+именованных пресетов направления (см. DirectionPreset) — если односторонняя
+развёртка заякорена в нуле (X_start==0 или X_stop==0). Если не заякорена
+(например 150→250) — пресет неприменим (нечего "заходить в ноль"), и both
+даёт буквальное зеркало исходного диапазона без хореографии пресета.
+
+Ноль измеряется тогда и только тогда, когда развёртка через него реально
+проходит — попадает он на шаг или нет, минимально достаточным числом раз
+для выбранного пресета (см. DirectionPreset). Модуль конечной точки
+измеряется всегда точно, без сноса плавающей точкой (см. _raw_pass).
+"""
+import math
+from dataclasses import dataclass
+from enum import Enum
+from typing import List, Optional
+
+
+class Branch(str, Enum):
+    """Какая полярность(и) измеряется. Заменяет булев use_relay (п.8)."""
+    POSITIVE = 'positive'
+    NEGATIVE = 'negative'
+    BOTH = 'both'
+
+
+class DirectionPreset(str, Enum):
+    """
+    Схема прохода для одностороннего (заякоренного в нуле) свипа при
+    branch=BOTH — см. PLAN_V2.md, В-3. Для развёртки, уже охватывающей оба
+    знака буквально (-250→250), пресет не участвует (branch работает как
+    фильтр, см. модуль-докстринг).
+    """
+    DIVERGING = 'diverging'      # 0→+X, затем 0→−X (поведение по умолчанию, как в v1.4ae)
+    CONVERGING = 'converging'    # +X→0, затем 0→−X — непрерывный переход через ноль
+    DESCENDING = 'descending'    # +X→0, затем −X→0 — обе ветви к нулю с разных сторон
+    FULL_CYCLE = 'full_cycle'    # 0→+X→0→−X→0 — петля гистерезиса
+
+
+@dataclass(frozen=True)
+class SweepPoint:
+    """
+    Одна точка плана.
+
+    x_set       — знаковая уставка, что пишется в CSV как X_set.
+    magnitude   — |x_set|, то, что реально уходит на источник (источник не
+                  умеет отрицательные значения).
+    relay       — 'forward' (x_set > 0), 'reverse' (x_set < 0) или None
+                  (x_set == 0 — реле не коммутируется вовсе).
+    is_zero     — x_set == 0. На такой точке источник и реле не трогаются
+                  (см. измерительный цикл): нет возбуждения — нет
+                  полярности, которую можно перепутать или которой можно
+                  повредить.
+    is_endpoint — это самая дальняя точка своей ветви (|x_set| == заданный
+                  для этой ветви максимум) — гарантированно измеряется
+                  точно, не приблизительно (см. _raw_pass).
+    """
+    x_set: float
+    magnitude: float
+    relay: Optional[str]
+    is_zero: bool
+    is_endpoint: bool
+
+
+def _raw_pass(start: float, stop: float, step: float) -> List[float]:
+    """
+    Один буквальный проход от start до stop (оба знаковые, любого порядка)
+    с шагом step (положительная величина).
+
+    Три гарантии (п.17, п.18):
+      1. stop измеряется ТОЧНО — не как start + n*step (что на нецелых шагах
+         вроде 0.1 накапливает погрешность плавающей точки и может не
+         попасть точно в конец), а как буквальное значение stop.
+      2. Каждая промежуточная точка считается от start НЕЗАВИСИМО
+         (start + i*step*direction), а не приращением к предыдущей — так
+         ошибка отдельной точки не накапливается от точки к точке на
+         длинных развёртках.
+      3. Ноль включается, если интервал [start, stop] его пересекает, даже
+         если он не попадает точно на шаг.
+    """
+    if step <= 0:
+        raise ValueError("X_step должен быть положительным")
+    if start == stop:
+        return [start]
+
+    direction = 1.0 if stop > start else -1.0
+    n = max(1, round(abs(stop - start) / step))
+    points = [start + direction * step * i for i in range(n)]
+    points.append(stop)
+    # Если регулярная сетка почти попала в stop сама, не дублируем точку.
+    if len(points) >= 2 and abs(points[-2] - stop) < step * 1e-9:
+        points.pop(-2)
+
+    lo, hi = (start, stop) if start < stop else (stop, start)
+    if lo < 0 < hi and not any(p == 0 for p in points):
+        insert_at = next(i for i, p in enumerate(points) if (p > 0) == (direction > 0))
+        points.insert(insert_at, 0.0)
+
+    return points
+
+
+def _magnitude_pass(magnitude: float, step: float) -> List[float]:
+    """0 → +magnitude, по возрастанию. Строительный блок для пресетов."""
+    if magnitude == 0:
+        return [0.0]
+    return _raw_pass(0.0, magnitude, step)
+
+
+def _to_sweep_points(values: List[float], magnitude: float) -> List[SweepPoint]:
+    return [
+        SweepPoint(
+            # "-0.0" — законный итог отрицания/вычитания (например -(-p) в
+            # зеркалировании), но в CSV/логе он читался бы как "-0.0000 А",
+            # что путает оператора: нормализуем -0.0 -> 0.0 (IEEE 754:
+            # -0.0 + 0.0 == 0.0).
+            x_set=(v + 0.0),
+            magnitude=abs(v),
+            relay=None if v == 0 else ('forward' if v > 0 else 'reverse'),
+            is_zero=(v == 0),
+            is_endpoint=(abs(v) == magnitude and magnitude > 0),
+        )
+        for v in values
+    ]
+
+
+def _preset_sequence(magnitude: float, step: float, preset: DirectionPreset) -> List[float]:
+    """
+    Строит знаковую последовательность для одностороннего (заякоренного в
+    нуле) свипа по выбранному пресету. Каждый вызов _magnitude_pass строит
+    ОДИН проход 0→+magnitude; отражения/развороты — обычные срезы списка.
+
+    Сколько раз в последовательности встречается 0 — решение пресета, не
+    случайность: DIVERGING/CONVERGING экономят на повторном заходе в ноль
+    (переход воспринимается как один и тот же физический ноль — как было
+    задумано ещё в Ф0), DESCENDING/FULL_CYCLE специально возвращаются в
+    ноль несколько раз — это и есть смысл снятия петли гистерезиса, ноль
+    после разных экскурсий может показывать разное.
+    """
+    pos_away = _magnitude_pass(magnitude, step)          # 0 → +X
+    pos_toward = list(reversed(pos_away))                # +X → 0
+    neg_away = [-p for p in pos_away]                     # 0 → -X
+    neg_toward = list(reversed(neg_away))                 # -X → 0
+
+    if preset == DirectionPreset.DIVERGING:
+        return pos_away + neg_away[1:]
+    if preset == DirectionPreset.CONVERGING:
+        return pos_toward + neg_away[1:]
+    if preset == DirectionPreset.DESCENDING:
+        return pos_toward + neg_toward
+    if preset == DirectionPreset.FULL_CYCLE:
+        return pos_away + pos_toward[1:] + neg_away[1:] + neg_toward[1:]
+    raise ValueError(f"Неизвестный пресет направления: {preset!r}")
+
+
+def plan_sweep(X_start: float, X_stop: float, X_step: float,
+               branch: Branch = Branch.BOTH,
+               preset: DirectionPreset = DirectionPreset.DIVERGING) -> List[SweepPoint]:
+    """
+    Строит полный план измерения. Ничего не знает про приборы — только
+    комбинаторика точек. См. докстринг модуля про модель целиком.
+    """
+    if X_step <= 0:
+        raise ValueError("X_step должен быть положительным")
+    if math.isnan(X_start) or math.isnan(X_stop):
+        raise ValueError("X_start/X_stop не могут быть NaN")
+
+    spans_both_signs = (X_start < 0 < X_stop) or (X_stop < 0 < X_start)
+
+    if spans_both_signs:
+        # X_start/X_stop уже сами по себе описывают двуполярную развёртку
+        # буквально — пресет здесь ни при чём, branch работает как фильтр.
+        base = _raw_pass(X_start, X_stop, X_step)
+        magnitude = max(abs(X_start), abs(X_stop))
+        if branch == Branch.POSITIVE:
+            values = [p for p in base if p >= 0]
+        elif branch == Branch.NEGATIVE:
+            values = [p for p in base if p <= 0]
+        else:
+            values = base
+        return _to_sweep_points(values, magnitude)
+
+    # Односторонняя развёртка: X_start и X_stop одного знака (или один из
+    # них — 0).
+    base = _raw_pass(X_start, X_stop, X_step)
+    base_is_negative = X_start < 0 or X_stop < 0
+    anchored_at_zero = (X_start == 0 or X_stop == 0)
+
+    if branch == Branch.BOTH:
+        if not anchored_at_zero:
+            # Ничего не "заходит" в ноль (например 150→250) — пресетную
+            # хореографию применить не к чему. both здесь буквально
+            # означает "эта развёртка и её знаковое зеркало", без общего
+            # нуля — его в этом диапазоне попросту нет (см. п.17: "если
+            # измеряем 150-250, ноль не трогаем").
+            mirror = [-p for p in base]
+            magnitude = max(abs(X_start), abs(X_stop))
+            return _to_sweep_points(base, magnitude) + _to_sweep_points(mirror, magnitude)
+
+        magnitude = max(abs(X_start), abs(X_stop))
+        sequence = _preset_sequence(magnitude, X_step, preset)
+        return _to_sweep_points(sequence, magnitude)
+
+    # branch — конкретная полярность, не обе.
+    wants_negative = (branch == Branch.NEGATIVE)
+    magnitude = max(abs(X_start), abs(X_stop))
+    if wants_negative == base_is_negative:
+        values = base
+    else:
+        # Запрошенная полярность противоположна тому, что буквально
+        # описывают X_start/X_stop, — зеркалим единственную ветвь целиком
+        # (удобно: можно ввести дружелюбный положительный диапазон и
+        # получить отрицательную ветвь, не переписывая числа).
+        values = [-p for p in base]
+    return _to_sweep_points(values, magnitude)

@@ -106,6 +106,42 @@ def test_load_and_analyze_detects_nonzero_error(tmp_path):
     assert stats['max_error_percent'] == pytest.approx(0.1, abs=1e-9)
 
 
+def test_load_and_analyze_excludes_rejected_points_from_stats_but_keeps_them_in_dataframe(tmp_path):
+    # Забракованные контрольными промерами точки (п.9, measurement.py)
+    # остаются в сырых данных, но не должны портить сводную погрешность.
+    csv_path = tmp_path / "IVtrace_rejected_20260101_000000.csv"
+    with open(csv_path, 'w', encoding='utf-8') as f:
+        f.write("# Датчик: TestSensor\n")
+        f.write("# Тип возбуждения: current\n")
+        f.write("# Единица измерения возбуждения: A\n")
+        f.write("#\n")
+        f.write("Timestamp,Branch,X_set,I_meas_A,Rejected\n")
+        f.write("2026-01-01T00:00:00,forward,0,0.0,False\n")
+        f.write("2026-01-01T00:00:00,forward,10,0.1,False\n")   # K=0.01, точно ожидаемое
+        f.write("2026-01-01T00:00:00,forward,20,999.0,True\n")  # заведомо бракованное показание
+
+    stats = load_and_analyze(csv_path, I_nom=1000.0, X=100.0, save_png=False, show=False)
+
+    assert stats['points'] == 3          # сырые данные — все три строки
+    assert stats['rejected_points'] == 1
+    # Без исключения брака max_error_percent улетел бы в тысячи процентов.
+    assert stats['max_error_percent'] == pytest.approx(0.0, abs=1e-9)
+    assert len(stats['dataframe']) == 3  # точка осталась в df целиком, не удалена
+
+
+def test_load_and_analyze_without_rejected_column_uses_all_points(tmp_path):
+    # Обратная совместимость: CSV до Ф2 без колонки Rejected — все точки участвуют.
+    csv_path = tmp_path / "IVtrace_no_rejected_20260101_000000.csv"
+    _write_csv(csv_path, extra_header_lines=[
+        "# Тип возбуждения: current",
+        "# Единица измерения возбуждения: A",
+    ], rows=[('forward', 0, 0.0), ('forward', 10, 0.1)])
+
+    stats = load_and_analyze(csv_path, I_nom=1000.0, X=100.0, save_png=False, show=False)
+    assert stats['rejected_points'] == 0
+    assert stats['points'] == 2
+
+
 def test_load_and_analyze_empty_csv_raises(tmp_path):
     csv_path = tmp_path / "IVtrace_x_20260101_000000.csv"
     _write_csv(csv_path, rows=[])

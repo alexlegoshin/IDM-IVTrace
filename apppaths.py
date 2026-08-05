@@ -10,8 +10,14 @@
 Пользовательские данные (CSV/PNG/конфиг) при этом всегда пишутся рядом с
 исполняемым файлом/скриптом (см. default_data_dir), а не внутрь _internal.
 """
+import os
 import sys
 from pathlib import Path
+
+# Версия приложения — используется, например, в метаданных сохранённых
+# профилей датчиков (см. config.SensorConfigManager, п.39), чтобы было
+# видно, каким билдом сохранён конкретный профиль.
+APP_VERSION = "2.0-dev"
 
 
 def resource_base() -> Path:
@@ -72,3 +78,27 @@ def app_root() -> Path:
 
 def default_data_dir() -> Path:
     return app_root() / "data"
+
+
+def config_dir() -> Path:
+    """
+    Каталог конфигурации приложения — вне рабочей папки (см. PLAN_V2.md,
+    В-1): рабочая папка настраивается оператором и полна CSV/PNG, конфиги
+    там не место, их не должно быть случайно легко затереть/переносить
+    вместе с результатами измерений.
+
+    На Windows это %LOCALAPPDATA%\\Legoshi\\IDM\\IVTrace\\config — тот же
+    путь, что займёт полная схема каталогов инсталлятора (Ф6), просто
+    заведённый заранее для того, что нужно уже сейчас (профили датчиков,
+    п.39). Если LOCALAPPDATA не задана (не-Windows, некоторые CI-окружения)
+    — используем app_root()/config, чтобы функция не падала вообще нигде.
+    """
+    local_app_data = os.environ.get('LOCALAPPDATA')
+    if local_app_data:
+        return Path(local_app_data) / "Legoshi" / "IDM" / "IVTrace" / "config"
+    return app_root() / "config"
+
+
+def sensor_config_dir() -> Path:
+    """Корень профилей датчиков (см. config.SensorConfigManager, п.39) — подпапки current/voltage внутри."""
+    return config_dir() / "sensors"
