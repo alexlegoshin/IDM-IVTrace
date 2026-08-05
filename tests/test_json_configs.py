@@ -50,14 +50,12 @@ def test_multimeter_measure_command_does_not_reset_range(instruments_dir):
     Регрессия ключевого бага: MEAS?/CONF? по SCPI переконфигурируют прибор и
     сбрасывают диапазон в AUTO при каждом чтении, из-за чего ручной
     set_range()/auto_range() в instruments.py/measurement.py перестают
-    работать. measure_command обязан быть READ?/FETC?.
+    работать. Актуально только для manual_range: true — в авто-режиме
+    (по умолчанию) MEAS?/CONF? не проблема, диапазон и так авто.
     """
     for f in _multimeter_configs(instruments_dir):
         cfg = _load(f)
-        if cfg.get("range_command") is False:
-            # Явный отказ от ручного диапазона (прибор не поддерживает SCPI
-            # SENS:...:RANG вовсе, см. rigol_dm3068.json) — сброс диапазона
-            # на MEAS? тут не проблема, т.к. set_range() всё равно no-op.
+        if not cfg.get("manual_range", False):
             continue
         cmd = cfg["measure_command"].strip().upper()
         assert not cmd.startswith("MEAS"), f"{f.name}: measure_command не должен быть MEAS? (сбрасывает диапазон)"
@@ -65,19 +63,24 @@ def test_multimeter_measure_command_does_not_reset_range(instruments_dir):
         assert cmd in ("READ?", "FETC?", "FETCH?"), f"{f.name}: неожиданный measure_command {cmd!r}"
 
 
-def test_multimeter_init_disables_autorange(instruments_dir):
+def test_multimeter_manual_range_requires_disable_autorange_and_range_command(instruments_dir):
     """
-    Без явного отключения автодиапазона ручное управление диапазоном
-    (Multimeter.set_range/auto_range) может конкурировать с автоматикой
-    прибора между измерениями.
+    Ручной диапазон (Multimeter.set_range/auto_range) — опциональная
+    возможность, по умолчанию выключена (авто-диапазон прибора). Если она
+    явно включена (manual_range: true), конфиг обязан нести и команду
+    отключения автодиапазона, и шаблон команды установки диапазона —
+    иначе instruments.py упадёт с KeyError либо будет конкурировать с
+    встроенной автоматикой прибора.
     """
     for f in _multimeter_configs(instruments_dir):
         cfg = _load(f)
-        if cfg.get("range_command") is False:
+        if not cfg.get("manual_range", False):
             continue
-        commands_upper = [c.upper() for c in cfg["init_commands"]]
-        assert any("RANG:AUTO" in c and "OFF" in c for c in commands_upper), \
-            f"{f.name}: init_commands должны явно отключать авто-диапазон (RANG:AUTO OFF)"
+        disable_cmd = cfg.get("disable_autorange_command", "").upper()
+        assert "RANG:AUTO" in disable_cmd and "OFF" in disable_cmd, \
+            f"{f.name}: manual_range: true требует disable_autorange_command (RANG:AUTO OFF)"
+        assert "range_command" in cfg and "{range_val}" in cfg["range_command"], \
+            f"{f.name}: manual_range: true требует range_command с плейсхолдером {{range_val}}"
 
 
 def test_current_source_configs_have_required_keys(instruments_dir):

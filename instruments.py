@@ -23,27 +23,33 @@ class Multimeter:
         for cmd in self.config['init_commands']:
             self.instr.write(cmd)
             time.sleep(0.5 if cmd.strip() == '*RST' else 0.1)
-        # Устанавливаем начальный (максимальный) диапазон
+        # Ручной диапазон — опциональная возможность (manual_range в
+        # конфиге, по умолчанию выключена — прибор остаётся на встроенном
+        # авто-диапазоне). Не все приборы вообще поддерживают ручной SCPI-
+        # диапазон (см. RIGOL DM3068 — -113 Undefined header на всю
+        # подсистему SENS:), поэтому явное отключение автодиапазона
+        # выполняется только когда ручной режим реально запрошен.
+        if self.config.get('manual_range', False):
+            disable_autorange_cmd = self.config.get('disable_autorange_command')
+            if disable_autorange_cmd:
+                self.instr.write(disable_autorange_cmd)
+                time.sleep(0.1)
+        # Устанавливаем начальный (максимальный) диапазон (no-op, если
+        # ручной режим выключен — см. set_range()).
         self.set_range(self.ranges[self.current_range_idx])
 
     def set_range(self, range_val: float):
-        # Костыль для приборов без поддержки SENS:CURR:DC:RANG по SCPI
-        # (например, RIGOL DM3068 — отвечает -113 Undefined header на всю
-        # подсистему SENS:, работает только самодостаточный MEAS:CURR:DC?,
-        # который сам авто-диапазонируется). range_command в конфиге:
-        # опущен — прежнее поведение (SENS:CURR:DC:RANG), false/null —
-        # ручная установка диапазона отключена (no-op).
-        cmd = self.config.get('range_command', 'SENS:CURR:DC:RANG {range_val}')
-        if not cmd:
+        if not self.config.get('manual_range', False):
             return
+        cmd = self.config['range_command']
         self.instr.write(cmd.format(range_val=range_val))
 
     def measure_current(self) -> float:
-        # measure_command должен быть 'READ?' (или 'FETC?'), а не 'MEAS:CURR:DC?':
-        # MEAS?/CONF? по SCPI переконфигурируют прибор и сбрасывают диапазон
-        # обратно в AUTO при каждом вызове, из-за чего set_range()/auto_range()
-        # ниже становятся no-op. READ? использует уже выставленную конфигурацию
-        # (функция, NPLC, диапазон), не трогая её.
+        # В ручном режиме (manual_range: true) measure_command обязан быть
+        # 'READ?' (или 'FETC?'), а не 'MEAS:CURR:DC?': MEAS?/CONF? по SCPI
+        # переконфигурируют прибор и сбрасывают диапазон обратно в AUTO при
+        # каждом вызове, из-за чего set_range()/auto_range() становятся
+        # no-op. В авто-режиме (по умолчанию) это ограничение не действует.
         cmd = self.config['measure_command']
         return float(self.instr.query(cmd))
 

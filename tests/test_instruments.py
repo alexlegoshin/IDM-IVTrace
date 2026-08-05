@@ -46,15 +46,46 @@ def akip2101_cfg(instruments_dir):
     return instruments_dir / "multimeters" / "akip2101.json"
 
 
-def test_multimeter_init_sends_init_commands_and_max_range(akip2101_cfg, make_fake_rm):
+@pytest.fixture
+def akip2101_manual_range_cfg(instruments_dir, tmp_path):
+    """
+    Ручной диапазон (manual_range) в конфиге АКИП-2101 по умолчанию
+    выключен (прибор остаётся на встроенном авто-диапазоне, см.
+    instruments.py). Тесты ниже целенаправленно проверяют ручное
+    управление диапазоном (set_range/auto_range), поэтому включают его
+    явно поверх реального конфига, во временном файле.
+    """
+    cfg = json.loads((instruments_dir / "multimeters" / "akip2101.json").read_text(encoding='utf-8'))
+    cfg['manual_range'] = True
+    path = tmp_path / "akip2101_manual.json"
+    path.write_text(json.dumps(cfg), encoding='utf-8')
+    return path
+
+
+def test_multimeter_uses_autorange_by_default(akip2101_cfg, make_fake_rm):
+    """
+    manual_range по умолчанию выключен (отсутствует в конфиге) — прибор
+    остаётся на встроенном авто-диапазоне, ни disable_autorange_command,
+    ни range_command не отправляются.
+    """
+    fake = FakeVisaResource()
+    rm = make_fake_rm({"FAKE::ADDR": fake})
+    dmm = Multimeter("FAKE::ADDR", akip2101_cfg, rm=rm)
+    dmm.auto_range(0.015, is_first=True)
+
+    assert not any("RANG" in cmd for cmd in fake.written)
+
+
+def test_multimeter_init_sends_init_commands_and_max_range(akip2101_manual_range_cfg, make_fake_rm):
     fake = FakeVisaResource()
     rm = make_fake_rm({"FAKE::ADDR": fake})
 
-    dmm = Multimeter("FAKE::ADDR", akip2101_cfg, rm=rm)
+    dmm = Multimeter("FAKE::ADDR", akip2101_manual_range_cfg, rm=rm)
 
-    cfg = json.loads(akip2101_cfg.read_text(encoding='utf-8'))
+    cfg = json.loads(akip2101_manual_range_cfg.read_text(encoding='utf-8'))
     for cmd in cfg['init_commands']:
         assert cmd in fake.written
+    assert cfg['disable_autorange_command'] in fake.written
 
     # Стартовый диапазон — максимальный.
     max_range = cfg['ranges'][-1]
@@ -85,10 +116,10 @@ def test_multimeter_measure_current_uses_configured_command(akip2101_cfg, make_f
     assert fake.queried[-1] == "READ?"
 
 
-def test_auto_range_is_first_picks_smallest_covering_range(akip2101_cfg, make_fake_rm):
+def test_auto_range_is_first_picks_smallest_covering_range(akip2101_manual_range_cfg, make_fake_rm):
     fake = FakeVisaResource()
     rm = make_fake_rm({"FAKE::ADDR": fake})
-    dmm = Multimeter("FAKE::ADDR", akip2101_cfg, rm=rm)
+    dmm = Multimeter("FAKE::ADDR", akip2101_manual_range_cfg, rm=rm)
 
     dmm.auto_range(0.015, is_first=True)
     assert dmm.ranges[dmm.current_range_idx] == 0.02
@@ -104,10 +135,10 @@ def test_auto_range_is_first_falls_back_to_max_when_over_range(akip2101_cfg, mak
     assert dmm.current_range_idx == len(dmm.ranges) - 1
 
 
-def test_auto_range_steps_up_above_95_percent(akip2101_cfg, make_fake_rm):
+def test_auto_range_steps_up_above_95_percent(akip2101_manual_range_cfg, make_fake_rm):
     fake = FakeVisaResource()
     rm = make_fake_rm({"FAKE::ADDR": fake})
-    dmm = Multimeter("FAKE::ADDR", akip2101_cfg, rm=rm)
+    dmm = Multimeter("FAKE::ADDR", akip2101_manual_range_cfg, rm=rm)
 
     dmm.current_range_idx = 2  # range 0.02
     dmm.auto_range(0.0195, is_first=False)  # > 95% of 0.02
