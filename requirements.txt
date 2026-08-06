@@ -7,4 +7,5 @@ pandas
 numpy
 scipy
 matplotlib
+openpyxl
 pytest

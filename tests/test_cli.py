@@ -394,6 +394,26 @@ def test_resolve_measure_params_interactive_reprompts_on_invalid_step(monkeypatc
     assert params['X_step'] == 2
 
 
+# ----------------------------------------------------------------------
+# analyze — новые флаги (Ф3: п.10/21/30)
+# ----------------------------------------------------------------------
+
+def test_analyze_parser_accepts_labels_xlsx_estimate_ratio_flags():
+    parser = build_parser()
+    args = parser.parse_args(["analyze", "--labels", "--xlsx", "--estimate-ratio"])
+    assert args.labels is True
+    assert args.xlsx is True
+    assert args.estimate_ratio is True
+
+
+def test_analyze_parser_flags_default_to_false():
+    parser = build_parser()
+    args = parser.parse_args(["analyze"])
+    assert args.labels is False
+    assert args.xlsx is False
+    assert args.estimate_ratio is False
+
+
 def test_resolve_measure_params_interactive_full_flow(monkeypatch, tmp_path):
     parser = build_parser()
     args = _measure_args(parser, [])  # ничего не передано флагами

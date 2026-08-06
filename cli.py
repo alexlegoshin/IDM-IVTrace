@@ -90,7 +90,7 @@ def build_parser(default_data_dir: Path = Path("data")) -> argparse.ArgumentPars
     )
     p_measure.add_argument(
         "--error-threshold", type=float, default=None,
-        help="Порог погрешности для досрочной остановки, % (по умолчанию 1.0)",
+        help="Порог погрешности для досрочной остановки, %% (по умолчанию 1.0)",
     )
     p_measure.add_argument(
         "--stop-on-error", action="store_true",
@@ -147,11 +147,17 @@ def build_parser(default_data_dir: Path = Path("data")) -> argparse.ArgumentPars
     )
 
     # ---------------- analyze ----------------
-    p_analyze = subparsers.add_parser("analyze", help="Построить график и рассчитать погрешность по последнему CSV")
-    p_analyze.add_argument("--file", type=Path, default=None, help="Путь к конкретному CSV (по умолчанию — последний в data-dir)")
+    p_analyze = subparsers.add_parser("analyze", help="Построить график и рассчитать погрешность по указанному (или последнему) CSV")
+    p_analyze.add_argument("--file", type=Path, default=None, help="Путь к конкретному CSV (по умолчанию — последний в data-dir; п.20)")
     p_analyze.add_argument("--inom", type=float, default=None, help="Номинальный первичный ток датчика, А")
     p_analyze.add_argument("--ratio", type=float, default=None, help="Коэффициент преобразования 1:X (передать X)")
     p_analyze.add_argument("--no-show", action="store_true", help="Не открывать окно с графиком (только сохранить PNG)")
+    p_analyze.add_argument("--labels", action="store_true", help="Подписывать погрешность над каждой точкой на графике (п.30)")
+    p_analyze.add_argument("--xlsx", action="store_true", help="Экспортировать результаты в XLSX рядом с CSV (п.21)")
+    p_analyze.add_argument(
+        "--estimate-ratio", action="store_true",
+        help="BETA: определить фактический коэффициент преобразования по снятым точкам (МНК, п.10), не строя график",
+    )
 
     return parser
 

@@ -129,6 +129,23 @@ def cmd_measure(args) -> int:
 
     print()
     print(df.head(10).to_string(index=False))
+
+    # Автопостроение графика по окончании измерения (п.22), не ломая ручной
+    # режим (analyze, п.20) — та же analysis.load_and_analyze. Без I ном./
+    # коэффициента сравнивать не с чем, тогда просто пропускаем без ошибки.
+    from analysis import load_and_analyze_from_params
+    stats = load_and_analyze_from_params(csv_path, params, show=False, close_fig=True)
+    if stats is not None:
+        print(f"\nГрафик сохранён: {stats['png_path']}")
+        print(f"Максимальная приведённая погрешность: {stats['max_error_percent']:+.4f} %")
+        print(f"Средняя приведённая погрешность:   {stats['mean_error_percent']:+.4f} %")
+        try:
+            import os
+            if hasattr(os, 'startfile'):
+                os.startfile(stats['png_path'])
+        except OSError:
+            pass
+
     return 0
 
 
@@ -137,6 +154,21 @@ def cmd_analyze(args) -> int:
 
     csv_path = args.file if args.file else find_latest_csv(data_dir)
     print(f"Файл: {csv_path}")
+
+    if args.estimate_ratio:
+        from analysis import estimate_ratio_from_data
+        import pandas as pd
+        df = pd.read_csv(csv_path, comment='#')
+        try:
+            result = estimate_ratio_from_data(df)
+        except ValueError as e:
+            print(f"Ошибка: {e}")
+            return 1
+        print("\nBETA: определение коэффициента преобразования по снятым точкам (МНК).")
+        print(f"Фактический коэффициент: 1:{result['X_actual']:.2f}")
+        print(f"Округлённый (кратно 50): 1:{result['X_rounded']:.0f} "
+              f"(расхождение {result['discrepancy_percent']:.2f}%)")
+        return 0
 
     I_nom = args.inom
     if I_nom is None:
@@ -162,11 +194,19 @@ def cmd_analyze(args) -> int:
             except ValueError:
                 print("Введите число.")
 
-    stats = load_and_analyze(csv_path, I_nom=I_nom, X=X, show=not args.no_show)
+    stats = load_and_analyze(csv_path, I_nom=I_nom, X=X, show=not args.no_show,
+                             show_error_labels=args.labels)
 
     print(f"\nГрафик сохранён: {stats['png_path']}")
-    print(f"Максимальная приведённая погрешность: {stats['max_error_percent']:.4f} %")
-    print(f"Средняя приведённая погрешность:   {stats['mean_error_percent']:.4f} %")
+    print(f"Максимальная приведённая погрешность: {stats['max_error_percent']:+.4f} %")
+    print(f"Средняя приведённая погрешность:   {stats['mean_error_percent']:+.4f} %")
+    if stats['rejected_points']:
+        print(f"Исключено из статистики: {stats['rejected_points']} из {stats['points']} точек")
+
+    if args.xlsx:
+        from analysis import export_xlsx
+        xlsx_path = export_xlsx(csv_path)
+        print(f"XLSX сохранён: {xlsx_path}")
 
     return 0
 

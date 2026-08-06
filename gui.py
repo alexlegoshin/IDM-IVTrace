@@ -24,6 +24,8 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, scrolledtext, messagebox
 
+import pandas as pd
+
 from apppaths import default_data_dir, sensor_config_dir
 from config import ConfigManager, SensorConfigManager
 from cli import current_sweep_max_abs, make_csv_filename, validate_measure_params
@@ -109,6 +111,13 @@ class IVTraceGUI:
         self._preflight_ok = False
         self.last_csv = None
         self._current_fig = None
+        # Вкладка «График» (Ф3): какой файл сейчас разобран (может быть не
+        # last_csv — оператор мог открыть произвольный старый CSV, п.20),
+        # его текущий DataFrame (для правки точек, п.26) и параметры
+        # последнего измерения (для автопостроения по его окончании, п.22).
+        self.plot_csv_path = None
+        self._current_df = None
+        self._last_measure_params = None
 
         self.skip_selftest_var = tk.BooleanVar(value=bool(getattr(args, "skip_selftest", False)))
         self.excitation_var = tk.StringVar(value="current")
@@ -356,26 +365,91 @@ class IVTraceGUI:
         # --- plot tab ---
         plot_tab = ttk.Frame(nb, padding=8)
         nb.add(plot_tab, text="  График  ")
-        plot_tab.rowconfigure(1, weight=1)
+        plot_tab.rowconfigure(5, weight=1)
         plot_tab.columnconfigure(0, weight=1)
 
-        an = ttk.Frame(plot_tab)
-        an.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        # -- файл (п.20: график из произвольного CSV, по умолчанию последний) --
+        file_bar = ttk.Frame(plot_tab)
+        file_bar.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        ttk.Button(file_bar, text="Открыть CSV…", command=self._open_csv_for_plot).pack(side="left")
+        self.plot_file_label = ttk.Label(file_bar, style="Muted.TLabel",
+                                         text="файл не выбран — по умолчанию последний в папке данных")
+        self.plot_file_label.pack(side="left", padx=(10, 0))
+
+        # -- параметры анализа --
+        an = ttk.Labelframe(plot_tab, text="Параметры анализа", padding=8)
+        an.grid(row=1, column=0, sticky="ew", pady=(0, 6))
         ttk.Label(an, text="I ном., А").grid(row=0, column=0, sticky="w")
-        self.e_inom = ttk.Entry(an, width=10)
-        self.e_inom.grid(row=0, column=1, padx=(6, 14))
+        self.plot_e_inom = ttk.Entry(an, width=10)
+        self.plot_e_inom.grid(row=0, column=1, padx=(6, 14))
         ttk.Label(an, text="Коэфф. 1:X").grid(row=0, column=2, sticky="w")
-        self.e_ratio = ttk.Entry(an, width=10)
-        self.e_ratio.grid(row=0, column=3, padx=(6, 14))
-        ttk.Button(an, text="Построить график", command=self._do_analyze).grid(row=0, column=4)
+        self.plot_e_ratio = ttk.Entry(an, width=10)
+        self.plot_e_ratio.grid(row=0, column=3, padx=(6, 14))
+        ttk.Button(an, text="Построить график", command=self._do_analyze).grid(row=0, column=4, padx=(0, 6))
+        ttk.Button(an, text="Определить коэфф. (BETA)", command=self._do_estimate_ratio).grid(row=0, column=5)
+
+        # -- отображение: подписи погрешности (п.30) + диапазоны осей (п.36) --
+        disp = ttk.Labelframe(plot_tab, text="Отображение", padding=8)
+        disp.grid(row=2, column=0, sticky="ew", pady=(0, 6))
+        self.show_labels_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(disp, text="Подписи погрешности над точками",
+                        variable=self.show_labels_var).grid(row=0, column=0, columnspan=6, sticky="w")
+
+        self.auto_range_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(disp, text="Авто-диапазон осей", variable=self.auto_range_var,
+                        command=self._on_auto_range_change).grid(row=1, column=0, columnspan=6, sticky="w", pady=(4, 0))
+        ttk.Label(disp, text="X мин/макс").grid(row=2, column=0, sticky="w", pady=(4, 0))
+        self.e_xmin = ttk.Entry(disp, width=8); self.e_xmin.grid(row=2, column=1, padx=(4, 4))
+        self.e_xmax = ttk.Entry(disp, width=8); self.e_xmax.grid(row=2, column=2, padx=(0, 14))
+        ttk.Label(disp, text="Y выход мин/макс").grid(row=2, column=3, sticky="w")
+        self.e_y1min = ttk.Entry(disp, width=8); self.e_y1min.grid(row=2, column=4, padx=(4, 4))
+        self.e_y1max = ttk.Entry(disp, width=8); self.e_y1max.grid(row=2, column=5, padx=(0, 14))
+        ttk.Label(disp, text="Y погр.,% мин/макс").grid(row=3, column=0, sticky="w", pady=(4, 0))
+        self.e_y2min = ttk.Entry(disp, width=8); self.e_y2min.grid(row=3, column=1, padx=(4, 4), pady=(4, 0))
+        self.e_y2max = ttk.Entry(disp, width=8); self.e_y2max.grid(row=3, column=2, padx=(0, 14), pady=(4, 0))
+        self._range_entries = (self.e_xmin, self.e_xmax, self.e_y1min, self.e_y1max, self.e_y2min, self.e_y2max)
+        self._on_auto_range_change()
+
+        # -- правка точек (п.26): исключение не удаляет данные, только помечает --
+        pts = ttk.Labelframe(plot_tab, text="Точки", padding=8)
+        pts.grid(row=3, column=0, sticky="ew", pady=(0, 6))
+        pts.columnconfigure(0, weight=1)
+        columns = ("x", "i_meas", "error", "rejected", "excluded")
+        self.points_tree = ttk.Treeview(pts, columns=columns, show="headings", height=5, selectmode="extended")
+        for col, text, width in (
+            ("x", "Возбуждение", 100), ("i_meas", "I изм., А", 90), ("error", "Погр., %", 90),
+            ("rejected", "Брак (авто)", 90), ("excluded", "Исключена", 90),
+        ):
+            self.points_tree.heading(col, text=text)
+            self.points_tree.column(col, width=width, anchor="center")
+        self.points_tree.grid(row=0, column=0, columnspan=4, sticky="ew")
+        pts_scroll = ttk.Scrollbar(pts, orient="vertical", command=self.points_tree.yview)
+        self.points_tree.configure(yscrollcommand=pts_scroll.set)
+        pts_scroll.grid(row=0, column=4, sticky="ns")
+
+        pts_btns = ttk.Frame(pts)
+        pts_btns.grid(row=1, column=0, columnspan=5, sticky="w", pady=(6, 0))
+        ttk.Button(pts_btns, text="Исключить выбранные",
+                  command=lambda: self._toggle_selected_points(True)).pack(side="left", padx=(0, 6))
+        ttk.Button(pts_btns, text="Вернуть выбранные",
+                  command=lambda: self._toggle_selected_points(False)).pack(side="left", padx=(0, 6))
+        ttk.Button(pts_btns, text="Сохранить и перестроить",
+                  command=self._save_point_exclusions).pack(side="left", padx=(0, 14))
+        ttk.Button(pts_btns, text="Инвертировать вход… (не рекомендуется)",
+                  command=self._do_invert_input).pack(side="left")
+
+        # -- экспорт (п.21) --
+        exp = ttk.Frame(plot_tab)
+        exp.grid(row=4, column=0, sticky="w", pady=(0, 6))
+        ttk.Button(exp, text="Экспорт в XLSX…", command=self._do_export_xlsx).pack(side="left")
 
         self.plot_frame = ttk.Frame(plot_tab, style="Card.TFrame")
-        self.plot_frame.grid(row=1, column=0, sticky="nsew")
+        self.plot_frame.grid(row=5, column=0, sticky="nsew")
         self.plot_frame.rowconfigure(0, weight=1)
         self.plot_frame.columnconfigure(0, weight=1)
         self.plot_hint = ttk.Label(self.plot_frame, style="Muted.TLabel",
                                    text="После измерения задайте I ном. и X, затем «Построить график».\n"
-                                        "Либо строится по последнему CSV в папке data.")
+                                        "Либо откройте любой CSV кнопкой выше.")
         self.plot_hint.grid(row=0, column=0)
 
         self.notebook = nb
@@ -619,6 +693,9 @@ class IVTraceGUI:
         self.stop_event.clear()
         self._set_running(True)
         self._append_log(f"\n=== Измерение: {csv_path.name} ===\n")
+        # Нужны на "done" для автопостроения графика (п.22) — там уже нет
+        # доступа к полям формы (оператор мог их поменять, пока шло измерение).
+        self._last_measure_params = params
 
         addr = {
             "dmm_addr": self.e_dmm.get().strip() or None,
@@ -687,21 +764,82 @@ class IVTraceGUI:
         self.start_btn.configure(state="disabled" if running else ("normal" if self._preflight_ok else "disabled"))
         self.stop_btn.configure(state="normal" if running else "disabled")
 
-    # ------------------------------------------------------------------ analyze
-    def _do_analyze(self):
-        from analysis import load_and_analyze, find_latest_csv
+    # ------------------------------------------------------------------ plot tab
+    def _on_auto_range_change(self):
+        state = "disabled" if self.auto_range_var.get() else "normal"
+        for entry in self._range_entries:
+            entry.configure(state=state)
 
-        csv_path = self.last_csv
+    def _axis_range(self, lo_entry, hi_entry):
+        """(min, max) из пары полей, либо None — если авто-диапазон включён
+        или поля не заполнены/некорректны (тогда просто оставляем авто, не
+        падая с ошибкой посреди построения графика)."""
+        if self.auto_range_var.get():
+            return None
+        lo, hi = lo_entry.get().strip(), hi_entry.get().strip()
+        if not lo or not hi:
+            return None
         try:
-            if not csv_path:
-                csv_path = find_latest_csv(self.data_dir)
+            return (float(lo.replace(",", ".")), float(hi.replace(",", ".")))
+        except ValueError:
+            return None
+
+    def _resolve_plot_csv_path(self):
+        if self.plot_csv_path is not None:
+            return self.plot_csv_path
+        if self.last_csv:
+            return Path(self.last_csv)
+        from analysis import find_latest_csv
+        try:
+            return find_latest_csv(self.data_dir)
         except FileNotFoundError as e:
             messagebox.showerror("Нет данных", str(e))
+            return None
+
+    def _open_csv_for_plot(self):
+        """п.20: вкладка «График» умеет открывать любой CSV, не только последний."""
+        from tkinter import filedialog
+        from analysis import metadata_i_nom_and_ratio
+
+        current = self._resolve_plot_csv_path()
+        initial_dir = str(current.parent) if current else str(self.data_dir)
+        path = filedialog.askopenfilename(
+            initialdir=initial_dir, filetypes=[("CSV", "*.csv"), ("Все файлы", "*.*")],
+            title="Открыть CSV для анализа",
+        )
+        if not path:
+            return
+        path = Path(path)
+        self.plot_csv_path = path
+        self.plot_file_label.configure(text=path.name)
+
+        # Предзаполняем I ном./коэффициент тем, с чем файл снимался, если это
+        # сохранено в его собственной шапке — иначе оператор увидит в полях
+        # значения от предыдущего файла, что не имеет смысла для нового.
+        I_nom, X = metadata_i_nom_and_ratio(path)
+        self.plot_e_inom.delete(0, "end")
+        if I_nom is not None:
+            self.plot_e_inom.insert(0, str(I_nom))
+        self.plot_e_ratio.delete(0, "end")
+        if X is not None:
+            self.plot_e_ratio.insert(0, str(X))
+
+        if I_nom is not None and X is not None:
+            self._do_analyze()
+        else:
+            self._current_df = None
+            self._refresh_points_tree()
+
+    def _do_analyze(self):
+        from analysis import load_and_analyze
+
+        csv_path = self._resolve_plot_csv_path()
+        if csv_path is None:
             return
 
         try:
-            inom = float(self.e_inom.get().strip().replace(",", "."))
-            ratio = float(self.e_ratio.get().strip().replace(",", "."))
+            inom = float(self.plot_e_inom.get().strip().replace(",", "."))
+            ratio = float(self.plot_e_ratio.get().strip().replace(",", "."))
             if inom <= 0 or ratio <= 0:
                 raise ValueError
         except ValueError:
@@ -710,15 +848,183 @@ class IVTraceGUI:
             return
 
         try:
-            stats = load_and_analyze(Path(csv_path), I_nom=inom, X=ratio,
-                                     save_png=True, show=False, close_fig=False)
+            stats = load_and_analyze(
+                Path(csv_path), I_nom=inom, X=ratio, save_png=True, show=False, close_fig=False,
+                show_error_labels=self.show_labels_var.get(),
+                xlim=self._axis_range(self.e_xmin, self.e_xmax),
+                y1lim=self._axis_range(self.e_y1min, self.e_y1max),
+                y2lim=self._axis_range(self.e_y2min, self.e_y2max),
+            )
         except Exception as e:
             messagebox.showerror("Ошибка анализа", str(e))
             return
 
+        self.plot_csv_path = Path(csv_path)
+        self.plot_file_label.configure(text=self.plot_csv_path.name)
+        self._current_df = stats["dataframe"]
+        self._refresh_points_tree()
+
+        excluded_note = f", исключено {stats['rejected_points']}/{stats['points']}" if stats['rejected_points'] else ""
         self._append_log(
-            f"[Анализ] {Path(csv_path).name}: макс. погрешность {stats['max_error_percent']:.4f} %, "
-            f"средняя {stats['mean_error_percent']:.4f} %; PNG: {stats['png_path']}\n"
+            f"[Анализ] {self.plot_csv_path.name}: макс. погрешность {stats['max_error_percent']:+.4f} %, "
+            f"средняя {stats['mean_error_percent']:+.4f} %{excluded_note}; PNG: {stats['png_path']}\n"
+        )
+        self._embed_figure(stats["figure"])
+        self.notebook.select(1)
+
+    def _do_estimate_ratio(self):
+        """п.10 (BETA): фактический коэффициент по снятым точкам, отдельно от построения графика."""
+        from analysis import estimate_ratio_from_data
+
+        csv_path = self._resolve_plot_csv_path()
+        if csv_path is None:
+            return
+        df = self._current_df if self._current_df is not None and self.plot_csv_path == csv_path \
+            else pd.read_csv(csv_path, comment='#')
+
+        try:
+            result = estimate_ratio_from_data(df)
+        except ValueError as e:
+            messagebox.showerror("Не удалось определить коэффициент", str(e))
+            return
+
+        messagebox.showinfo(
+            "Коэффициент преобразования (BETA)",
+            f"Фактический: 1:{result['X_actual']:.2f}\n"
+            f"Округлённый (кратно 50): 1:{result['X_rounded']:.0f}\n"
+            f"Расхождение: {result['discrepancy_percent']:.2f}%",
+        )
+
+    # -------------------------------------------------------------- point editing
+    def _refresh_points_tree(self):
+        """п.26: таблица точек с возможностью исключить/вернуть без потери сырых данных."""
+        for item in self.points_tree.get_children():
+            self.points_tree.delete(item)
+        df = self._current_df
+        if df is None:
+            return
+        excitation_col = 'X_set' if 'X_set' in df.columns else 'I_set_A'
+        for idx, row in df.iterrows():
+            rejected = bool(row['Rejected']) if 'Rejected' in df.columns and pd.notna(row.get('Rejected')) else False
+            excluded = bool(row['ManuallyExcluded']) if 'ManuallyExcluded' in df.columns and pd.notna(row.get('ManuallyExcluded')) else False
+            error = row.get('Error_percent')
+            error_text = f"{error:+.4f}" if error is not None and pd.notna(error) else ""
+            self.points_tree.insert("", "end", iid=str(idx), values=(
+                row.get(excitation_col, ''), row.get('I_meas_A', ''), error_text,
+                "да" if rejected else "", "да" if excluded else "",
+            ))
+
+    def _toggle_selected_points(self, excluded: bool):
+        if self._current_df is None:
+            messagebox.showinfo("Точки", "Сначала постройте график.")
+            return
+        selected = self.points_tree.selection()
+        if not selected:
+            return
+        if 'ManuallyExcluded' not in self._current_df.columns:
+            self._current_df['ManuallyExcluded'] = False
+        for iid in selected:
+            self._current_df.loc[int(iid), 'ManuallyExcluded'] = excluded
+        self._refresh_points_tree()
+
+    def _save_point_exclusions(self):
+        """Пишет ManuallyExcluded обратно в CSV (данные не удаляются) и перестраивает график."""
+        if self._current_df is None or self.plot_csv_path is None:
+            messagebox.showinfo("Точки", "Сначала постройте график.")
+            return
+        from analysis import save_dataframe_with_metadata
+        save_dataframe_with_metadata(self.plot_csv_path, self._current_df)
+        self._append_log(f"Изменения точек сохранены: {self.plot_csv_path}\n")
+        self._do_analyze()
+
+    def _do_invert_input(self):
+        """
+        п.26/invert_input: пост-обработка уже снятого файла, перенесённая из
+        измерительного цикла. НЕ РЕКОМЕНДУЕТСЯ — пишет НОВЫЙ файл, исходные
+        данные измерения не трогает.
+        """
+        csv_path = self._resolve_plot_csv_path()
+        if csv_path is None:
+            return
+        if not messagebox.askyesno(
+            "Инвертировать вход",
+            "Инверсия знака возбуждения НЕ РЕКОМЕНДУЕТСЯ (см. документацию) — предназначена только "
+            "для случая, когда датчик физически подключён в обратной полярности, а перекоммутировать "
+            "его на стенде нельзя.\n\n"
+            f"Будет создан НОВЫЙ файл рядом с «{csv_path.name}», исходные данные не изменятся.\n"
+            "Продолжить?",
+        ):
+            return
+        from analysis import apply_invert_input, metadata_i_nom_and_ratio
+        output_path = apply_invert_input(csv_path)
+        self._append_log(f"Инвертированная копия сохранена: {output_path}\n")
+        if messagebox.askyesno("Готово", f"Файл создан: {output_path.name}\nОткрыть его для анализа?"):
+            self.plot_csv_path = output_path
+            self.plot_file_label.configure(text=output_path.name)
+            I_nom, X = metadata_i_nom_and_ratio(output_path)
+            self.plot_e_inom.delete(0, "end")
+            if I_nom is not None:
+                self.plot_e_inom.insert(0, str(I_nom))
+            self.plot_e_ratio.delete(0, "end")
+            if X is not None:
+                self.plot_e_ratio.insert(0, str(X))
+            if I_nom is not None and X is not None:
+                self._do_analyze()
+
+    # -------------------------------------------------------------------- export
+    def _do_export_xlsx(self):
+        from tkinter import filedialog
+        from analysis import export_xlsx
+
+        csv_path = self._resolve_plot_csv_path()
+        if csv_path is None:
+            return
+        out = filedialog.asksaveasfilename(
+            initialdir=str(csv_path.parent), initialfile=csv_path.with_suffix('.xlsx').name,
+            defaultextension=".xlsx", filetypes=[("Excel", "*.xlsx")], title="Экспорт в XLSX",
+        )
+        if not out:
+            return
+        path = export_xlsx(csv_path, xlsx_path=Path(out))
+        self._append_log(f"XLSX сохранён: {path}\n")
+        messagebox.showinfo("Экспорт", f"Файл сохранён:\n{path}")
+
+    # -------------------------------------------------------- автопостроение (п.22)
+    def _auto_plot_after_measurement(self, csv_path: Path):
+        """
+        По окончании измерения график сохраняется и открывается автоматически
+        (п.22), не ломая ручной режим (п.20 — кнопка «Построить график» и
+        открытие произвольного файла работают точно так же, как раньше).
+
+        Без I ном./коэффициента в параметрах измерения строить не из чего —
+        это не ошибка измерения, тихо пропускаем с пометкой в журнале.
+        """
+        from analysis import load_and_analyze_from_params
+
+        params = self._last_measure_params or {}
+        try:
+            stats = load_and_analyze_from_params(
+                csv_path, params, save_png=True, show=False, close_fig=False,
+                show_error_labels=self.show_labels_var.get(),
+            )
+        except Exception as e:
+            self._append_log(f"[График] Не удалось построить: {e}\n")
+            return
+
+        if stats is None:
+            self._append_log("[График] Пропущен: не заданы I ном. и коэффициент преобразования.\n")
+            return
+
+        self.plot_csv_path = csv_path
+        self.plot_file_label.configure(text=csv_path.name)
+        self.plot_e_inom.delete(0, "end"); self.plot_e_inom.insert(0, str(params.get('I_nom')))
+        self.plot_e_ratio.delete(0, "end"); self.plot_e_ratio.insert(0, str(params.get('ratio')))
+        self._current_df = stats["dataframe"]
+        self._refresh_points_tree()
+
+        self._append_log(
+            f"[График] Сохранён: {stats['png_path']} (макс. {stats['max_error_percent']:+.4f} %, "
+            f"средняя {stats['mean_error_percent']:+.4f} %)\n"
         )
         self._embed_figure(stats["figure"])
         self.notebook.select(1)
@@ -792,6 +1098,7 @@ class IVTraceGUI:
                     self._append_log(f"\n✔ Измерение завершено. Данные: {payload}\n")
                     self._set_running(False)
                     self._set_status("Измерение завершено", "ok")
+                    self._auto_plot_after_measurement(Path(payload))
                 elif kind == "error":
                     self._append_log(f"\n✖ Ошибка: {payload}\n")
                     self._set_running(False)
