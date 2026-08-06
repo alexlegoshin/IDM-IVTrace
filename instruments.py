@@ -285,14 +285,16 @@ class VoltageSource:
         self.instr.write(self.config['tracking_series_command'])
         time.sleep(0.2)
 
-    def setup(self, voltage_limit: float, current_limit: float = 1.0):
+    def setup(self, voltage_limit: float, current_limit: float):
         """
         voltage_limit принимается для единообразия вызова с CurrentSource.setup()
         (measurement.py вызывает src.setup(voltage_limit=...) для обоих типов
         источника), но сейчас не используется: в конфиге GPP-серии нет
         отдельной команды OVP/предела по напряжению — сама уставка (VSET)
         каждый раз ограничена X_stop. current_limit — реальное ограничение
-        по току (защита источника через ISET).
+        по току (защита источника через ISET); обязателен, без дефолта —
+        значение всегда приходит от оператора (I_limit, см. measurement.py/
+        orchestrate.py), молчаливая подстановка тут была бы опасным хардкодом.
         """
         cmds = self.config['setup_commands']
         self.instr.write(cmds['current_limit'].format(ch=self.primary_ch, current=current_limit))

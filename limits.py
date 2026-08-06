@@ -145,15 +145,20 @@ def strictest_current_source_limits(config_dir: Optional[Path] = None) -> Dict[s
 
 def strictest_voltage_source_limits(config_dir: Optional[Path] = None) -> Dict[str, Optional[float]]:
     """
-    Возвращает {'max_voltage': ...} — минимум паспортного напряжения среди
-    всех сконфигурированных источников напряжения (GPP-4323: 64.0 В в
-    tracking-series, см. instruments/voltage_sources/gpp74323.json).
+    Возвращает {'max_voltage': ..., 'max_current_limit': ...} — минимум
+    паспортных пределов среди всех сконфигурированных источников напряжения
+    (GPP-4323: 64.0 В / 3.0 А в tracking-series, см.
+    instruments/voltage_sources/gpp74323.json).
 
     Задание X_stop выше max_voltage при возбуждении 'voltage' физически
     недостижимо: X_stop и есть уставка источника напряжения (см.
     measurement.run_measurement — 'voltage' не использует V_limit вовсе).
+
+    max_current_limit — паспортный предел защитного ограничения тока
+    (ISET) источника напряжения, симметрично max_current у источника тока —
+    задание I_limit выше него физически недостижимо.
     """
     if config_dir is None:
         from apppaths import voltage_source_cfg_dir
         config_dir = voltage_source_cfg_dir()
-    return _strictest_source_limits(config_dir, ('max_voltage',))
+    return _strictest_source_limits(config_dir, ('max_voltage', 'max_current_limit'))

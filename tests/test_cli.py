@@ -134,7 +134,7 @@ def test_validate_reads_real_current_source_configs_by_default():
 
 def _voltage_params(**overrides):
     p = {'X_start': 0.0, 'X_stop': 30.0, 'X_step': 5.0,
-         'delay': 0.5, 'cooling_delay': 0.5, 'V_limit': 0.0}
+         'delay': 0.5, 'cooling_delay': 0.5, 'V_limit': 0.0, 'I_limit': 1.0}
     p.update(overrides)
     return p
 

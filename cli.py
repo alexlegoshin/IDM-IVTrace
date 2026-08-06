@@ -81,6 +81,8 @@ def build_parser(default_data_dir: Path = Path("data")) -> argparse.ArgumentPars
     p_setpoint.add_argument("--excitation", choices=["current", "voltage"], default="current")
     p_setpoint.add_argument("--vlimit", type=float, default=None,
                             help="Ограничение напряжения источника (обязательно для --excitation current)")
+    p_setpoint.add_argument("--ilimit", type=float, default=None,
+                            help="Ограничение тока источника напряжения (обязательно для --excitation voltage)")
     p_setpoint.add_argument("--dmm-addr", type=str, default=None)
     p_setpoint.add_argument("--src-addr", type=str, default=None)
     p_setpoint.add_argument("--relay-port", type=str, default=None)
@@ -154,6 +156,7 @@ def build_parser(default_data_dir: Path = Path("data")) -> argparse.ArgumentPars
     p_measure.add_argument("--stop", type=float, help="Конечное значение возбуждения")
     p_measure.add_argument("--step", type=float, help="Шаг возбуждения")
     p_measure.add_argument("--vlimit", type=float, help="Ограничение напряжения на источнике тока, В (не используется для источника напряжения)")
+    p_measure.add_argument("--ilimit", type=float, help="Ограничение тока на источнике напряжения, А (не используется для источника тока)")
     p_measure.add_argument("--delay", type=float, help="Задержка на установку возбуждения, с")
     p_measure.add_argument("--cool", type=float, help="Задержка на охлаждение между точками, с")
     p_measure.add_argument("--label", type=str, help="Комментарий (датчик, пометка)")
@@ -312,6 +315,8 @@ def validate_measure_params(params: dict, excitation_type: str,
         errors.append("Задержка на охлаждение не может быть отрицательной.")
     if excitation_type == 'current' and (params.get('V_limit') is None or params['V_limit'] <= 0):
         errors.append("Ограничение напряжения должно быть положительным числом.")
+    if excitation_type == 'voltage' and (params.get('I_limit') is None or params['I_limit'] <= 0):
+        errors.append("Ограничение тока должно быть положительным числом.")
 
     if excitation_type == 'current':
         block = relay_current_block_reason(current_sweep_max_abs(params, excitation_type))
@@ -355,6 +360,13 @@ def validate_measure_params(params: dict, excitation_type: str,
         ceiling_block = voltage_ceiling_block_reason(max_abs_v)
         if ceiling_block:
             errors.append(ceiling_block)
+
+        max_i_limit = voltage_source_limits.get('max_current_limit')
+        if max_i_limit is not None and params.get('I_limit') is not None and params['I_limit'] > max_i_limit:
+            errors.append(
+                f"Ограничение тока {params['I_limit']} А превышает паспортный предел "
+                f"источника ({max_i_limit} А) — физически недостижимо."
+            )
 
     return errors
 
@@ -435,6 +447,7 @@ def resolve_measure_params(args, config_mgr: ConfigManager, sensor_config_mgr=No
         'X_stop': args.stop if args.stop is not None else loaded.get('X_stop'),
         'X_step': args.step if args.step is not None else loaded.get('X_step'),
         'V_limit': args.vlimit if args.vlimit is not None else loaded.get('V_limit'),
+        'I_limit': args.ilimit if args.ilimit is not None else loaded.get('I_limit'),
         'delay': args.delay if args.delay is not None else loaded.get('delay'),
         'cooling_delay': args.cool if args.cool is not None else loaded.get('cooling_delay'),
         'label': args.label if args.label is not None else loaded.get('label'),
@@ -459,13 +472,18 @@ def resolve_measure_params(args, config_mgr: ConfigManager, sensor_config_mgr=No
         ),
     }
 
-    # Для источника напряжения V_limit не используется
+    # Для источника напряжения V_limit не используется, и наоборот — I_limit
+    # не используется для источника тока (симметрично, баг-репорт).
     if excitation_type == 'voltage':
         params['V_limit'] = 0.0
+    else:
+        params['I_limit'] = 0.0
 
     numeric_keys = ['X_start', 'X_stop', 'X_step', 'delay', 'cooling_delay']
     if excitation_type == 'current':
         numeric_keys.append('V_limit')
+    else:
+        numeric_keys.append('I_limit')
 
     have_all_numeric = all(params[k] is not None for k in numeric_keys)
     saved_matches_excitation = bool(saved) and saved.get('excitation_type') == excitation_type
@@ -476,6 +494,8 @@ def resolve_measure_params(args, config_mgr: ConfigManager, sensor_config_mgr=No
             print(f"  Возбуждение ({unit}): {saved.get('X_start')} → {saved.get('X_stop')}, шаг {saved.get('X_step')} {unit}")
             if excitation_type == 'current':
                 print(f"  Ограничение напряжения: {saved.get('V_limit')} В")
+            else:
+                print(f"  Ограничение тока: {saved.get('I_limit')} А")
             print(f"  Задержка на установку: {saved.get('delay')} с")
             print(f"  Задержка на охлаждение: {saved.get('cooling_delay')} с")
             print(f"  Последний комментарий: {saved.get('label', '')}")
@@ -507,6 +527,12 @@ def resolve_measure_params(args, config_mgr: ConfigManager, sensor_config_mgr=No
                     "Ограничение напряжения на источнике (В): ",
                     validator=lambda v: v > 0,
                     error_msg="Ограничение напряжения должно быть положительным числом.",
+                )
+            if excitation_type == 'voltage' and params['I_limit'] is None:
+                params['I_limit'] = _prompt_float(
+                    "Ограничение тока на источнике (А): ",
+                    validator=lambda v: v > 0,
+                    error_msg="Ограничение тока должно быть положительным числом.",
                 )
             if params['delay'] is None:
                 params['delay'] = _prompt_float(

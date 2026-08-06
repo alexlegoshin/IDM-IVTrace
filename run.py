@@ -93,6 +93,8 @@ def cmd_measure(args) -> int:
           f"шаг {params['X_step']} {unit} (обе полярности через реле)")
     if excitation_type == 'current':
         print(f"Ограничение напряжения источника: {params['V_limit']} В")
+    else:
+        print(f"Ограничение тока источника: {params['I_limit']} А")
     print(f"Комментарий: {params['label']}")
     print(f"Задержка установки: {params['delay']} с, задержка охлаждения: {params['cooling_delay']} с\n")
 
@@ -167,7 +169,7 @@ def cmd_analyze(args) -> int:
             return 1
         print("\nBETA: определение коэффициента преобразования по снятым точкам (МНК).")
         print(f"Фактический коэффициент: 1:{result['X_actual']:.2f}")
-        print(f"Округлённый (кратно 50): 1:{result['X_rounded']:.0f} "
+        print(f"Округлённый (кратно 25): 1:{result['X_rounded']:.0f} "
               f"(расхождение {result['discrepancy_percent']:.2f}%)")
         return 0
 
@@ -332,6 +334,10 @@ def cmd_setpoint(args) -> int:
             print("Ошибка: для --excitation current нужно указать --vlimit.")
             return 1
 
+    if args.excitation == 'voltage' and args.ilimit is None:
+        print("Ошибка: для --excitation voltage нужно указать --ilimit.")
+        return 1
+
     if not args.yes:
         confirm = input(f"Установить уставку {args.value:+g} ({args.excitation})? (y/n): ").strip().lower()
         if confirm != 'y':
@@ -348,7 +354,7 @@ def cmd_setpoint(args) -> int:
     from orchestrate import open_manual_control_session
     try:
         session = open_manual_control_session(
-            rm, args.excitation, V_limit=args.vlimit,
+            rm, args.excitation, V_limit=args.vlimit, I_limit=args.ilimit,
             dmm_addr=args.dmm_addr, src_addr=args.src_addr, relay_port=args.relay_port,
         )
     except (RuntimeError, ValueError) as e:

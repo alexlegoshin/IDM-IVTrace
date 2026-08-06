@@ -519,6 +519,15 @@ class IVTraceGUI:
         self._vlimit_frame.columnconfigure(1, weight=1)
         self.e_vlimit, self.u_vlimit = self._param_row(self._vlimit_frame, 0, "Огр. напряжения", unit="В")
 
+        # Огр. тока — симметрично огр. напряжения, только для возбуждения
+        # напряжением (защита источника от КЗ/низкоомной нагрузки на выходе,
+        # баг-репорт: у уставки тока есть огр. по напряжению, у уставки
+        # напряжения должно быть огр. по току).
+        self._ilimit_frame = ttk.Frame(pf)
+        self._ilimit_frame.grid(row=3, column=0, columnspan=3, sticky="ew")
+        self._ilimit_frame.columnconfigure(1, weight=1)
+        self.e_ilimit, self.u_ilimit = self._param_row(self._ilimit_frame, 0, "Огр. тока", unit="А")
+
         self.e_delay, self.u_delay = self._param_row(pf, 4, "Задержка установки", unit="с")
         self.e_cool, self.u_cool = self._param_row(pf, 5, "Задержка охлаждения", unit="с")
 
@@ -893,7 +902,7 @@ class IVTraceGUI:
             self.output_var.set(saved["output_type"])
         mapping = {
             "X_start": self.e_start, "X_stop": self.e_stop, "X_step": self.e_step,
-            "V_limit": self.e_vlimit, "delay": self.e_delay, "cooling_delay": self.e_cool,
+            "V_limit": self.e_vlimit, "I_limit": self.e_ilimit, "delay": self.e_delay, "cooling_delay": self.e_cool,
             "label": self.e_label,
         }
         for key, entry in mapping.items():
@@ -910,12 +919,15 @@ class IVTraceGUI:
             lbl.configure(text=unit)
         # п.33: показываем только то, что реально будет использовано —
         # огр. напряжения и витки не имеют смысла при возбуждении
-        # напряжением, поэтому прячутся целиком, а не просто гаснут.
+        # напряжением (там вместо огр. напряжения — симметричное огр. тока),
+        # поэтому прячутся целиком, а не просто гаснут.
         if is_current:
             self._vlimit_frame.grid()
+            self._ilimit_frame.grid_remove()
             self._turns_row.grid()
         else:
             self._vlimit_frame.grid_remove()
+            self._ilimit_frame.grid()
             self._turns_row.grid_remove()
         self._refresh_profile_list()
         self._update_sweep_preview()
@@ -1154,6 +1166,7 @@ class IVTraceGUI:
             return
         excitation_type = self.excitation_var.get()
         v_limit = None
+        i_limit = None
         if excitation_type == 'current':
             try:
                 v_limit = float(self.e_vlimit.get().strip().replace(",", "."))
@@ -1162,6 +1175,15 @@ class IVTraceGUI:
             except ValueError:
                 messagebox.showerror("Проверьте параметры",
                                      "Для возбуждения током укажите положительное «Огр. напряжения» в панели параметров.")
+                return
+        else:
+            try:
+                i_limit = float(self.e_ilimit.get().strip().replace(",", "."))
+                if i_limit <= 0:
+                    raise ValueError
+            except ValueError:
+                messagebox.showerror("Проверьте параметры",
+                                     "Для возбуждения напряжением укажите положительное «Огр. тока» в панели параметров.")
                 return
 
         addr = {
@@ -1179,7 +1201,7 @@ class IVTraceGUI:
             try:
                 rm = make_resource_manager()
                 session = open_manual_control_session(
-                    rm, excitation_type, V_limit=v_limit,
+                    rm, excitation_type, V_limit=v_limit, I_limit=i_limit,
                     dmm_addr=addr["dmm_addr"], src_addr=addr["src_addr"], relay_port=addr["relay_port"],
                     log=self._manual_log, on_session_open=self._session.set,
                 )
@@ -1513,6 +1535,7 @@ class IVTraceGUI:
         self.e_stop.delete(0, 'end'); self.e_stop.insert(0, str(params.get('X_stop', '')))
         self.e_step.delete(0, 'end'); self.e_step.insert(0, str(params.get('X_step', '')))
         self.e_vlimit.delete(0, 'end'); self.e_vlimit.insert(0, str(params.get('V_limit', '')))
+        self.e_ilimit.delete(0, 'end'); self.e_ilimit.insert(0, str(params.get('I_limit', '')))
         self.e_delay.delete(0, 'end'); self.e_delay.insert(0, str(params.get('delay', '')))
         self.e_cool.delete(0, 'end'); self.e_cool.insert(0, str(params.get('cooling_delay', '')))
         self.e_label.delete(0, 'end'); self.e_label.insert(0, params.get('label', ''))
@@ -1565,8 +1588,10 @@ class IVTraceGUI:
             }
             if excitation_type == "current":
                 params["V_limit"] = num(self.e_vlimit, "Огр. напряжения")
+                params["I_limit"] = 0.0
             else:
                 params["V_limit"] = 0.0
+                params["I_limit"] = num(self.e_ilimit, "Огр. тока")
 
             # Новые параметры
             params["I_nom"] = optional_num(self.e_inom)

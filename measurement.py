@@ -319,6 +319,7 @@ def run_measurement(dmm: DMM, src: Union[CurrentSource, VoltageSource], relay: R
                      excitation_type: str,
                      X_start: float, X_stop: float, X_step: float,
                      V_limit: float, delay: float, cooling_delay: float,
+                     I_limit: Optional[float] = None,
                      output_type: str = 'current',
                      branch: Branch = Branch.BOTH,
                      preset: DirectionPreset = DirectionPreset.DIVERGING,
@@ -359,7 +360,9 @@ def run_measurement(dmm: DMM, src: Union[CurrentSource, VoltageSource], relay: R
                       'voltage' — на источник напряжения подаётся уставка
                       напряжения (V_limit в этом случае не используется для
                       настройки источника, X_stop и есть максимальное
-                      напряжение цикла).
+                      напряжение цикла; вместо этого используется I_limit —
+                      симметричное ограничение тока источника напряжения,
+                      обязательно при excitation_type='voltage').
 
     output_type (ось А-1, PLAN_V2.md, независимая от excitation_type) —
     что физически измеряет мультиметр на выходе датчика: 'current' (по
@@ -397,7 +400,7 @@ def run_measurement(dmm: DMM, src: Union[CurrentSource, VoltageSource], relay: R
     if excitation_type == 'current':
         src.setup(voltage_limit=V_limit)
     elif excitation_type == 'voltage':
-        src.setup(voltage_limit=X_stop)
+        src.setup(voltage_limit=X_stop, current_limit=I_limit)
     else:
         raise ValueError(f"Неизвестный тип возбуждения: {excitation_type!r} (ожидается 'current' или 'voltage')")
 

@@ -10,8 +10,8 @@ from apppaths import APP_VERSION
 class ConfigManager:
     """
     Отвечает за чтение/запись JSON-конфига с параметрами последнего измерения
-    (excitation_type, X_start, X_stop, X_step, V_limit, delay, cooling_delay,
-    label, I_nom, ratio, turns, error_threshold, branch, preset,
+    (excitation_type, X_start, X_stop, X_step, V_limit, I_limit, delay,
+    cooling_delay, label, I_nom, ratio, turns, error_threshold, branch, preset,
     averaging_count, averaging_delay, discard_first, stop_on_error).
     branch (см. sweep.Branch) заменяет собой старое булево use_relay —
     'both' снимает обе полярности автоматически через плату реле в рамках

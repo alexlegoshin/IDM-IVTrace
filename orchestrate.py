@@ -175,6 +175,8 @@ def write_results_csv(csv_path: Path, df: pd.DataFrame, params: dict,
             f.write("# Выход по напряжению — BETA, не проверено на реальном стенде\n")
         if excitation_type == 'current':
             f.write(f"# Ограничение напряжения: {params['V_limit']} В\n")
+        else:
+            f.write(f"# Ограничение тока: {params.get('I_limit')} А\n")
         if params.get('I_nom'):
             f.write(f"# Номинальный первичный ток: {params['I_nom']} А\n")
         if params.get('ratio'):
@@ -287,7 +289,8 @@ def run_measurement_session(
         run_measurement(
             dmm, src, relay, excitation_type,
             X_start=params['X_start'], X_stop=params['X_stop'], X_step=params['X_step'],
-            V_limit=params['V_limit'], delay=params['delay'], cooling_delay=params['cooling_delay'],
+            V_limit=params['V_limit'], I_limit=params.get('I_limit'),
+            delay=params['delay'], cooling_delay=params['cooling_delay'],
             output_type=output_type,
             branch=Branch(params.get('branch', Branch.BOTH.value)),
             preset=DirectionPreset(params.get('preset', DirectionPreset.DIVERGING.value)),
@@ -441,6 +444,7 @@ def open_manual_control_session(
     rm,
     excitation_type: str,
     V_limit: Optional[float] = None,
+    I_limit: Optional[float] = None,
     dmm_addr: Optional[str] = None,
     src_addr: Optional[str] = None,
     relay_port: Optional[str] = None,
@@ -463,11 +467,17 @@ def open_manual_control_session(
     поднять напряжение сколь угодно высоко, добиваясь заданного тока. Для
     excitation_type='voltage' не используется (см. VoltageSource.setup).
 
+    I_limit — симметричное ограничение тока источника напряжения (защита от
+    короткого замыкания/низкоомной нагрузки на выходе); обязателен при
+    excitation_type='voltage'. Для excitation_type='current' не используется.
+
     Приборы остаются открытыми — закрыть их обязан вызывающий код через
     ManualControlSession.close() (или аварийным остановом).
     """
     if excitation_type == 'current' and V_limit is None:
         raise ValueError("Для возбуждения током необходимо указать ограничение напряжения источника (V_limit).")
+    if excitation_type == 'voltage' and I_limit is None:
+        raise ValueError("Для возбуждения напряжением необходимо указать ограничение тока источника (I_limit).")
 
     source_cfg_dir = current_source_cfg_dir() if excitation_type == 'current' else voltage_source_cfg_dir()
     source_label = "источник тока" if excitation_type == 'current' else "источник напряжения"
@@ -492,7 +502,10 @@ def open_manual_control_session(
                  else VoltageSource(src_addr, src_cfg, rm=rm))
     handle.relay = RelayController(relay_port)
 
-    handle.src.setup(voltage_limit=(V_limit if excitation_type == 'current' else 0.0))
+    if excitation_type == 'current':
+        handle.src.setup(voltage_limit=V_limit)
+    else:
+        handle.src.setup(voltage_limit=0.0, current_limit=I_limit)
     log("Ручной режим: приборы и реле готовы.")
     _log_calibration_warnings([handle.dmm.config, handle.src.config], log)
 
