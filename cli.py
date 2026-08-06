@@ -71,6 +71,69 @@ def build_parser(default_data_dir: Path = Path("data")) -> argparse.ArgumentPars
     p_relay.add_argument("--yes", action="store_true",
                          help="Не спрашивать подтверждения перед переключением")
 
+    # ---------------- setpoint ----------------
+    p_setpoint = subparsers.add_parser(
+        "setpoint",
+        help="Прямая знаковая уставка вне измерительного цикла (Ф5, п.40) — держит значение до Enter/Ctrl+C",
+    )
+    p_setpoint.add_argument("value", type=float,
+                            help="Значение со знаком: >0 — прямое направление, <0 — обратное, 0 — выключить")
+    p_setpoint.add_argument("--excitation", choices=["current", "voltage"], default="current")
+    p_setpoint.add_argument("--vlimit", type=float, default=None,
+                            help="Ограничение напряжения источника (обязательно для --excitation current)")
+    p_setpoint.add_argument("--dmm-addr", type=str, default=None)
+    p_setpoint.add_argument("--src-addr", type=str, default=None)
+    p_setpoint.add_argument("--relay-port", type=str, default=None)
+    p_setpoint.add_argument("--yes", action="store_true", help="Не спрашивать подтверждения")
+
+    # ---------------- identify ----------------
+    p_identify = subparsers.add_parser(
+        "identify",
+        help="«Мигнуть» прибором по VISA-адресу, если у него в конфиге настроена identify_command (Ф4, п.11)",
+    )
+    p_identify.add_argument("address", help="VISA-адрес (см. discover)")
+
+    # ---------------- profile ----------------
+    p_profile = subparsers.add_parser("profile", help="Профили датчиков (п.39)")
+    profile_sub = p_profile.add_subparsers(dest="profile_command", required=True)
+
+    p_profile_list = profile_sub.add_parser("list", help="Список сохранённых профилей")
+    p_profile_list.add_argument("--excitation", choices=["current", "voltage"], default=None,
+                                help="Сузить список до одного типа возбуждения (по умолчанию — оба)")
+
+    p_profile_delete = profile_sub.add_parser("delete", help="Удалить профиль")
+    p_profile_delete.add_argument("name")
+    p_profile_delete.add_argument("--excitation", choices=["current", "voltage"], default=None)
+    p_profile_delete.add_argument("--yes", action="store_true")
+
+    p_profile_rename = profile_sub.add_parser("rename", help="Переименовать профиль")
+    p_profile_rename.add_argument("old_name")
+    p_profile_rename.add_argument("new_name")
+    p_profile_rename.add_argument("--excitation", choices=["current", "voltage"], default=None)
+
+    # ---------------- calibration ----------------
+    p_cal = subparsers.add_parser("calibration", help="Даты поверки приборов (п.3-UI)")
+    cal_sub = p_cal.add_subparsers(dest="calibration_command", required=True)
+
+    cal_sub.add_parser("list", help="Статус поверки всех сконфигурированных приборов")
+
+    p_cal_set = cal_sub.add_parser("set", help="Внести дату поверки в конфиг прибора")
+    p_cal_set.add_argument("config_file",
+                           help="Имя json-файла конфига (например akip2101.json) или полный путь к нему — см. calibration list")
+    p_cal_set.add_argument("--date", required=True, help="Дата последней поверки, ISO YYYY-MM-DD")
+    p_cal_set.add_argument("--interval-months", type=int, required=True)
+
+    # ---------------- config ----------------
+    p_config = subparsers.add_parser("config", help="Настройки приложения (п.23 — рабочая папка)")
+    config_sub = p_config.add_subparsers(dest="config_command", required=True)
+
+    config_sub.add_parser("show", help="Текущая рабочая папка и её источник (переопределена/по умолчанию)")
+
+    p_config_set = config_sub.add_parser("set-work-dir", help="Переопределить рабочую папку")
+    p_config_set.add_argument("path", type=Path)
+
+    config_sub.add_parser("reset-work-dir", help="Сбросить переопределение рабочей папки (снова по умолчанию)")
+
     # ---------------- measure ----------------
     p_measure = subparsers.add_parser(
         "measure",

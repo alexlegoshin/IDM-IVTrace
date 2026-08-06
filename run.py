@@ -26,8 +26,9 @@ IVtrace — приложение для автоматизированного �
 оборудования от повреждения из-за поломки кода.
 """
 import sys
+from pathlib import Path
 
-from apppaths import default_data_dir, sensor_config_dir
+from apppaths import default_data_dir, sensor_config_dir, work_dir, set_work_dir
 from cli import build_parser, resolve_measure_params, make_csv_filename
 from config import ConfigManager, SensorConfigManager
 from analysis import load_and_analyze, find_latest_csv
@@ -312,8 +313,220 @@ def cmd_relay(args) -> int:
     return 0
 
 
+def cmd_setpoint(args) -> int:
+    """Прямая знаковая уставка вне измерительного цикла (Ф5, п.40) — держит значение до Enter/Ctrl+C."""
+    from limits import relay_current_block_reason, relay_current_warning
+
+    if args.excitation == 'current':
+        block = relay_current_block_reason(abs(args.value))
+        if block:
+            print(f"Ошибка: {block}")
+            return 1
+        warning = relay_current_warning(abs(args.value))
+        if warning and not args.yes:
+            confirm = input(f"⚠ {warning}\nПродолжить? (y/n): ").strip().lower()
+            if confirm != 'y':
+                print("Отменено.")
+                return 1
+        if args.vlimit is None:
+            print("Ошибка: для --excitation current нужно указать --vlimit.")
+            return 1
+
+    if not args.yes:
+        confirm = input(f"Установить уставку {args.value:+g} ({args.excitation})? (y/n): ").strip().lower()
+        if confirm != 'y':
+            print("Отменено.")
+            return 1
+
+    try:
+        from visa_backend import make_resource_manager
+        rm = make_resource_manager()
+    except RuntimeError as e:
+        print(f"Ошибка VISA: {e}")
+        return 1
+
+    from orchestrate import open_manual_control_session
+    try:
+        session = open_manual_control_session(
+            rm, args.excitation, V_limit=args.vlimit,
+            dmm_addr=args.dmm_addr, src_addr=args.src_addr, relay_port=args.relay_port,
+        )
+    except (RuntimeError, ValueError) as e:
+        print(f"Ошибка: {e}")
+        try:
+            rm.close()
+        except Exception:
+            pass
+        return 1
+
+    try:
+        session.apply_setpoint(args.value)
+        print(f"Уставка применена: {args.value:+g}. Нажмите Enter для остановки...")
+        try:
+            input()
+        except KeyboardInterrupt:
+            print()
+    finally:
+        session.stop()
+        session.close()
+        try:
+            rm.close()
+        except Exception:
+            pass
+
+    print("Остановлено.")
+    return 0
+
+
+def cmd_identify(args) -> int:
+    """«Мигнуть» прибором по VISA-адресу (Ф4, п.11 — CLI-паритет, Ф5 п.34)."""
+    import json
+    from apppaths import (
+        multimeter_cfg_dir, voltmeter_cfg_dir, current_source_cfg_dir, voltage_source_cfg_dir,
+    )
+    from discovery import scan_instruments
+    from instruments import identify_instrument
+
+    try:
+        from visa_backend import make_resource_manager
+        rm = make_resource_manager()
+    except RuntimeError as e:
+        print(f"Ошибка VISA: {e}")
+        return 1
+
+    found = scan_instruments(rm, {
+        'multimeter': multimeter_cfg_dir(), 'voltmeter': voltmeter_cfg_dir(),
+        'current_source': current_source_cfg_dir(), 'voltage_source': voltage_source_cfg_dir(),
+    })
+    match = next((i for i in found if i.address == args.address), None)
+    try:
+        rm.close()
+    except Exception:
+        pass
+
+    if match is None or match.config_path is None:
+        print(f"Прибор по адресу {args.address} не опознан сканом — нечем определить конфиг с командой мигания.")
+        return 1
+
+    # Новый ResourceManager: предыдущий уже закрыт после скана — не держим
+    # его открытым дольше, чем нужно для самого перебора ресурсов.
+    rm = make_resource_manager()
+    cfg = json.loads(match.config_path.read_text(encoding='utf-8'))
+    ok = identify_instrument(rm, args.address, cfg)
+    try:
+        rm.close()
+    except Exception:
+        pass
+
+    if ok:
+        print(f"Команда отправлена: {args.address} ({match.config_path.stem})")
+        return 0
+    print(f"Для {match.config_path.stem} не настроена команда мигания (identify_command в конфиге отсутствует).")
+    return 1
+
+
+def cmd_profile(args) -> int:
+    """Профили датчиков (п.39) — CLI-паритет к сохранению/загрузке из GUI."""
+    from config import SensorConfigManager
+
+    mgr = SensorConfigManager(sensor_config_dir())
+
+    if args.profile_command == "list":
+        names = mgr.list_sensor_configs(excitation_type=args.excitation)
+        if not names:
+            print("Профилей не найдено.")
+        for name in names:
+            print(f"  {name}")
+        return 0
+
+    if args.profile_command == "delete":
+        if not args.yes:
+            confirm = input(f"Удалить профиль '{args.name}'? (y/n): ").strip().lower()
+            if confirm != 'y':
+                print("Отменено.")
+                return 1
+        ok = mgr.delete_sensor_config(args.name, excitation_type=args.excitation)
+        print("Удалён." if ok else "Профиль не найден.")
+        return 0 if ok else 1
+
+    if args.profile_command == "rename":
+        ok = mgr.rename_sensor_config(args.old_name, args.new_name, excitation_type=args.excitation)
+        print("Переименован." if ok else "Исходный профиль не найден.")
+        return 0 if ok else 1
+
+    return 1
+
+
+def cmd_calibration(args) -> int:
+    """Даты поверки приборов (п.3-UI — CLI-паритет)."""
+    import json
+    from apppaths import (
+        multimeter_cfg_dir, voltmeter_cfg_dir, current_source_cfg_dir, voltage_source_cfg_dir,
+    )
+    from calibration import list_instrument_configs, update_calibration_date, check_calibration
+
+    config_dirs = [multimeter_cfg_dir(), voltmeter_cfg_dir(), current_source_cfg_dir(), voltage_source_cfg_dir()]
+
+    if args.calibration_command == "list":
+        configs = list_instrument_configs(config_dirs)
+        if not configs:
+            print("Конфигов приборов не найдено.")
+        for path in configs:
+            try:
+                cfg = json.loads(path.read_text(encoding='utf-8'))
+            except (ValueError, OSError) as e:
+                print(f"  {path.name}: ошибка чтения ({e})")
+                continue
+            info = check_calibration(cfg)
+            print(f"  {path.name}  [{info.status.value}]  {info.message}")
+        return 0
+
+    if args.calibration_command == "set":
+        config_file = Path(args.config_file)
+        if not config_file.is_absolute():
+            matches = [p for p in list_instrument_configs(config_dirs) if p.name == config_file.name]
+            if not matches:
+                print(f"Конфиг {args.config_file} не найден ни в одном из каталогов приборов "
+                      "(см. calibration list).")
+                return 1
+            config_file = matches[0]
+        try:
+            update_calibration_date(config_file, args.date, args.interval_months)
+        except ValueError as e:
+            print(f"Ошибка: {e}")
+            return 1
+        print(f"Записано: {config_file}")
+        return 0
+
+    return 1
+
+
+def cmd_config(args) -> int:
+    """Настройки приложения (п.23 — рабочая папка)."""
+    if args.config_command == "show":
+        current = work_dir()
+        print(f"Рабочая папка: {current}")
+        print("(значение по умолчанию)" if current == default_data_dir() else "(переопределена)")
+        return 0
+
+    if args.config_command == "set-work-dir":
+        set_work_dir(args.path)
+        print(f"Рабочая папка установлена: {args.path}")
+        return 0
+
+    if args.config_command == "reset-work-dir":
+        set_work_dir(None)
+        print(f"Рабочая папка сброшена на значение по умолчанию: {default_data_dir()}")
+        return 0
+
+    return 1
+
+
 def main(argv=None) -> int:
-    parser = build_parser(default_data_dir=default_data_dir())
+    # work_dir() (п.23) — уважает переопределение рабочей папки, заданное
+    # из GUI/через `config set-work-dir`; без него — то же самое, что и
+    # раньше (default_data_dir()).
+    parser = build_parser(default_data_dir=work_dir())
     args = parser.parse_args(argv)
 
     # Без подкоманды или с 'gui' — запускаем графический интерфейс.
@@ -329,6 +542,16 @@ def main(argv=None) -> int:
         return cmd_discover(args)
     if args.command == "relay":
         return cmd_relay(args)
+    if args.command == "setpoint":
+        return cmd_setpoint(args)
+    if args.command == "identify":
+        return cmd_identify(args)
+    if args.command == "profile":
+        return cmd_profile(args)
+    if args.command == "calibration":
+        return cmd_calibration(args)
+    if args.command == "config":
+        return cmd_config(args)
 
     parser.print_help()
     return 1

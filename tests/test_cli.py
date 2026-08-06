@@ -557,6 +557,123 @@ def test_discover_subcommand_parses_with_no_extra_args():
     assert args.command == "discover"
 
 
+# ----------------------------------------------------------------------
+# setpoint/identify/profile/calibration/config — новые подкоманды (Ф5,
+# CLI-паритет п.34: п.40-CLI, п.11-CLI, п.39-CLI, п.3-UI-CLI, п.23-CLI)
+# ----------------------------------------------------------------------
+
+def test_setpoint_parser_accepts_signed_value_and_defaults():
+    parser = build_parser()
+    args = parser.parse_args(["setpoint", "-5.5"])
+    assert args.value == -5.5
+    assert args.excitation == "current"
+    assert args.vlimit is None
+    assert args.yes is False
+
+
+def test_setpoint_parser_accepts_all_options():
+    parser = build_parser()
+    args = parser.parse_args([
+        "setpoint", "10", "--excitation", "voltage", "--vlimit", "5",
+        "--dmm-addr", "DMM1", "--src-addr", "SRC1", "--relay-port", "COM3", "--yes",
+    ])
+    assert args.value == 10.0
+    assert args.excitation == "voltage"
+    assert args.vlimit == 5.0
+    assert args.dmm_addr == "DMM1"
+    assert args.src_addr == "SRC1"
+    assert args.relay_port == "COM3"
+    assert args.yes is True
+
+
+def test_identify_parser_requires_address():
+    parser = build_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["identify"])
+    args = parser.parse_args(["identify", "USB0::0x1234::INSTR"])
+    assert args.address == "USB0::0x1234::INSTR"
+
+
+def test_profile_list_parser():
+    parser = build_parser()
+    args = parser.parse_args(["profile", "list"])
+    assert args.profile_command == "list"
+    assert args.excitation is None
+
+    args = parser.parse_args(["profile", "list", "--excitation", "voltage"])
+    assert args.excitation == "voltage"
+
+
+def test_profile_delete_parser():
+    parser = build_parser()
+    args = parser.parse_args(["profile", "delete", "MySensor", "--yes"])
+    assert args.profile_command == "delete"
+    assert args.name == "MySensor"
+    assert args.yes is True
+
+
+def test_profile_rename_parser():
+    parser = build_parser()
+    args = parser.parse_args(["profile", "rename", "Old", "New"])
+    assert args.profile_command == "rename"
+    assert args.old_name == "Old"
+    assert args.new_name == "New"
+
+
+def test_profile_requires_a_subcommand():
+    parser = build_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["profile"])
+
+
+def test_calibration_list_parser():
+    parser = build_parser()
+    args = parser.parse_args(["calibration", "list"])
+    assert args.calibration_command == "list"
+
+
+def test_calibration_set_parser():
+    parser = build_parser()
+    args = parser.parse_args([
+        "calibration", "set", "akip2101.json", "--date", "2026-01-01", "--interval-months", "12",
+    ])
+    assert args.calibration_command == "set"
+    assert args.config_file == "akip2101.json"
+    assert args.date == "2026-01-01"
+    assert args.interval_months == 12
+
+
+def test_calibration_set_requires_date_and_interval():
+    parser = build_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["calibration", "set", "akip2101.json"])
+
+
+def test_config_show_parser():
+    parser = build_parser()
+    args = parser.parse_args(["config", "show"])
+    assert args.config_command == "show"
+
+
+def test_config_set_work_dir_parser(tmp_path):
+    parser = build_parser()
+    args = parser.parse_args(["config", "set-work-dir", str(tmp_path)])
+    assert args.config_command == "set-work-dir"
+    assert args.path == tmp_path
+
+
+def test_config_reset_work_dir_parser():
+    parser = build_parser()
+    args = parser.parse_args(["config", "reset-work-dir"])
+    assert args.config_command == "reset-work-dir"
+
+
+def test_config_requires_a_subcommand():
+    parser = build_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["config"])
+
+
 def test_resolve_measure_params_interactive_full_flow(monkeypatch, tmp_path):
     parser = build_parser()
     args = _measure_args(parser, [])  # ничего не передано флагами
