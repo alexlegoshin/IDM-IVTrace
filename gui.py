@@ -42,6 +42,7 @@ from limits import relay_current_warning, relay_current_block_reason, SMOOTH_RAM
 from measurement import (
     EXCITATION_UNITS,
     DEFAULT_AVERAGING_COUNT, DEFAULT_AVERAGING_DELAY, DEFAULT_DISCARD_FIRST,
+    DEFAULT_ADAPTIVE_COOLING_MIN_DELAY, DEFAULT_ADAPTIVE_COOLING_MAX_DELAY,
     estimate_duration_seconds,
 )
 from sweep import Branch, DirectionPreset, plan_sweep, plan_custom_sweep
@@ -483,6 +484,7 @@ class IVTraceGUI:
 
         self._on_excitation_change()
         self._on_custom_program_change()
+        self._on_adaptive_cooling_change()
         self._on_stop_on_error_change()
         self._on_branch_change()
         self._on_preset_change()
@@ -591,7 +593,25 @@ class IVTraceGUI:
         self._delay_cool_frame.grid(row=4, column=0, columnspan=3, sticky="ew")
         self._delay_cool_frame.columnconfigure(1, weight=1)
         self.e_delay, self.u_delay = self._param_row(self._delay_cool_frame, 0, "Задержка установки", unit="с")
-        self.e_cool, self.u_cool = self._param_row(self._delay_cool_frame, 1, "Задержка охлаждения", unit="с")
+
+        # Адаптивное охлаждение (BETA, галочка на вкладке «Дополнительно»,
+        # см. _cool_box) заменяет одну "Задержка охлаждения" двумя явными
+        # границами — оператор сам видит и задаёт мин./макс. в секундах,
+        # а не множитель от неизвестной итоговой величины (баг-репорт).
+        self._cooling_fixed_frame = ttk.Frame(self._delay_cool_frame)
+        self._cooling_fixed_frame.grid(row=1, column=0, columnspan=3, sticky="ew")
+        self._cooling_fixed_frame.columnconfigure(1, weight=1)
+        self.e_cool, self.u_cool = self._param_row(self._cooling_fixed_frame, 0, "Задержка охлаждения", unit="с")
+
+        self._cooling_adaptive_frame = ttk.Frame(self._delay_cool_frame)
+        self._cooling_adaptive_frame.grid(row=1, column=0, columnspan=3, sticky="ew")
+        self._cooling_adaptive_frame.columnconfigure(1, weight=1)
+        self.e_cool_min, self.u_cool_min = self._param_row(
+            self._cooling_adaptive_frame, 0, "Мин. задержка охлаждения", unit="с")
+        self.e_cool_min.insert(0, str(DEFAULT_ADAPTIVE_COOLING_MIN_DELAY))
+        self.e_cool_max, self.u_cool_max = self._param_row(
+            self._cooling_adaptive_frame, 1, "Макс. задержка охлаждения", unit="с")
+        self.e_cool_max.insert(0, str(DEFAULT_ADAPTIVE_COOLING_MAX_DELAY))
 
         self._ramp_duration_frame = ttk.Frame(pf)
         self._ramp_duration_frame.grid(row=4, column=0, columnspan=3, sticky="ew")
@@ -747,7 +767,8 @@ class IVTraceGUI:
         self._cool_box = ttk.Labelframe(body, text="Охлаждение", padding=10)
         self._cool_box.grid(row=3, column=0, sticky="ew", padx=10, pady=(0, 10))
         ttk.Checkbutton(self._cool_box, text="Адаптивное охлаждение (BETA, растёт с током)",
-                        variable=self.adaptive_cooling_var).grid(row=0, column=0, sticky="w")
+                        variable=self.adaptive_cooling_var,
+                        command=self._on_adaptive_cooling_change).grid(row=0, column=0, sticky="w")
         ttk.Label(self._cool_box, text="не проверено на реальном стенде",
                   style="Muted.TLabel").grid(row=1, column=0, sticky="w")
 
@@ -1037,6 +1058,24 @@ class IVTraceGUI:
             else:
                 self._dir_box.grid()
         self._update_sweep_preview()
+
+    def _on_adaptive_cooling_change(self):
+        """
+        Адаптивное охлаждение (BETA, галочка на вкладке «Дополнительно») —
+        заменяет одну "Задержка охлаждения" двумя явными границами (мин./
+        макс. в секундах), которые оператор задаёт сам; функция сама
+        интерполирует между ними по току (см.
+        measurement._adaptive_cooling_delay). Показываем только то, что
+        реально будет использовано (п.33).
+        """
+        if not hasattr(self, '_cooling_fixed_frame'):
+            return
+        if self.adaptive_cooling_var.get():
+            self._cooling_fixed_frame.grid_remove()
+            self._cooling_adaptive_frame.grid()
+        else:
+            self._cooling_fixed_frame.grid()
+            self._cooling_adaptive_frame.grid_remove()
 
     def _on_smooth_ramp_change(self):
         """
@@ -1856,6 +1895,10 @@ class IVTraceGUI:
         self.e_avg_delay.delete(0, 'end'); self.e_avg_delay.insert(0, str(params.get('averaging_delay', DEFAULT_AVERAGING_DELAY)))
         self.discard_first_var.set(params.get('discard_first', DEFAULT_DISCARD_FIRST))
         self.adaptive_cooling_var.set(params.get('adaptive_cooling', False))
+        self.e_cool_min.delete(0, 'end')
+        self.e_cool_min.insert(0, str(params.get('adaptive_cooling_min_delay', DEFAULT_ADAPTIVE_COOLING_MIN_DELAY)))
+        self.e_cool_max.delete(0, 'end')
+        self.e_cool_max.insert(0, str(params.get('adaptive_cooling_max_delay', DEFAULT_ADAPTIVE_COOLING_MAX_DELAY)))
         self.smooth_ramp_var.set(params.get('smooth_ramp', False))
         self.e_ramp_duration.delete(0, 'end'); self.e_ramp_duration.insert(0, str(params.get('ramp_duration', 1.0)))
         self.custom_program_var.set(bool(params.get('custom_program')))
@@ -1865,6 +1908,7 @@ class IVTraceGUI:
 
         self._on_excitation_change()
         self._on_custom_program_change()
+        self._on_adaptive_cooling_change()
         self._on_stop_on_error_change()
         self._on_branch_change()
         self._on_preset_change()
@@ -1926,7 +1970,16 @@ class IVTraceGUI:
                 params["ramp_duration"] = num(self.e_ramp_duration, "Время шага")
             else:
                 params["delay"] = num(self.e_delay, "Задержка установки")
-                params["cooling_delay"] = num(self.e_cool, "Задержка охлаждения")
+                # e_cool скрыт при адаптивном охлаждении (см.
+                # _on_adaptive_cooling_change) — сама cooling_delay в этом
+                # режиме не используется (эффективную задержку считает
+                # _adaptive_cooling_delay из min/max), требовать заполнения
+                # скрытого поля не нужно.
+                params["cooling_delay"] = (
+                    optional_num(self.e_cool) or 0.0
+                    if self.adaptive_cooling_var.get()
+                    else num(self.e_cool, "Задержка охлаждения")
+                )
                 params["ramp_duration"] = optional_num(self.e_ramp_duration) or 1.0
             params["smooth_ramp"] = smooth_ramp
             if excitation_type == "current":
@@ -1949,6 +2002,16 @@ class IVTraceGUI:
             params["averaging_delay"] = optional_num(self.e_avg_delay) or 0.0
             params["discard_first"] = self.discard_first_var.get()
             params["adaptive_cooling"] = self.adaptive_cooling_var.get()
+            if params["adaptive_cooling"]:
+                params["adaptive_cooling_min_delay"] = num(self.e_cool_min, "Мин. задержка охлаждения")
+                params["adaptive_cooling_max_delay"] = num(self.e_cool_max, "Макс. задержка охлаждения")
+                if params["adaptive_cooling_min_delay"] > params["adaptive_cooling_max_delay"]:
+                    raise ValueError(
+                        "Минимальная задержка охлаждения не может быть больше максимальной."
+                    )
+            else:
+                params["adaptive_cooling_min_delay"] = optional_num(self.e_cool_min) or DEFAULT_ADAPTIVE_COOLING_MIN_DELAY
+                params["adaptive_cooling_max_delay"] = optional_num(self.e_cool_max) or DEFAULT_ADAPTIVE_COOLING_MAX_DELAY
             params["suppress_notifications"] = self.suppress_warnings_var.get()
 
             # I_nom — только метаданные датчика для шапки CSV, для измерения
@@ -2055,7 +2118,8 @@ class IVTraceGUI:
                 averaging_count=params.get('averaging_count', DEFAULT_AVERAGING_COUNT),
                 averaging_delay=params.get('averaging_delay', DEFAULT_AVERAGING_DELAY),
                 adaptive_cooling=params.get('adaptive_cooling', False),
-                adaptive_cooling_max_multiplier=params.get('adaptive_cooling_max_multiplier', 5.0),
+                adaptive_cooling_min_delay=params.get('adaptive_cooling_min_delay', DEFAULT_ADAPTIVE_COOLING_MIN_DELAY),
+                adaptive_cooling_max_delay=params.get('adaptive_cooling_max_delay', DEFAULT_ADAPTIVE_COOLING_MAX_DELAY),
                 smooth_ramp=params.get('smooth_ramp', False),
                 ramp_duration=params.get('ramp_duration') or 1.0,
             )

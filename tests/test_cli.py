@@ -4,6 +4,7 @@ import pytest
 
 from cli import build_parser, resolve_measure_params, make_csv_filename, validate_measure_params
 from config import ConfigManager
+from measurement import DEFAULT_ADAPTIVE_COOLING_MIN_DELAY, DEFAULT_ADAPTIVE_COOLING_MAX_DELAY
 
 
 # ----------------------------------------------------------------------
@@ -153,6 +154,47 @@ def test_custom_program_max_abs_used_for_relay_limit_not_literal_x_start_stop():
     # раз задана кастомная программа (её собственный максимум — всего 5 А).
     p = {'custom_program': '-5, 5', 'X_start': 999.0, 'X_stop': 999.0,
          'delay': 0.1, 'cooling_delay': 0.1, 'V_limit': 5.0}
+    errors = validate_measure_params(p, 'current', current_source_limits={})
+    assert errors == []
+
+
+# ----------------------------------------------------------------------
+# adaptive_cooling_min_delay/adaptive_cooling_max_delay (баг-репорт: явные
+# границы в секундах вместо базы × множитель)
+# ----------------------------------------------------------------------
+
+def test_adaptive_cooling_valid_bounds_pass_validation():
+    p = _good_current_params()
+    p['adaptive_cooling'] = True
+    p['adaptive_cooling_min_delay'] = 0.5
+    p['adaptive_cooling_max_delay'] = 2.5
+    errors = validate_measure_params(p, 'current', current_source_limits={})
+    assert errors == []
+
+
+def test_adaptive_cooling_min_greater_than_max_is_rejected():
+    p = _good_current_params()
+    p['adaptive_cooling'] = True
+    p['adaptive_cooling_min_delay'] = 3.0
+    p['adaptive_cooling_max_delay'] = 1.0
+    errors = validate_measure_params(p, 'current', current_source_limits={})
+    assert any('не может быть больше максимальной' in e for e in errors)
+
+
+def test_adaptive_cooling_negative_bounds_are_rejected():
+    p = _good_current_params()
+    p['adaptive_cooling'] = True
+    p['adaptive_cooling_min_delay'] = -1.0
+    p['adaptive_cooling_max_delay'] = 2.0
+    errors = validate_measure_params(p, 'current', current_source_limits={})
+    assert any('Минимальная задержка охлаждения' in e for e in errors)
+
+
+def test_adaptive_cooling_bounds_ignored_when_adaptive_cooling_off():
+    p = _good_current_params()
+    p['adaptive_cooling'] = False
+    p['adaptive_cooling_min_delay'] = 3.0
+    p['adaptive_cooling_max_delay'] = 1.0  # некорректно, но не должно проверяться
     errors = validate_measure_params(p, 'current', current_source_limits={})
     assert errors == []
 
@@ -479,6 +521,36 @@ def test_custom_program_defaults_to_none_when_not_given(tmp_path):
     mgr = ConfigManager(tmp_path / "cfg.json")
     params = resolve_measure_params(args, mgr)
     assert params['custom_program'] is None
+
+
+def test_adaptive_cooling_bounds_flow_into_params_from_cli(tmp_path):
+    parser = build_parser()
+    args = _measure_args(parser, [
+        "--excitation", "current",
+        "--start", "0", "--stop", "10", "--step", "1",
+        "--vlimit", "5", "--delay", "0.1", "--cool", "0.1",
+        "--label", "TestSensor", "--yes", "--adaptive-cooling",
+        "--adaptive-cooling-min-delay", "0.5", "--adaptive-cooling-max-delay", "3.0",
+    ])
+    mgr = ConfigManager(tmp_path / "cfg.json")
+    params = resolve_measure_params(args, mgr)
+    assert params['adaptive_cooling'] is True
+    assert params['adaptive_cooling_min_delay'] == 0.5
+    assert params['adaptive_cooling_max_delay'] == 3.0
+
+
+def test_adaptive_cooling_bounds_default_when_not_given(tmp_path):
+    parser = build_parser()
+    args = _measure_args(parser, [
+        "--excitation", "current",
+        "--start", "0", "--stop", "10", "--step", "1",
+        "--vlimit", "5", "--delay", "0.1", "--cool", "0.1",
+        "--label", "TestSensor", "--yes",
+    ])
+    mgr = ConfigManager(tmp_path / "cfg.json")
+    params = resolve_measure_params(args, mgr)
+    assert params['adaptive_cooling_min_delay'] == DEFAULT_ADAPTIVE_COOLING_MIN_DELAY
+    assert params['adaptive_cooling_max_delay'] == DEFAULT_ADAPTIVE_COOLING_MAX_DELAY
 
 
 def test_smooth_ramp_defaults_to_false(tmp_path):

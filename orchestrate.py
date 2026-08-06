@@ -24,7 +24,7 @@ from relay import RelayController, discover_relay_port
 from measurement import (
     run_measurement, EXCITATION_UNITS, OUTPUT_UNITS,
     DEFAULT_AVERAGING_COUNT, DEFAULT_AVERAGING_DELAY, DEFAULT_DISCARD_FIRST,
-    DEFAULT_ADAPTIVE_COOLING_MAX_MULTIPLIER,
+    DEFAULT_ADAPTIVE_COOLING_MIN_DELAY, DEFAULT_ADAPTIVE_COOLING_MAX_DELAY,
 )
 from sweep import Branch, DirectionPreset, plan_custom_sweep
 from safety import emergency_shutdown
@@ -223,11 +223,13 @@ def write_results_csv(csv_path: Path, df: pd.DataFrame, params: dict,
                     f"{params.get('ramp_duration') or 1.0} с (delay/cooling_delay не применялись)\n")
         else:
             f.write(f"# Задержка установки: {params['delay']} с\n")
-            f.write(f"# Задержка охлаждения: {params['cooling_delay']} с\n")
             if params.get('adaptive_cooling', False):
-                f.write(f"# Адаптивная задержка охлаждения (BETA, растёт с током до ×"
-                        f"{params.get('adaptive_cooling_max_multiplier', DEFAULT_ADAPTIVE_COOLING_MAX_MULTIPLIER):.1f} "
-                        f"на максимуме развёртки)\n")
+                min_delay = params.get('adaptive_cooling_min_delay', DEFAULT_ADAPTIVE_COOLING_MIN_DELAY)
+                max_delay = params.get('adaptive_cooling_max_delay', DEFAULT_ADAPTIVE_COOLING_MAX_DELAY)
+                f.write(f"# Адаптивная задержка охлаждения (BETA, растёт с током): "
+                        f"{min_delay} с на нуле … {max_delay} с на максимуме развёртки\n")
+            else:
+                f.write(f"# Задержка охлаждения: {params['cooling_delay']} с\n")
         f.write(f"# Время измерения: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
         f.write(f"# Всего точек: {len(df)}\n")
         f.write("#\n")
@@ -342,8 +344,11 @@ def run_measurement_session(
             averaging_delay=params.get('averaging_delay', DEFAULT_AVERAGING_DELAY),
             discard_first=params.get('discard_first', DEFAULT_DISCARD_FIRST),
             adaptive_cooling=params.get('adaptive_cooling', False),
-            adaptive_cooling_max_multiplier=params.get(
-                'adaptive_cooling_max_multiplier', DEFAULT_ADAPTIVE_COOLING_MAX_MULTIPLIER,
+            adaptive_cooling_min_delay=params.get(
+                'adaptive_cooling_min_delay', DEFAULT_ADAPTIVE_COOLING_MIN_DELAY,
+            ),
+            adaptive_cooling_max_delay=params.get(
+                'adaptive_cooling_max_delay', DEFAULT_ADAPTIVE_COOLING_MAX_DELAY,
             ),
             should_stop=should_stop,
             ratio=params.get('ratio'),

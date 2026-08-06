@@ -40,9 +40,11 @@ DEFAULT_DISCARD_FIRST = True
 # погрешности, прежде чем забраковать её окончательно.
 MAX_MEASUREMENT_ATTEMPTS = 3
 
-# п.27: во сколько раз задержка охлаждения на самой большой точке развёртки
-# может вырасти относительно заданной cooling_delay при adaptive_cooling=True.
-DEFAULT_ADAPTIVE_COOLING_MAX_MULTIPLIER = 5.0
+# п.27: границы адаптивной задержки охлаждения (BETA) — оператор задаёт их
+# сам явно (мин./макс. в секундах), а не как множитель от одной базовой
+# cooling_delay (было раньше, до баг-репорта об удобстве этого UI).
+DEFAULT_ADAPTIVE_COOLING_MIN_DELAY = 0.5
+DEFAULT_ADAPTIVE_COOLING_MAX_DELAY = 2.5
 
 # Между шагами плавного нарастания (feature, BETA) — не спамим источник частыми командами
 # (баг-репорт: "не надо слать тысячи команд"). Если на переход отведено
@@ -52,17 +54,20 @@ DEFAULT_ADAPTIVE_COOLING_MAX_MULTIPLIER = 5.0
 SMOOTH_RAMP_MIN_DURATION_FOR_STEPS_S = 2.0
 
 
-def _adaptive_cooling_delay(base_delay: float, magnitude: float, max_magnitude: float,
-                             max_multiplier: float = DEFAULT_ADAPTIVE_COOLING_MAX_MULTIPLIER) -> float:
+def _adaptive_cooling_delay(min_delay: float, max_delay: float, magnitude: float,
+                             max_magnitude: float) -> float:
     """
     Задержка охлаждения, растущая с током (п.27, BETA).
 
     Джоулево тепло ∝ I², поэтому масштаб — квадратичный: на самой большой
     по модулю точке развёртки (magnitude == max_magnitude) задержка
-    достигает base_delay * max_multiplier, на нулевой — остаётся
-    base_delay (никакой лишней задержки для мелких точек). Между ними —
-    квадратичная интерполяция, потолок задан явно (max_multiplier), чтобы
-    не мог случайно вырасти без ограничения.
+    достигает max_delay, на нулевой — остаётся min_delay (никакой лишней
+    задержки для мелких точек). Между ними — квадратичная интерполяция.
+
+    Границы (min_delay/max_delay) — то, что оператор явно вводит в UI/CLI
+    в секундах (баг-репорт: раньше это была одна базовая cooling_delay,
+    умноженная на коэффициент, — неудобно оценить итоговое время на глаз;
+    теперь обе границы видны и задаются напрямую).
 
     Алгоритм эмпирический, не подтверждён на реальном стенде — отсюда
     статус BETA (см. PLAN_V2.md п.27): включается отдельной галочкой,
@@ -70,9 +75,9 @@ def _adaptive_cooling_delay(base_delay: float, magnitude: float, max_magnitude: 
     поведением по умолчанию.
     """
     if max_magnitude <= 0:
-        return base_delay
+        return min_delay
     fraction = min(1.0, magnitude / max_magnitude) ** 2
-    return base_delay * (1.0 + fraction * (max_multiplier - 1.0))
+    return min_delay + fraction * (max_delay - min_delay)
 
 
 def _ease_in_out(p: float, k: float = 5.0) -> float:
@@ -251,7 +256,8 @@ def _measure_point_row(dmm: DMM, src: Union[CurrentSource, VoltageSource],
                         log_callback: Optional[Callable[[str], None]],
                         adaptive_cooling: bool = False,
                         max_magnitude: float = 0.0,
-                        adaptive_cooling_max_multiplier: float = DEFAULT_ADAPTIVE_COOLING_MAX_MULTIPLIER,
+                        adaptive_cooling_min_delay: float = DEFAULT_ADAPTIVE_COOLING_MIN_DELAY,
+                        adaptive_cooling_max_delay: float = DEFAULT_ADAPTIVE_COOLING_MAX_DELAY,
                         suppress_notifications: bool = False,
                         zero_offset: float = 0.0,
                         ) -> Tuple[Dict, Optional[str]]:
@@ -309,8 +315,8 @@ def _measure_point_row(dmm: DMM, src: Union[CurrentSource, VoltageSource],
 
         src.output_off()
         effective_cooling_delay = (
-            _adaptive_cooling_delay(cooling_delay, point.magnitude, max_magnitude,
-                                     adaptive_cooling_max_multiplier)
+            _adaptive_cooling_delay(adaptive_cooling_min_delay, adaptive_cooling_max_delay,
+                                     point.magnitude, max_magnitude)
             if adaptive_cooling else cooling_delay
         )
         time.sleep(effective_cooling_delay)
@@ -486,7 +492,8 @@ def run_measurement(dmm: DMM, src: Union[CurrentSource, VoltageSource], relay: O
                      averaging_delay: float = DEFAULT_AVERAGING_DELAY,
                      discard_first: bool = DEFAULT_DISCARD_FIRST,
                      adaptive_cooling: bool = False,
-                     adaptive_cooling_max_multiplier: float = DEFAULT_ADAPTIVE_COOLING_MAX_MULTIPLIER,
+                     adaptive_cooling_min_delay: float = DEFAULT_ADAPTIVE_COOLING_MIN_DELAY,
+                     adaptive_cooling_max_delay: float = DEFAULT_ADAPTIVE_COOLING_MAX_DELAY,
                      should_stop: Optional[Callable[[], bool]] = None,
                      ratio: Optional[float] = None,
                      stop_on_error: bool = False,
@@ -552,9 +559,13 @@ def run_measurement(dmm: DMM, src: Union[CurrentSource, VoltageSource], relay: O
 
     adaptive_cooling (п.27, BETA) — задержка охлаждения между точками
     растёт квадратично с током (джоулево тепло ∝ I²) вместо фиксированной
-    cooling_delay, с потолком adaptive_cooling_max_multiplier относительно
-    неё на самой большой точке развёртки. Алгоритм эмпирический, не
-    проверен на реальном стенде — выключен по умолчанию, включается явно.
+    cooling_delay: на нулевой точке — adaptive_cooling_min_delay, на самой
+    большой по модулю точке развёртки — adaptive_cooling_max_delay, между
+    ними квадратичная интерполяция (см. _adaptive_cooling_delay). Обе
+    границы оператор вводит сам в секундах (баг-репорт — раньше это была
+    одна база × множитель, границы явно не были видны). Алгоритм
+    эмпирический, не проверен на реальном стенде — выключен по умолчанию,
+    включается явно; в этом режиме cooling_delay сама не используется вовсе.
 
     excitation_type: 'current' — на источник тока подаётся уставка тока
                       (V_limit используется как ограничение по напряжению);
@@ -667,7 +678,8 @@ def run_measurement(dmm: DMM, src: Union[CurrentSource, VoltageSource], relay: O
                     ratio, turns, averaging, stop_on_error, error_threshold,
                     is_first_of_run=run_started_fresh, log_callback=log_callback,
                     adaptive_cooling=adaptive_cooling, max_magnitude=max_magnitude,
-                    adaptive_cooling_max_multiplier=adaptive_cooling_max_multiplier,
+                    adaptive_cooling_min_delay=adaptive_cooling_min_delay,
+                    adaptive_cooling_max_delay=adaptive_cooling_max_delay,
                     suppress_notifications=suppress_notifications,
                     zero_offset=zero_offset,
                 )
@@ -706,7 +718,8 @@ def estimate_duration_seconds(
     averaging_count: int = DEFAULT_AVERAGING_COUNT,
     averaging_delay: float = DEFAULT_AVERAGING_DELAY,
     adaptive_cooling: bool = False,
-    adaptive_cooling_max_multiplier: float = DEFAULT_ADAPTIVE_COOLING_MAX_MULTIPLIER,
+    adaptive_cooling_min_delay: float = DEFAULT_ADAPTIVE_COOLING_MIN_DELAY,
+    adaptive_cooling_max_delay: float = DEFAULT_ADAPTIVE_COOLING_MAX_DELAY,
     smooth_ramp: bool = False,
     ramp_duration: float = 1.0,
 ) -> float:
@@ -739,8 +752,8 @@ def estimate_duration_seconds(
             continue
         total += delay
         if adaptive_cooling:
-            total += _adaptive_cooling_delay(cooling_delay, point.magnitude, max_magnitude,
-                                             adaptive_cooling_max_multiplier)
+            total += _adaptive_cooling_delay(adaptive_cooling_min_delay, adaptive_cooling_max_delay,
+                                             point.magnitude, max_magnitude)
         else:
             total += cooling_delay
     return total

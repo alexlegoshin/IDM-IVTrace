@@ -15,7 +15,7 @@ from limits import (
 )
 from measurement import (
     DEFAULT_AVERAGING_COUNT, DEFAULT_AVERAGING_DELAY, DEFAULT_DISCARD_FIRST,
-    DEFAULT_ADAPTIVE_COOLING_MAX_MULTIPLIER,
+    DEFAULT_ADAPTIVE_COOLING_MIN_DELAY, DEFAULT_ADAPTIVE_COOLING_MAX_DELAY,
 )
 from sweep import Branch, DirectionPreset
 
@@ -256,10 +256,14 @@ def build_parser(default_data_dir: Path = Path("data")) -> argparse.ArgumentPars
              "(джоулево тепло ~ I^2). Алгоритм не проверен на реальном стенде.",
     )
     p_measure.add_argument(
-        "--adaptive-cooling-max-multiplier", type=float, default=None,
-        help="Потолок роста задержки охлаждения при --adaptive-cooling, "
-             f"во сколько раз от базовой на максимуме развёртки (по умолчанию "
-             f"{DEFAULT_ADAPTIVE_COOLING_MAX_MULTIPLIER:.0f})",
+        "--adaptive-cooling-min-delay", type=float, default=None,
+        help="Задержка охлаждения на нулевой точке при --adaptive-cooling, с "
+             f"(по умолчанию {DEFAULT_ADAPTIVE_COOLING_MIN_DELAY:.1f})",
+    )
+    p_measure.add_argument(
+        "--adaptive-cooling-max-delay", type=float, default=None,
+        help="Задержка охлаждения на самой большой точке развёртки при --adaptive-cooling, с "
+             f"(по умолчанию {DEFAULT_ADAPTIVE_COOLING_MAX_DELAY:.1f})",
     )
     p_measure.add_argument(
         "--save-config", type=str, default=None,
@@ -366,6 +370,17 @@ def validate_measure_params(params: dict, excitation_type: str,
         errors.append("Задержка на установку не может быть отрицательной.")
     if params.get('cooling_delay') is not None and params['cooling_delay'] < 0:
         errors.append("Задержка на охлаждение не может быть отрицательной.")
+    if params.get('adaptive_cooling'):
+        min_delay = params.get('adaptive_cooling_min_delay')
+        max_delay = params.get('adaptive_cooling_max_delay')
+        if min_delay is None or min_delay < 0:
+            errors.append("Минимальная задержка охлаждения не может быть отрицательной.")
+        if max_delay is None or max_delay < 0:
+            errors.append("Максимальная задержка охлаждения не может быть отрицательной.")
+        if min_delay is not None and max_delay is not None and min_delay > max_delay:
+            errors.append(
+                "Минимальная задержка охлаждения не может быть больше максимальной."
+            )
     if excitation_type == 'current' and (params.get('V_limit') is None or params['V_limit'] <= 0):
         errors.append("Ограничение напряжения должно быть положительным числом.")
     if excitation_type == 'voltage' and (params.get('I_limit') is None or params['I_limit'] <= 0):
@@ -538,9 +553,13 @@ def resolve_measure_params(args, config_mgr: ConfigManager, sensor_config_mgr=No
         'adaptive_cooling': args.adaptive_cooling or loaded.get('adaptive_cooling', False),
         'smooth_ramp': args.smooth_ramp or loaded.get('smooth_ramp', False),
         'ramp_duration': args.ramp_duration if args.ramp_duration is not None else loaded.get('ramp_duration', 1.0),
-        'adaptive_cooling_max_multiplier': (
-            args.adaptive_cooling_max_multiplier if args.adaptive_cooling_max_multiplier is not None
-            else loaded.get('adaptive_cooling_max_multiplier', DEFAULT_ADAPTIVE_COOLING_MAX_MULTIPLIER)
+        'adaptive_cooling_min_delay': (
+            args.adaptive_cooling_min_delay if args.adaptive_cooling_min_delay is not None
+            else loaded.get('adaptive_cooling_min_delay', DEFAULT_ADAPTIVE_COOLING_MIN_DELAY)
+        ),
+        'adaptive_cooling_max_delay': (
+            args.adaptive_cooling_max_delay if args.adaptive_cooling_max_delay is not None
+            else loaded.get('adaptive_cooling_max_delay', DEFAULT_ADAPTIVE_COOLING_MAX_DELAY)
         ),
     }
 

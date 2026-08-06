@@ -696,34 +696,32 @@ def test_output_type_does_not_change_which_dmm_method_is_called():
 # _adaptive_cooling_delay (п.27, BETA)
 # ----------------------------------------------------------------------
 
-def test_adaptive_cooling_at_zero_magnitude_is_the_base_delay():
-    assert _adaptive_cooling_delay(1.0, magnitude=0.0, max_magnitude=100.0) == pytest.approx(1.0)
+def test_adaptive_cooling_at_zero_magnitude_is_the_min_delay():
+    assert _adaptive_cooling_delay(1.0, 5.0, magnitude=0.0, max_magnitude=100.0) == pytest.approx(1.0)
 
 
-def test_adaptive_cooling_at_max_magnitude_reaches_the_cap():
-    assert _adaptive_cooling_delay(1.0, magnitude=100.0, max_magnitude=100.0,
-                                    max_multiplier=5.0) == pytest.approx(5.0)
+def test_adaptive_cooling_at_max_magnitude_reaches_the_max_delay():
+    assert _adaptive_cooling_delay(1.0, 5.0, magnitude=100.0, max_magnitude=100.0) == pytest.approx(5.0)
 
 
 def test_adaptive_cooling_scales_quadratically_not_linearly():
-    # На половине максимума задержка должна быть заметно ближе к базовой,
+    # На половине максимума задержка должна быть заметно ближе к минимальной,
     # чем при линейном масштабировании (джоулево тепло ∝ I²).
-    half = _adaptive_cooling_delay(1.0, magnitude=50.0, max_magnitude=100.0, max_multiplier=5.0)
+    half = _adaptive_cooling_delay(1.0, 5.0, magnitude=50.0, max_magnitude=100.0)
     linear_half = 1.0 + 0.5 * (5.0 - 1.0)  # было бы при линейном масштабе
     assert half < linear_half
     assert half == pytest.approx(1.0 + 0.25 * (5.0 - 1.0))
 
 
-def test_adaptive_cooling_never_exceeds_the_cap_beyond_max_magnitude():
+def test_adaptive_cooling_never_exceeds_the_max_delay_beyond_max_magnitude():
     # magnitude > max_magnitude в принципе не должно случаться (max_magnitude
     # берётся из самого плана), но функция не должна улетать выше потолка.
-    assert _adaptive_cooling_delay(1.0, magnitude=150.0, max_magnitude=100.0,
-                                    max_multiplier=5.0) == pytest.approx(5.0)
+    assert _adaptive_cooling_delay(1.0, 5.0, magnitude=150.0, max_magnitude=100.0) == pytest.approx(5.0)
 
 
-def test_adaptive_cooling_falls_back_to_base_when_sweep_has_no_magnitude():
+def test_adaptive_cooling_falls_back_to_min_when_sweep_has_no_magnitude():
     # Свип из одной только нулевой точки — max_magnitude=0, делить не на что.
-    assert _adaptive_cooling_delay(1.0, magnitude=0.0, max_magnitude=0.0) == pytest.approx(1.0)
+    assert _adaptive_cooling_delay(1.0, 5.0, magnitude=0.0, max_magnitude=0.0) == pytest.approx(1.0)
 
 
 def test_run_measurement_uses_flat_cooling_delay_by_default(monkeypatch):
@@ -748,13 +746,14 @@ def test_run_measurement_scales_cooling_delay_when_adaptive_enabled(monkeypatch)
     src = FakeSource()
     relay = FakeRelay()
     _run(
-        dmm, src, relay, X_start=0, X_stop=2, X_step=1, cooling_delay=1.0,
-        branch=Branch.POSITIVE, adaptive_cooling=True, adaptive_cooling_max_multiplier=5.0,
+        dmm, src, relay, X_start=0, X_stop=2, X_step=1,
+        branch=Branch.POSITIVE, adaptive_cooling=True,
+        adaptive_cooling_min_delay=1.0, adaptive_cooling_max_delay=5.0,
     )
 
-    # Точка X=2 — самая большая (max_magnitude=2) -> должна получить потолок 5.0.
+    # Точка X=2 — самая большая (max_magnitude=2) -> должна получить максимум 5.0.
     assert any(s == pytest.approx(5.0) for s in sleeps)
-    # Точка X=1 — половина максимума -> задержка меньше потолка, но больше базовой.
+    # Точка X=1 — половина максимума -> задержка меньше максимума, но больше минимума.
     assert any(1.0 < s < 5.0 for s in sleeps)
 
 
@@ -977,8 +976,9 @@ def test_estimate_duration_scales_with_adaptive_cooling():
                                      adaptive_cooling=False)
     adaptive = estimate_duration_seconds(plan, delay=0.0, cooling_delay=1.0,
                                          averaging_count=1, averaging_delay=0.0,
-                                         adaptive_cooling=True, adaptive_cooling_max_multiplier=5.0)
-    # Точка X=2 при адаптивном охлаждении получает cooling_delay*5, а не *1.
+                                         adaptive_cooling=True,
+                                         adaptive_cooling_min_delay=1.0, adaptive_cooling_max_delay=5.0)
+    # Точка X=2 при адаптивном охлаждении получает max_delay=5.0, а не cooling_delay=1.0.
     assert adaptive > flat
 
 
