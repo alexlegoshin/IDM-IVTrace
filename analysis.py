@@ -357,7 +357,7 @@ def estimate_ratio_from_data(df: pd.DataFrame, excitation_col: str = 'X_set') ->
         raise ValueError("Не удалось определить коэффициент: измеренный ток нулевой во всех точках.")
 
     X_actual = abs(1.0 / slope)
-    X_rounded = max(50.0, round(X_actual / 50.0) * 50.0)
+    X_rounded = max(25.0, round(X_actual / 25.0) * 25.0)
     discrepancy_percent = abs(X_rounded - X_actual) / X_actual * 100.0
 
     return {

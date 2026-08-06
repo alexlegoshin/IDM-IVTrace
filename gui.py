@@ -15,6 +15,7 @@ visa_backend, selftest), поэтому логика измерения полн
   - вкладка «График» строит и встраивает тот же график, что и CLI analyze.
 """
 import io
+import os
 import queue
 import sys
 import threading
@@ -28,7 +29,7 @@ from tkinter import font as tkfont
 import pandas as pd
 
 from apppaths import (
-    default_data_dir, sensor_config_dir, work_dir, set_work_dir,
+    default_data_dir, sensor_config_dir, work_dir, set_work_dir, cache_dir, config_dir, instruments_dir,
     multimeter_cfg_dir, voltmeter_cfg_dir, current_source_cfg_dir, voltage_source_cfg_dir,
 )
 from calibration import list_instrument_configs, update_calibration_date, check_calibration, CalibrationStatus
@@ -74,6 +75,44 @@ def _pick_font(root) -> str:
     return _FONT_FAMILY
 
 
+_wheel_dispatch_installed = False
+
+
+def _install_global_wheel_dispatch(any_widget):
+    """
+    Единственная на всё приложение привязка колеса мыши (bind_all), общая
+    для всех _ScrollableFrame. Раньше каждый экземпляр вешал/снимал
+    bind_all по своим <Enter>/<Leave> на canvas — но виджеты внутри body
+    (Entry, Combobox, Label...) в Tk являются отдельными дочерними окнами
+    поверх canvas, и курсор, попадая на них, генерирует Leave у canvas
+    (колесо переставало работать почти везде, кроме голых промежутков —
+    отсюда «колесико не всегда срабатывало»). Вместо слежения за границами
+    canvas разбираем событие по фактическому виджету под курсором и идём
+    вверх по .master, пока не найдём владельца — так работает независимо
+    от того, над каким конкретно дочерним виджетом сейчас курсор.
+    """
+    global _wheel_dispatch_installed
+    if _wheel_dispatch_installed:
+        return
+    _wheel_dispatch_installed = True
+    root = any_widget.winfo_toplevel()
+
+    def _dispatch(event):
+        try:
+            under = event.widget.winfo_containing(event.x_root, event.y_root)
+        except Exception:
+            under = event.widget
+        w = under
+        while w is not None:
+            owner = getattr(w, "_ivtrace_scroll_owner", None)
+            if owner is not None:
+                owner._on_mousewheel(event)
+                return
+            w = w.master if hasattr(w, "master") else None
+
+    root.bind_all("<MouseWheel>", _dispatch)
+
+
 class _ScrollableFrame(ttk.Frame):
     """
     Вертикальный скролл без лишней навороченности (п.33): Canvas + Frame
@@ -102,8 +141,10 @@ class _ScrollableFrame(ttk.Frame):
 
         self.body.bind("<Configure>", self._on_body_configure)
         self.canvas.bind("<Configure>", self._on_canvas_configure)
-        self.canvas.bind("<Enter>", lambda e: self._bind_wheel())
-        self.canvas.bind("<Leave>", lambda e: self._unbind_wheel())
+        # Владелец для глобального диспетчера колеса — виден с любого
+        # дочернего виджета через цепочку .master (см. _install_global_wheel_dispatch).
+        self.canvas._ivtrace_scroll_owner = self
+        _install_global_wheel_dispatch(self.canvas)
 
     def _on_body_configure(self, _event=None):
         self.canvas.configure(scrollregion=self.canvas.bbox("all"))
@@ -111,13 +152,13 @@ class _ScrollableFrame(ttk.Frame):
     def _on_canvas_configure(self, event):
         self.canvas.itemconfigure(self._window, width=event.width)
 
-    def _bind_wheel(self):
-        self.canvas.bind_all("<MouseWheel>", self._on_mousewheel)
-
-    def _unbind_wheel(self):
-        self.canvas.unbind_all("<MouseWheel>")
-
     def _on_mousewheel(self, event):
+        # Если весь контент и так помещается в видимую область — скроллить
+        # нечего; без этой проверки yview_scroll всё равно немного «дёргал»
+        # canvas на месте, хотя прокручивать было некуда (баг: «поле
+        # двигается, даже если на нём всё видно»).
+        if self.body.winfo_height() <= self.canvas.winfo_height():
+            return
         self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
 
 
@@ -363,6 +404,23 @@ class IVTraceGUI:
         footer_btns = ttk.Frame(footer)
         footer_btns.grid(row=0, column=1, sticky="e")
         ttk.Button(footer_btns, text="Рабочая папка…", command=self._open_work_dir_dialog).pack(side="left", padx=(0, 6))
+
+        # Баг-репорт: "чёрт ногу сломит" среди папок с конфигами — один
+        # выпадающий список вместо кучи отдельных кнопок (не перегружать UI).
+        open_folder_mb = ttk.Menubutton(footer_btns, text="Открыть папку ▾")
+        open_folder_menu = tk.Menu(open_folder_mb, tearoff=False)
+        open_folder_menu.add_command(label="Рабочая папка (CSV/графики)",
+                                     command=lambda: self._open_folder(work_dir()))
+        open_folder_menu.add_command(label="Кэш", command=lambda: self._open_folder(cache_dir()))
+        open_folder_menu.add_command(label="Профили датчиков",
+                                     command=lambda: self._open_folder(sensor_config_dir()))
+        open_folder_menu.add_command(label="Конфиги приборов (мультиметры/источники)",
+                                     command=lambda: self._open_folder(instruments_dir()))
+        open_folder_menu.add_command(label="Конфигурация приложения",
+                                     command=lambda: self._open_folder(config_dir()))
+        open_folder_mb.configure(menu=open_folder_menu)
+        open_folder_mb.pack(side="left", padx=(0, 6))
+
         ttk.Button(footer_btns, text="Даты поверки…", command=self._open_calibration_editor).pack(side="left", padx=(0, 6))
         ttk.Button(footer_btns, text="⚠ Баннер предупреждения", command=self._open_warning_banner).pack(side="left", padx=(0, 6))
         ttk.Button(footer_btns, text="Проверить снова", command=self._run_preflight).pack(side="left")
@@ -411,6 +469,7 @@ class IVTraceGUI:
         self._on_excitation_change()
         self._on_stop_on_error_change()
         self._on_branch_change()
+        self._on_preset_change()
         self._update_sweep_preview()
 
     # -- вкладка «Измерение»: что и как возбуждаем, диапазон, предпросмотр --
@@ -573,11 +632,19 @@ class IVTraceGUI:
         # когда снимается только одна полярность (п.33).
         self._preset_row = ttk.Frame(dir_box)
         self._preset_row.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(4, 0))
-        ttk.Label(self._preset_row, text="Схема прохода").pack(side="left")
-        preset_combo = ttk.Combobox(self._preset_row, textvariable=self.preset_var, state="readonly", width=10,
+        preset_line = ttk.Frame(self._preset_row)
+        preset_line.pack(side="top", fill="x")
+        ttk.Label(preset_line, text="Схема прохода").pack(side="left")
+        preset_combo = ttk.Combobox(preset_line, textvariable=self.preset_var, state="readonly", width=10,
                                     values=[p.value for p in DirectionPreset])
         preset_combo.pack(side="left", padx=(8, 0))
-        preset_combo.bind("<<ComboboxSelected>>", lambda e: self._update_sweep_preview())
+        preset_combo.bind("<<ComboboxSelected>>",
+                          lambda e: (self._on_preset_change(), self._update_sweep_preview()))
+        # Коротко, что значит выбранная схема — оператору не приходится
+        # держать в голове разницу diverging/converging/descending/full_cycle.
+        self.preset_desc_label = ttk.Label(self._preset_row, style="Muted.TLabel",
+                                           wraplength=300, justify="left")
+        self.preset_desc_label.pack(side="top", anchor="w", pady=(2, 0))
 
         avg_box = ttk.Labelframe(body, text="Усреднение", padding=10)
         avg_box.grid(row=2, column=0, sticky="ew", padx=10, pady=(0, 8))
@@ -872,6 +939,20 @@ class IVTraceGUI:
         else:
             self._preset_row.grid_remove()
 
+    _PRESET_DESCRIPTIONS = {
+        DirectionPreset.DIVERGING.value: "0 → +X, затем 0 → −X (по умолчанию)",
+        DirectionPreset.CONVERGING.value: "+X → 0 → −X, без остановки в нуле",
+        DirectionPreset.DESCENDING.value: "+X → 0 и −X → 0 — обе ветви идут к нулю",
+        DirectionPreset.FULL_CYCLE.value: "0 → +X → 0 → −X → 0 — петля гистерезиса",
+    }
+
+    def _on_preset_change(self):
+        """п.9 (баг-репорт): короткая наглядная расшифровка выбранной схемы прохода."""
+        if not hasattr(self, 'preset_desc_label'):
+            return
+        self.preset_desc_label.configure(
+            text=self._PRESET_DESCRIPTIONS.get(self.preset_var.get(), ""))
+
     def _set_branch_safe(self, raw):
         """
         Загруженный профиль датчика мог быть сохранён другой версией/руками
@@ -958,21 +1039,25 @@ class IVTraceGUI:
             visa = check_visa()
             self.events.put(("log", "[VISA] " + visa.summary_line() + "\n"))
             if not visa.ok:
-                self.events.put(("preflight", (False, "NI-VISA не найдена", visa.message)))
+                self.events.put(("preflight", (False, "NI-VISA не найдена", visa.message, None, None)))
                 return
 
             if self.skip_selftest_var.get():
-                self.events.put(("preflight", (True, visa.summary_line() + " · самотесты пропущены", visa.message)))
+                suffix = " · самотесты пропущены"
+                self.events.put(("preflight", (True, visa.summary_line() + suffix, visa.message,
+                                                visa.backend, suffix)))
                 return
 
             from selftest import run_selftests
             self.events.put(("log", "[Самотесты] запуск виртуальной проверки кода…\n"))
             st = run_selftests()
             self.events.put(("log", f"[Самотесты] {st.summary}\n"))
-            status = visa.summary_line() + (" · самотесты OK" if st.ok else " · САМОТЕСТЫ ПРОВАЛЕНЫ")
-            self.events.put(("preflight", (st.ok, status, st.output if not st.ok else visa.message)))
+            suffix = " · самотесты OK" if st.ok else " · САМОТЕСТЫ ПРОВАЛЕНЫ"
+            status = visa.summary_line() + suffix
+            self.events.put(("preflight", (st.ok, status, st.output if not st.ok else visa.message,
+                                            visa.backend if st.ok else None, suffix if st.ok else None)))
         except Exception as e:
-            self.events.put(("preflight", (False, "Ошибка проверки", str(e))))
+            self.events.put(("preflight", (False, "Ошибка проверки", str(e), None, None)))
 
     # -------------------------------------------------------------- discovery
     def _refresh_discovery_ui(self):
@@ -1004,6 +1089,15 @@ class IVTraceGUI:
             status = f"Найдено VISA-приборов: {len(state.instruments)}"
         status += "  ·  реле: " + (f"{state.relay_port}" if state.relay_port else "не найдено")
         self.discovery_status_label.configure(text=status)
+
+        # Живой счётчик "ресурсов видно" в статус-строке NI-VISA (баг-репорт:
+        # раньше строка застывала на значении со старта программы). Трогаем
+        # её только когда предполётная проверка прошла и сейчас не идёт
+        # измерение — иначе затёрли бы "Измерение завершено"/"Ошибка" и т.п.
+        if self._preflight_ok and getattr(self, '_visa_backend', None) and self.stop_btn.instate(['disabled']):
+            n = state.resource_count if state.resource_count is not None else "?"
+            live_status = f"NI-VISA: OK ({self._visa_backend}); ресурсов видно: {n}{self._visa_suffix}"
+            self._set_status(live_status, "ok")
 
     def _rescan_discovery_now(self):
         """Кнопка «Обновить список» — форсирует один скан вне очереди опроса."""
@@ -1208,6 +1302,15 @@ class IVTraceGUI:
         self._warning_banner = None
 
     # -------------------------------------------------------------- work dir
+    def _open_folder(self, path):
+        """Открывает папку в проводнике; создаёт её, если ещё не существует (см. меню «Открыть папку»)."""
+        path = Path(path)
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+            os.startfile(str(path))
+        except Exception as e:
+            messagebox.showerror("Не удалось открыть папку", f"{path}\n\n{e}")
+
     def _open_work_dir_dialog(self):
         """п.23: рабочая папка настраивается из UI, персистентно (apppaths.work_dir)."""
         from tkinter import filedialog
@@ -1428,6 +1531,7 @@ class IVTraceGUI:
         self._on_excitation_change()
         self._on_stop_on_error_change()
         self._on_branch_change()
+        self._on_preset_change()
         self._update_sweep_preview()
         self._append_log(f"Конфиг датчика загружен: {name}\n")
         messagebox.showinfo("Успех", f"Конфиг '{name}' загружен.")
@@ -1792,7 +1896,7 @@ class IVTraceGUI:
         messagebox.showinfo(
             "Коэффициент преобразования (BETA)",
             f"Фактический: 1:{result['X_actual']:.2f}\n"
-            f"Округлённый (кратно 50): 1:{result['X_rounded']:.0f}\n"
+            f"Округлённый (кратно 25): 1:{result['X_rounded']:.0f}\n"
             f"Расхождение: {result['discrepancy_percent']:.2f}%",
         )
 
@@ -2026,8 +2130,10 @@ class IVTraceGUI:
                 if kind == "log":
                     self._append_log(payload)
                 elif kind == "preflight":
-                    ok, status, detail = payload
+                    ok, status, detail, visa_backend, visa_suffix = payload
                     self._preflight_ok = ok
+                    self._visa_backend = visa_backend
+                    self._visa_suffix = visa_suffix
                     self._set_status(status, "ok" if ok else "error")
                     self.footer_label.configure(
                         text=("Готово к измерению." if ok

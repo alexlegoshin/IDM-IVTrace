@@ -341,15 +341,15 @@ def test_estimate_ratio_from_data_recovers_known_ratio():
     assert result['discrepancy_percent'] == pytest.approx(0.0, abs=1e-6)
 
 
-def test_estimate_ratio_from_data_rounds_to_nearest_multiple_of_50():
-    # I_meas = X_set / 1523 -> фактический коэффициент не кратен 50.
+def test_estimate_ratio_from_data_rounds_to_nearest_multiple_of_25():
+    # I_meas = X_set / 1523 -> фактический коэффициент не кратен 25.
     df = pd.DataFrame({
         'X_set': [0.0, 1000.0],
         'I_meas_A': [0.0, 1000.0 / 1523.0],
     })
     result = estimate_ratio_from_data(df)
     assert result['X_actual'] == pytest.approx(1523.0, rel=1e-3)
-    assert result['X_rounded'] == 1500.0
+    assert result['X_rounded'] == 1525.0
     assert result['discrepancy_percent'] > 0
 
 

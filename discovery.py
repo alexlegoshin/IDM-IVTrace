@@ -57,6 +57,12 @@ class DiscoveryState:
     relay_port: Optional[str] = None
     scanning: bool = False
     last_scan_error: Optional[str] = None
+    # Сырое число VISA-ресурсов, увиденных на последнем скане (в отличие от
+    # instruments — те, что откликнулись на *IDN? и опознались по конфигу).
+    # Нужно, чтобы строка статуса NI-VISA в GUI ("ресурсов видно: N") жила,
+    # а не застывала на значении со старта программы (баг-репорт: "ресурсов
+    # видно: 0", хотя приборы подключены).
+    resource_count: Optional[int] = None
 
     def by_kind(self, kind: str) -> List[DiscoveredInstrument]:
         return [i for i in self.instruments if i.kind == kind]
@@ -194,6 +200,10 @@ class DiscoveryService:
             return
 
         try:
+            try:
+                resource_count = len(rm.list_resources())
+            except Exception:
+                resource_count = None
             instruments = scan_instruments(rm, self._config_dirs)
         finally:
             try:
@@ -202,7 +212,8 @@ class DiscoveryService:
                 pass
 
         relay_port = self._scan_relay()
-        self._publish(DiscoveryState(instruments=instruments, relay_port=relay_port, scanning=False))
+        self._publish(DiscoveryState(instruments=instruments, relay_port=relay_port, scanning=False,
+                                      resource_count=resource_count))
 
     def _scan_relay(self) -> Optional[str]:
         candidates = self._port_lister()
