@@ -7,6 +7,7 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:  # ручной запуск — диагностика/повторная сборка без нового тега
 
 permissions:
   contents: write  # нужно softprops/action-gh-release, чтобы создать релиз и приложить архив
