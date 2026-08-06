@@ -12,7 +12,8 @@ visa_backend, selftest), поэтому логика измерения полн
     защита оборудования от запуска на сломанном коде/без VISA;
   - измерение идёт в отдельном потоке, весь вывод ядра (print) перехватывается
     в журнал; кнопка «Стоп» кооперативно прерывает проход между точками;
-  - вкладка «График» строит и встраивает тот же график, что и CLI analyze.
+  - вкладка «Данные» строит тот же график, что и CLI analyze; сам холст
+    отображается на отдельной вкладке «График» (переключение автоматическое).
 """
 import io
 import os
@@ -31,7 +32,7 @@ import pandas as pd
 from apppaths import (
     default_data_dir, sensor_config_dir, work_dir, set_work_dir, cache_dir, config_dir,
     multimeter_cfg_dir, voltmeter_cfg_dir, current_source_cfg_dir, voltage_source_cfg_dir,
-    clear_results_cache,
+    clear_results_cache, assets_dir,
 )
 from calibration import known_models, list_calibration_rows, set_calibration_record, delete_calibration_record
 from config import ConfigManager, SensorConfigManager
@@ -313,9 +314,33 @@ class IVTraceGUI:
         from visa_backend import make_resource_manager
         return make_resource_manager()
 
+    def _load_window_icon(self):
+        """
+        Иконка окна/панели задач — квадратный значок без мелкого текста
+        (читается и совсем маленьким, в отличие от лого с надписью TRACE в
+        заголовке, см. _build_ui). Отдаём ПОЛНЫЙ спуск размеров, какие есть
+        (16 → 256) — ОС (Dock на macOS, панель задач/Alt-Tab на Windows)
+        сама берёт подходящий, вместо того чтобы растягивать маленький
+        источник и размывать (баг-репорт: иконка в Dock была смазанной,
+        потому что на iconphoto отдавались только 16–64). Ссылки на
+        PhotoImage держим на self — иначе Tk соберёт их мусором и иконка
+        исчезнет.
+        """
+        self._icon_images = []
+        for size in (16, 32, 48, 64, 128, 256, 512):
+            path = assets_dir() / f"icon_{size}.png"
+            if path.exists():
+                self._icon_images.append(tk.PhotoImage(file=str(path)))
+        if self._icon_images:
+            try:
+                self.root.iconphoto(True, *self._icon_images)
+            except tk.TclError:
+                pass
+
     # ------------------------------------------------------------------ style
     def _build_style(self):
         self.root.title("IVTrace")
+        self._load_window_icon()
         self.root.geometry("1180x760")
         # Табличная раскладка + скролл внутри вкладок (см. _ScrollableFrame)
         # держит панель управляемой даже на небольшом экране — минимальный
@@ -380,7 +405,19 @@ class IVTraceGUI:
         header = ttk.Frame(self.root, padding=(18, 14, 18, 6))
         header.grid(row=0, column=0, sticky="ew")
         header.columnconfigure(0, weight=1)
-        ttk.Label(header, text="IVTrace", style="Title.TLabel").grid(row=0, column=0, sticky="w")
+
+        # Логотип вместо текстовой надписи "IVTrace" — картинка заранее
+        # отрисована под нужный размер (56 px высотой: достаточно, чтобы
+        # надпись TRACE внутри неё оставалась читаемой, но не крупнее
+        # заголовка), поэтому грузим напрямую tk.PhotoImage без Pillow как
+        # runtime-зависимости. Ссылку держим на self — иначе Tk соберёт
+        # картинку мусором и заголовок останется пустым.
+        logo_path = assets_dir() / "logo_header.png"
+        if logo_path.exists():
+            self._header_logo_img = tk.PhotoImage(file=str(logo_path))
+            ttk.Label(header, image=self._header_logo_img).grid(row=0, column=0, sticky="w")
+        else:
+            ttk.Label(header, text="IVTrace", style="Title.TLabel").grid(row=0, column=0, sticky="w")
         ttk.Label(header, text="Амплитудная характеристика датчиков тока/напряжения",
                   style="Sub.TLabel").grid(row=1, column=0, sticky="w")
 
@@ -443,8 +480,8 @@ class IVTraceGUI:
 
     def _build_params(self, parent):
         """
-        п.33: левая панель разложена по вкладкам (Измерение/Датчик/Приборы/
-        Дополнительно), каждая — со своим скроллом (_ScrollableFrame), чтобы
+        п.33: левая панель разложена по вкладкам (Датчик/Уставка/Приборы/
+        Реле), каждая — со своим скроллом (_ScrollableFrame), чтобы
         не обрезаться снизу на небольших экранах. Старт/Стоп/отсчёт и
         галочки безопасности вынесены НАД вкладками — они нужны постоянно,
         прятать их за переключением вкладки было бы неудобно.
@@ -456,10 +493,10 @@ class IVTraceGUI:
 
         tabs = ttk.Notebook(left)
         tabs.grid(row=0, column=0, sticky="nsew")
-        tabs.add(self._build_tab_measure(tabs), text="Измерение")
         tabs.add(self._build_tab_sensor(tabs), text="Датчик")
+        tabs.add(self._build_tab_setpoint(tabs), text="Уставка")
         tabs.add(self._build_tab_instruments(tabs), text="Приборы")
-        tabs.add(self._build_tab_advanced(tabs), text="Дополнительно")
+        tabs.add(self._build_tab_relay(tabs), text="Реле")
 
         bottom = ttk.Frame(left, padding=(2, 10, 2, 0))
         bottom.grid(row=1, column=0, sticky="ew")
@@ -490,36 +527,14 @@ class IVTraceGUI:
         self._on_preset_change()
         self._update_sweep_preview()
 
-    # -- вкладка «Измерение»: что и как возбуждаем, диапазон, предпросмотр --
-    def _build_tab_measure(self, parent):
+    # -- вкладка «Уставка»: параметры развёртки, отсечка, усреднение, предпросмотр --
+    def _build_tab_setpoint(self, parent):
         scroll = _ScrollableFrame(parent)
         body = scroll.body
         body.columnconfigure(0, weight=1)
 
-        exc = ttk.Labelframe(body, text="Тип возбуждения", padding=10)
-        exc.grid(row=0, column=0, sticky="ew", padx=10, pady=(10, 8))
-        ttk.Radiobutton(exc, text="Ток (источник тока)", value="current",
-                        variable=self.excitation_var, command=self._on_excitation_change).grid(row=0, column=0, sticky="w")
-        ttk.Radiobutton(exc, text="Напряжение (источник напряжения) — BETA", value="voltage",
-                        variable=self.excitation_var, command=self._on_excitation_change).grid(row=1, column=0, sticky="w")
-
-        # --- output type (ось А-1, независимая от возбуждения: чем датчик
-        # возбуждают — не то же самое, что и то, что он выдаёт на выходе;
-        # действительны любые сочетания — ток/ток, ток/напряжение,
-        # напряжение/ток, напряжение/напряжение) ---
-        ttk.Separator(exc, orient="horizontal").grid(row=2, column=0, sticky="ew", pady=(8, 6))
-        out_row = ttk.Frame(exc)
-        out_row.grid(row=3, column=0, sticky="w")
-        ttk.Label(out_row, text="Выход датчика:").pack(side="left", padx=(0, 6))
-        ttk.Combobox(
-            out_row, textvariable=self.output_var, state="readonly", width=10,
-            values=["current", "voltage"],
-        ).pack(side="left")
-        ttk.Label(exc, text="выход «напряжение» — BETA, не проверено на реальном стенде",
-                  style="Muted.TLabel").grid(row=4, column=0, sticky="w", pady=(4, 0))
-
         pf = ttk.Labelframe(body, text="Параметры развёртки", padding=10)
-        pf.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 8))
+        pf.grid(row=0, column=0, sticky="ew", padx=10, pady=(10, 8))
         pf.columnconfigure(1, weight=1)
 
         # Свой сценарий (feature "планировщик кастомных программ", BETA) —
@@ -594,17 +609,27 @@ class IVTraceGUI:
         self._delay_cool_frame.columnconfigure(1, weight=1)
         self.e_delay, self.u_delay = self._param_row(self._delay_cool_frame, 0, "Задержка установки", unit="с")
 
-        # Адаптивное охлаждение (BETA, галочка на вкладке «Дополнительно»,
-        # см. _cool_box) заменяет одну "Задержка охлаждения" двумя явными
-        # границами — оператор сам видит и задаёт мин./макс. в секундах,
-        # а не множитель от неизвестной итоговой величины (баг-репорт).
+        # Адаптивное охлаждение (BETA) — стоит перед самим полем задержки
+        # охлаждения (что фиксированной, что мин./макс.), чтобы сразу было
+        # видно, что именно переключает эта галочка. Заменяет одну
+        # "Задержка охлаждения" двумя явными границами — оператор сам видит
+        # и задаёт мин./макс. в секундах, а не множитель от неизвестной
+        # итоговой величины (баг-репорт).
+        self._adaptive_cooling_row = ttk.Frame(self._delay_cool_frame)
+        self._adaptive_cooling_row.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(4, 0))
+        ttk.Checkbutton(self._adaptive_cooling_row, text="Адаптивное охлаждение (BETA, растёт с током)",
+                        variable=self.adaptive_cooling_var,
+                        command=self._on_adaptive_cooling_change).pack(anchor="w")
+        ttk.Label(self._adaptive_cooling_row, text="не проверено на реальном стенде",
+                  style="Muted.TLabel").pack(anchor="w")
+
         self._cooling_fixed_frame = ttk.Frame(self._delay_cool_frame)
-        self._cooling_fixed_frame.grid(row=1, column=0, columnspan=3, sticky="ew")
+        self._cooling_fixed_frame.grid(row=2, column=0, columnspan=3, sticky="ew")
         self._cooling_fixed_frame.columnconfigure(1, weight=1)
         self.e_cool, self.u_cool = self._param_row(self._cooling_fixed_frame, 0, "Задержка охлаждения", unit="с")
 
         self._cooling_adaptive_frame = ttk.Frame(self._delay_cool_frame)
-        self._cooling_adaptive_frame.grid(row=1, column=0, columnspan=3, sticky="ew")
+        self._cooling_adaptive_frame.grid(row=2, column=0, columnspan=3, sticky="ew")
         self._cooling_adaptive_frame.columnconfigure(1, weight=1)
         self.e_cool_min, self.u_cool_min = self._param_row(
             self._cooling_adaptive_frame, 0, "Мин. задержка охлаждения", unit="с")
@@ -623,25 +648,75 @@ class IVTraceGUI:
         self.e_label = ttk.Entry(pf)
         self.e_label.grid(row=5, column=1, columnspan=2, sticky="ew", pady=(6, 0))
 
+        # Отсечка по погрешности — отдельным пунктом, не перемешивая с
+        # параметрами самой развёртки (баг-репорт).
+        err_box = ttk.Labelframe(body, text="Отсечка по погрешности", padding=10)
+        err_box.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 8))
+        ttk.Checkbutton(err_box, text="Остановить при превышении погрешности",
+                        variable=self.stop_on_error_var,
+                        command=self._on_stop_on_error_change).grid(row=0, column=0, sticky="w")
+        # Порог показывается только когда отсечка реально включена (п.33).
+        self._error_threshold_row = ttk.Frame(err_box)
+        self._error_threshold_row.grid(row=1, column=0, sticky="ew", pady=(4, 0))
+        ttk.Label(self._error_threshold_row, text="Порог погрешности, %").pack(side="left")
+        self.e_error_threshold = ttk.Entry(self._error_threshold_row, width=10)
+        self.e_error_threshold.pack(side="left", padx=(8, 0))
+        self.e_error_threshold.insert(0, "1.0")
+
+        avg_box = ttk.Labelframe(body, text="Усреднение", padding=10)
+        avg_box.grid(row=2, column=0, sticky="ew", padx=10, pady=(0, 8))
+        ttk.Label(avg_box, text="Отсчётов на усреднение").grid(row=0, column=0, sticky="w", pady=3)
+        self.e_avg_count = ttk.Entry(avg_box, width=6)
+        self.e_avg_count.grid(row=0, column=1, sticky="w", pady=3, padx=(8, 0))
+        self.e_avg_count.insert(0, str(DEFAULT_AVERAGING_COUNT))
+        ttk.Label(avg_box, text="Задержка между ними, с").grid(row=1, column=0, sticky="w", pady=3)
+        self.e_avg_delay = ttk.Entry(avg_box, width=6)
+        self.e_avg_delay.grid(row=1, column=1, sticky="w", pady=3, padx=(8, 0))
+        self.e_avg_delay.insert(0, str(DEFAULT_AVERAGING_DELAY))
+        ttk.Checkbutton(avg_box, text="Отбрасывать первый отсчёт",
+                        variable=self.discard_first_var).grid(row=2, column=0, columnspan=2, sticky="w", pady=(4, 0))
+
         # --- предпросмотр развёртки: что реально получится при текущих
         # значениях (не то, что напечатано, а то, что посчитает планировщик,
         # см. _update_sweep_preview) ---
         preview = ttk.Labelframe(body, text="Предпросмотр развёртки", padding=10)
-        preview.grid(row=2, column=0, sticky="ew", padx=10, pady=(0, 10))
+        preview.grid(row=3, column=0, sticky="ew", padx=10, pady=(0, 10))
         self.sweep_preview_label = ttk.Label(preview, text="—", style="Muted.TLabel",
                                              wraplength=300, justify="left")
         self.sweep_preview_label.pack(anchor="w", fill="x")
 
         return scroll
 
-    # -- вкладка «Датчик»: метаданные + профиль (п.39-UI) --
+    # -- вкладка «Датчик»: тип возбуждения + метаданные + профиль (п.39-UI) --
     def _build_tab_sensor(self, parent):
         scroll = _ScrollableFrame(parent)
         body = scroll.body
         body.columnconfigure(0, weight=1)
 
+        exc = ttk.Labelframe(body, text="Тип возбуждения", padding=10)
+        exc.grid(row=0, column=0, sticky="ew", padx=10, pady=(10, 8))
+        ttk.Radiobutton(exc, text="Ток (источник тока)", value="current",
+                        variable=self.excitation_var, command=self._on_excitation_change).grid(row=0, column=0, sticky="w")
+        ttk.Radiobutton(exc, text="Напряжение (источник напряжения) — BETA", value="voltage",
+                        variable=self.excitation_var, command=self._on_excitation_change).grid(row=1, column=0, sticky="w")
+
+        # --- output type (ось А-1, независимая от возбуждения: чем датчик
+        # возбуждают — не то же самое, что и то, что он выдаёт на выходе;
+        # действительны любые сочетания — ток/ток, ток/напряжение,
+        # напряжение/ток, напряжение/напряжение) ---
+        ttk.Separator(exc, orient="horizontal").grid(row=2, column=0, sticky="ew", pady=(8, 6))
+        out_row = ttk.Frame(exc)
+        out_row.grid(row=3, column=0, sticky="w")
+        ttk.Label(out_row, text="Выход датчика:").pack(side="left", padx=(0, 6))
+        ttk.Combobox(
+            out_row, textvariable=self.output_var, state="readonly", width=10,
+            values=["current", "voltage"],
+        ).pack(side="left")
+        ttk.Label(exc, text="выход «напряжение» — BETA, не проверено на реальном стенде",
+                  style="Muted.TLabel").grid(row=4, column=0, sticky="w", pady=(4, 0))
+
         meta = ttk.Labelframe(body, text="Метаданные датчика", padding=10)
-        meta.grid(row=0, column=0, sticky="ew", padx=10, pady=(10, 8))
+        meta.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 8))
         meta.columnconfigure(1, weight=1)
         ttk.Label(meta, text="I ном., А").grid(row=0, column=0, sticky="w", pady=3)
         self.e_inom = ttk.Entry(meta, width=14)
@@ -669,7 +744,7 @@ class IVTraceGUI:
         self.e_turns.insert(0, "1")
 
         cfg = ttk.Labelframe(body, text="Профиль датчика", padding=10)
-        cfg.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 10))
+        cfg.grid(row=2, column=0, sticky="ew", padx=10, pady=(0, 10))
         cfg.columnconfigure(1, weight=1)
         ttk.Label(cfg, text="Имя").grid(row=0, column=0, sticky="w", pady=3)
         self.e_config_name = ttk.Combobox(cfg, state="normal")
@@ -696,33 +771,25 @@ class IVTraceGUI:
         self._blink_btn_dmm.configure(command=lambda: self._do_blink('dmm'))
         self.e_src, self._blink_btn_src = self._combo_addr_row(adv, 1, "Источник VISA")
         self._blink_btn_src.configure(command=lambda: self._do_blink('src'))
-        self.e_relay = self._addr_row(adv, 2, "Порт реле (COMx)")
 
-        self.discovery_status_label = ttk.Label(adv, style="Muted.TLabel", text="Поиск приборов…")
-        self.discovery_status_label.grid(row=3, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        self.discovery_status_label = ttk.Label(adv, style="Muted.TLabel", text="Поиск приборов…",
+                                                 wraplength=320, justify="left")
+        self.discovery_status_label.grid(row=2, column=0, columnspan=3, sticky="w", pady=(6, 0))
         ttk.Button(adv, text="Обновить список", command=self._rescan_discovery_now).grid(
-            row=4, column=0, columnspan=3, sticky="w", pady=(4, 0))
+            row=3, column=0, columnspan=3, sticky="w", pady=(4, 0))
 
         return scroll
 
-    # -- вкладка «Дополнительно»: отсечка/направление/усреднение/охлаждение --
-    def _build_tab_advanced(self, parent):
+    # -- вкладка «Реле»: порт платы + направление развёртки --
+    def _build_tab_relay(self, parent):
         scroll = _ScrollableFrame(parent)
         body = scroll.body
         body.columnconfigure(0, weight=1)
 
-        err_box = ttk.Labelframe(body, text="Отсечка по погрешности", padding=10)
-        err_box.grid(row=0, column=0, sticky="ew", padx=10, pady=(10, 8))
-        ttk.Checkbutton(err_box, text="Остановить при превышении погрешности",
-                        variable=self.stop_on_error_var,
-                        command=self._on_stop_on_error_change).grid(row=0, column=0, sticky="w")
-        # Порог показывается только когда отсечка реально включена (п.33).
-        self._error_threshold_row = ttk.Frame(err_box)
-        self._error_threshold_row.grid(row=1, column=0, sticky="ew", pady=(4, 0))
-        ttk.Label(self._error_threshold_row, text="Порог погрешности, %").pack(side="left")
-        self.e_error_threshold = ttk.Entry(self._error_threshold_row, width=10)
-        self.e_error_threshold.pack(side="left", padx=(8, 0))
-        self.e_error_threshold.insert(0, "1.0")
+        port_box = ttk.Labelframe(body, text="Плата реле", padding=10)
+        port_box.grid(row=0, column=0, sticky="ew", padx=10, pady=(10, 8))
+        port_box.columnconfigure(1, weight=1)
+        self.e_relay = self._addr_row(port_box, 0, "Порт реле (COMx)")
 
         self._dir_box = ttk.Labelframe(body, text="Направление развёртки", padding=10)
         self._dir_box.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 8))
@@ -751,27 +818,6 @@ class IVTraceGUI:
                                            wraplength=300, justify="left")
         self.preset_desc_label.pack(side="top", anchor="w", pady=(2, 0))
 
-        avg_box = ttk.Labelframe(body, text="Усреднение", padding=10)
-        avg_box.grid(row=2, column=0, sticky="ew", padx=10, pady=(0, 8))
-        ttk.Label(avg_box, text="Отсчётов на усреднение").grid(row=0, column=0, sticky="w", pady=3)
-        self.e_avg_count = ttk.Entry(avg_box, width=6)
-        self.e_avg_count.grid(row=0, column=1, sticky="w", pady=3, padx=(8, 0))
-        self.e_avg_count.insert(0, str(DEFAULT_AVERAGING_COUNT))
-        ttk.Label(avg_box, text="Задержка между ними, с").grid(row=1, column=0, sticky="w", pady=3)
-        self.e_avg_delay = ttk.Entry(avg_box, width=6)
-        self.e_avg_delay.grid(row=1, column=1, sticky="w", pady=3, padx=(8, 0))
-        self.e_avg_delay.insert(0, str(DEFAULT_AVERAGING_DELAY))
-        ttk.Checkbutton(avg_box, text="Отбрасывать первый отсчёт",
-                        variable=self.discard_first_var).grid(row=2, column=0, columnspan=2, sticky="w", pady=(4, 0))
-
-        self._cool_box = ttk.Labelframe(body, text="Охлаждение", padding=10)
-        self._cool_box.grid(row=3, column=0, sticky="ew", padx=10, pady=(0, 10))
-        ttk.Checkbutton(self._cool_box, text="Адаптивное охлаждение (BETA, растёт с током)",
-                        variable=self.adaptive_cooling_var,
-                        command=self._on_adaptive_cooling_change).grid(row=0, column=0, sticky="w")
-        ttk.Label(self._cool_box, text="не проверено на реальном стенде",
-                  style="Muted.TLabel").grid(row=1, column=0, sticky="w")
-
         return scroll
 
     def _param_row(self, parent, row, label, unit=""):
@@ -795,12 +841,12 @@ class IVTraceGUI:
         остаётся редактируемым (state="normal", не "readonly"): скан мог
         ещё не найти нужный прибор, и поручать оператору набрать адрес
         руками в этом случае — не регресс, а разумный запасной путь.
-        Рядом — кнопка «Мигнуть» (п.11).
+        Рядом — кнопка «blink» (BETA, п.11).
         """
         ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", pady=3)
         combo = ttk.Combobox(parent, state="normal")
         combo.grid(row=row, column=1, sticky="ew", pady=3, padx=(8, 6))
-        blink_btn = ttk.Button(parent, text="Мигнуть", width=9)
+        blink_btn = ttk.Button(parent, text="blink (BETA)", width=13)
         blink_btn.grid(row=row, column=2, pady=3)
         return combo, blink_btn
 
@@ -838,9 +884,12 @@ class IVTraceGUI:
 
         # --- plot tab ---
         plot_tab = ttk.Frame(nb, padding=8)
-        nb.add(plot_tab, text="  График  ")
-        plot_tab.rowconfigure(5, weight=1)
+        nb.add(plot_tab, text="  Данные  ")
         plot_tab.columnconfigure(0, weight=1)
+        # Таблица точек — единственный блок здесь, которому есть смысл
+        # расти: свободного места снизу стало много после переноса самого
+        # графика на отдельную вкладку (баг-репорт), пусть забирает его.
+        plot_tab.rowconfigure(3, weight=1)
 
         # -- файл (п.20: график из произвольного CSV, по умолчанию последний) --
         file_bar = ttk.Frame(plot_tab)
@@ -870,31 +919,37 @@ class IVTraceGUI:
 
         ttk.Checkbutton(disp, text="Авто-диапазон осей", variable=self.auto_range_var,
                         command=self._on_auto_range_change).grid(row=1, column=0, columnspan=6, sticky="w", pady=(4, 0))
-        ttk.Label(disp, text="X мин/макс").grid(row=2, column=0, sticky="w", pady=(4, 0))
-        self.e_xmin = ttk.Entry(disp, width=8); self.e_xmin.grid(row=2, column=1, padx=(4, 4))
-        self.e_xmax = ttk.Entry(disp, width=8); self.e_xmax.grid(row=2, column=2, padx=(0, 14))
-        ttk.Label(disp, text="Y выход мин/макс").grid(row=2, column=3, sticky="w")
-        self.e_y1min = ttk.Entry(disp, width=8); self.e_y1min.grid(row=2, column=4, padx=(4, 4))
-        self.e_y1max = ttk.Entry(disp, width=8); self.e_y1max.grid(row=2, column=5, padx=(0, 14))
-        ttk.Label(disp, text="Y погр.,% мин/макс").grid(row=3, column=0, sticky="w", pady=(4, 0))
-        self.e_y2min = ttk.Entry(disp, width=8); self.e_y2min.grid(row=3, column=1, padx=(4, 4), pady=(4, 0))
-        self.e_y2max = ttk.Entry(disp, width=8); self.e_y2max.grid(row=3, column=2, padx=(0, 14), pady=(4, 0))
-        self._range_entries = (self.e_xmin, self.e_xmax, self.e_y1min, self.e_y1max, self.e_y2min, self.e_y2max)
+
+        # Поля диапазонов нефункциональны при включённом авто-диапазоне —
+        # прячем их целиком (не просто блокируем), чтобы не вводить в
+        # заблуждение видом рабочих на самом деле полей (баг-репорт, п.33).
+        self._range_fields_row = ttk.Frame(disp)
+        self._range_fields_row.grid(row=2, column=0, columnspan=6, sticky="ew")
+        ttk.Label(self._range_fields_row, text="X мин/макс").grid(row=0, column=0, sticky="w", pady=(4, 0))
+        self.e_xmin = ttk.Entry(self._range_fields_row, width=8); self.e_xmin.grid(row=0, column=1, padx=(4, 4))
+        self.e_xmax = ttk.Entry(self._range_fields_row, width=8); self.e_xmax.grid(row=0, column=2, padx=(0, 14))
+        ttk.Label(self._range_fields_row, text="Y выход мин/макс").grid(row=0, column=3, sticky="w")
+        self.e_y1min = ttk.Entry(self._range_fields_row, width=8); self.e_y1min.grid(row=0, column=4, padx=(4, 4))
+        self.e_y1max = ttk.Entry(self._range_fields_row, width=8); self.e_y1max.grid(row=0, column=5, padx=(0, 14))
+        ttk.Label(self._range_fields_row, text="Y погр.,% мин/макс").grid(row=1, column=0, sticky="w", pady=(4, 0))
+        self.e_y2min = ttk.Entry(self._range_fields_row, width=8); self.e_y2min.grid(row=1, column=1, padx=(4, 4), pady=(4, 0))
+        self.e_y2max = ttk.Entry(self._range_fields_row, width=8); self.e_y2max.grid(row=1, column=2, padx=(0, 14), pady=(4, 0))
         self._on_auto_range_change()
 
         # -- правка точек (п.26): исключение не удаляет данные, только помечает --
         pts = ttk.Labelframe(plot_tab, text="Точки", padding=8)
-        pts.grid(row=3, column=0, sticky="ew", pady=(0, 6))
+        pts.grid(row=3, column=0, sticky="nsew", pady=(0, 6))
         pts.columnconfigure(0, weight=1)
+        pts.rowconfigure(0, weight=1)
         columns = ("x", "i_meas", "error", "rejected", "excluded")
-        self.points_tree = ttk.Treeview(pts, columns=columns, show="headings", height=5, selectmode="extended")
+        self.points_tree = ttk.Treeview(pts, columns=columns, show="headings", height=16, selectmode="extended")
         for col, text, width in (
             ("x", "Возбуждение", 100), ("i_meas", "I изм., А", 90), ("error", "Погр., %", 90),
             ("rejected", "Брак (авто)", 90), ("excluded", "Исключена", 90),
         ):
             self.points_tree.heading(col, text=text)
             self.points_tree.column(col, width=width, anchor="center")
-        self.points_tree.grid(row=0, column=0, columnspan=4, sticky="ew")
+        self.points_tree.grid(row=0, column=0, columnspan=4, sticky="nsew")
         pts_scroll = ttk.Scrollbar(pts, orient="vertical", command=self.points_tree.yview)
         self.points_tree.configure(yscrollcommand=pts_scroll.set)
         pts_scroll.grid(row=0, column=4, sticky="ns")
@@ -915,8 +970,17 @@ class IVTraceGUI:
         exp.grid(row=4, column=0, sticky="w", pady=(0, 6))
         ttk.Button(exp, text="Экспорт в XLSX…", command=self._do_export_xlsx).pack(side="left")
 
-        self.plot_frame = ttk.Frame(plot_tab, style="Card.TFrame")
-        self.plot_frame.grid(row=5, column=0, sticky="nsew")
+        # -- вкладка «График»: только сам холст (Данные выше — файл, точки,
+        # параметры анализа) — так графику остаётся всё свободное место (баг-
+        # репорт: на "Данные" для него уже не было места), а после построения
+        # (см. _do_analyze/_auto_plot_after_measurement) оператора сразу
+        # переключает сюда. --
+        graph_tab = ttk.Frame(nb, padding=8)
+        nb.add(graph_tab, text="  График  ")
+        graph_tab.rowconfigure(0, weight=1)
+        graph_tab.columnconfigure(0, weight=1)
+        self.plot_frame = ttk.Frame(graph_tab, style="Card.TFrame")
+        self.plot_frame.grid(row=0, column=0, sticky="nsew")
         self.plot_frame.rowconfigure(0, weight=1)
         self.plot_frame.columnconfigure(0, weight=1)
         self.plot_hint = ttk.Label(self.plot_frame, style="Muted.TLabel",
@@ -1022,19 +1086,33 @@ class IVTraceGUI:
             self._vlimit_frame.grid()
             self._ilimit_frame.grid_remove()
             self._turns_row.grid()
-            self._smooth_ramp_row.grid()
         else:
             self._vlimit_frame.grid_remove()
             self._ilimit_frame.grid()
             self._turns_row.grid_remove()
-            # Плавное нарастание — только для тока (см. measurement.py);
-            # для напряжения чекбокс прячется целиком и режим форсированно
-            # выключается, чтобы поле не осталось незаметно включённым.
-            self._smooth_ramp_row.grid_remove()
-            self.smooth_ramp_var.set(False)
+        self._update_smooth_ramp_row_visibility()
         self._on_smooth_ramp_change()
         self._refresh_profile_list()
         self._update_sweep_preview()
+
+    def _update_smooth_ramp_row_visibility(self):
+        """
+        Плавное нарастание — только для тока (см. measurement.py) и, отдельно,
+        не в своём сценарии (баг-репорт: слишком много непроверенных
+        сочетаний с произвольным порядком/знаком точек — своя программа и
+        так предназначена для точечных случаев, а не для гладких переходов).
+        В обоих случаях чекбокс прячется целиком, а не просто гаснет
+        (п.33), и режим форсированно выключается, чтобы не остался
+        незаметно включённым.
+        """
+        if not hasattr(self, '_smooth_ramp_row'):
+            return
+        allowed = self.excitation_var.get() == "current" and not self.custom_program_var.get()
+        if allowed:
+            self._smooth_ramp_row.grid()
+        else:
+            self._smooth_ramp_row.grid_remove()
+            self.smooth_ramp_var.set(False)
 
     def _on_custom_program_change(self):
         """
@@ -1044,6 +1122,14 @@ class IVTraceGUI:
         развёртки») в этом режиме не участвуют вовсе — полярность каждой
         точки определяется её буквальным знаком, а не комбинаторикой,
         поэтому вкладка прячется целиком, а не просто гаснет (п.33).
+
+        Плавное нарастание и адаптивное охлаждение тоже прячутся целиком
+        (см. _update_smooth_ramp_row_visibility/_update_adaptive_cooling_row_visibility) —
+        обе непроверенные BETA-функции рассчитаны на предсказуемую
+        монотонную развёртку, а свой сценарий по смыслу — для тех редких
+        точечных случаев, где оператору нужно что-то конкретное, а не
+        гладкий проход (баг-репорт). Отсечку по погрешности НЕ прячем —
+        она нужна независимо от того, как построена развёртка.
         """
         custom = self.custom_program_var.get()
         if custom:
@@ -1057,11 +1143,31 @@ class IVTraceGUI:
                 self._dir_box.grid_remove()
             else:
                 self._dir_box.grid()
+        self._update_smooth_ramp_row_visibility()
+        # _update_smooth_ramp_row_visibility() могла форсированно сбросить
+        # smooth_ramp_var — без этого вызова _delay_cool_frame/
+        # _ramp_duration_frame остались бы в прежнем (уже неверном)
+        # состоянии видимости (баг: поля задержки/охлаждения пропадали
+        # навсегда, если до этого было включено плавное нарастание).
+        self._on_smooth_ramp_change()
+        self._update_adaptive_cooling_row_visibility()
         self._update_sweep_preview()
+
+    def _update_adaptive_cooling_row_visibility(self):
+        """Адаптивное охлаждение прячется в своём сценарии — см. _on_custom_program_change."""
+        if not hasattr(self, '_adaptive_cooling_row'):
+            return
+        if self.custom_program_var.get():
+            self._adaptive_cooling_row.grid_remove()
+            if self.adaptive_cooling_var.get():
+                self.adaptive_cooling_var.set(False)
+                self._on_adaptive_cooling_change()
+        else:
+            self._adaptive_cooling_row.grid()
 
     def _on_adaptive_cooling_change(self):
         """
-        Адаптивное охлаждение (BETA, галочка на вкладке «Дополнительно») —
+        Адаптивное охлаждение (BETA, галочка на вкладке «Уставка») —
         заменяет одну "Задержка охлаждения" двумя явными границами (мин./
         макс. в секундах), которые оператор задаёт сам; функция сама
         интерполирует между ними по току (см.
@@ -1088,11 +1194,9 @@ class IVTraceGUI:
         if smooth:
             self._delay_cool_frame.grid_remove()
             self._ramp_duration_frame.grid()
-            self._cool_box.grid_remove()
         else:
             self._delay_cool_frame.grid()
             self._ramp_duration_frame.grid_remove()
-            self._cool_box.grid()
         self._update_sweep_preview()
 
     def _refresh_profile_list(self):
@@ -1346,7 +1450,7 @@ class IVTraceGUI:
 
     def _do_blink(self, which: str):
         """
-        «Мигнуть» (п.11): отправляет identify_command выбранному прибору,
+        «blink» (BETA, п.11): отправляет identify_command выбранному прибору,
         если он у него в конфиге настроен (у большинства сейчас — нет, см.
         instruments.identify_instrument — не сочиняем непроверенные SCPI-
         команды). Ищет конфиг по совпадению адреса с последним снимком
@@ -1364,13 +1468,13 @@ class IVTraceGUI:
         combo = self.e_dmm if which == 'dmm' else self.e_src
         addr = self._combo_address(combo)
         if not addr:
-            messagebox.showinfo("Мигнуть", "Сначала выберите или введите адрес прибора.")
+            messagebox.showinfo("blink", "Сначала выберите или введите адрес прибора.")
             return
         state = self.discovery.snapshot()
         match = next((i for i in state.instruments if i.address == addr), None)
         if match is None or match.config_path is None:
-            messagebox.showinfo("Мигнуть", "Прибор по этому адресу пока не опознан сканом — "
-                                           "нечем определить конфиг с командой мигания.")
+            messagebox.showinfo("blink", "Прибор по этому адресу пока не опознан сканом — "
+                                         "нечем определить конфиг с командой мигания.")
             return
 
         import json as _json
@@ -1387,12 +1491,12 @@ class IVTraceGUI:
                     ok = identify_instrument(rm, addr, cfg)
                     rm.close()
                 except Exception as e:
-                    self.events.put(("log", f"[Мигнуть] Ошибка: {e}\n"))
+                    self.events.put(("log", f"[blink] Ошибка: {e}\n"))
                     return
                 if ok:
-                    self.events.put(("log", f"[Мигнуть] Команда отправлена: {addr} ({match.config_path.stem})\n"))
+                    self.events.put(("log", f"[blink] Команда отправлена: {addr} ({match.config_path.stem})\n"))
                 else:
-                    self.events.put(("log", f"[Мигнуть] Для {match.config_path.stem} не настроена команда "
+                    self.events.put(("log", f"[blink] Для {match.config_path.stem} не настроена команда "
                                             "мигания (identify_command в конфиге отсутствует).\n"))
             finally:
                 self.discovery.resume()
@@ -2217,9 +2321,10 @@ class IVTraceGUI:
 
     # ------------------------------------------------------------------ plot tab
     def _on_auto_range_change(self):
-        state = "disabled" if self.auto_range_var.get() else "normal"
-        for entry in self._range_entries:
-            entry.configure(state=state)
+        if self.auto_range_var.get():
+            self._range_fields_row.grid_remove()
+        else:
+            self._range_fields_row.grid()
 
     def _axis_range(self, lo_entry, hi_entry):
         """(min, max) из пары полей, либо None — если авто-диапазон включён
@@ -2321,7 +2426,7 @@ class IVTraceGUI:
             f"средняя {stats['mean_error_percent']:+.4f} %{excluded_note}; PNG: {stats['png_path']}\n"
         )
         self._embed_figure(stats["figure"])
-        self.notebook.select(1)
+        self.notebook.select(2)
 
     def _do_estimate_ratio(self):
         """п.10 (BETA): фактический коэффициент по снятым точкам, отдельно от построения графика."""
@@ -2488,7 +2593,7 @@ class IVTraceGUI:
             f"средняя {stats['mean_error_percent']:+.4f} %)\n"
         )
         self._embed_figure(stats["figure"])
-        self.notebook.select(1)
+        self.notebook.select(2)
 
     def _embed_figure(self, fig):
         from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk

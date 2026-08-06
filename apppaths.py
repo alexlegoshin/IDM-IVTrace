@@ -80,6 +80,11 @@ def tests_dir() -> Path:
     return resource_base() / "tests"
 
 
+def assets_dir() -> Path:
+    """Логотип/иконки (см. gui.py) — read-only ресурс, той же природы, что instruments_dir()/tests_dir()."""
+    return resource_base() / "assets"
+
+
 def app_root() -> Path:
     """
     Каталог, рядом с которым логично держать пользовательские данные:

@@ -21,6 +21,7 @@ hidden = ["pytest"] + collect_submodules("_pytest")
 datas = [
     ("instruments", "instruments"),   # json-конфиги приборов
     ("tests", "tests"),               # виртуальные самотесты (гейт перед measure)
+    ("assets", "assets"),             # логотип/иконки GUI (см. gui.py, apppaths.assets_dir)
 ]
 
 # pyvisa-py в поставку не входит: работаем строго через NI-VISA. Исключаем,
@@ -50,6 +51,7 @@ exe = EXE(
     [],
     exclude_binaries=True,
     name="IVTrace",
+    icon="assets/ivtrace_exe.ico",   # иконка exe/ярлыка (Ф6, см. assets/ivtrace_exe.ico)
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
