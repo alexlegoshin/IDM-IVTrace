@@ -23,6 +23,7 @@ from pathlib import Path
 
 import tkinter as tk
 from tkinter import ttk, scrolledtext, messagebox, simpledialog
+from tkinter import font as tkfont
 
 import pandas as pd
 
@@ -44,14 +45,80 @@ from measurement import (
 from sweep import Branch, DirectionPreset, plan_sweep
 
 
-ACCENT = "#2563eb"
-ACCENT_ACTIVE = "#1d4ed8"
-BG = "#f4f5f7"
-CARD = "#ffffff"
-OK_COLOR = "#15803d"
-ERR_COLOR = "#b91c1c"
-BUSY_COLOR = "#b45309"
-MUTED = "#6b7280"
+# п.33 — минимализм: бело-кремовый фон, чёрный текст, геометричный
+# гротеск (Century Gothic — не всегда есть на голой Windows без Office;
+# берём первый реально установленный шрифт из списка, см. _pick_font).
+BG = "#faf7f0"
+CARD = "#fffdf8"
+CARD_BORDER = "#e6e1d3"
+TEXT = "#1c1c19"
+MUTED = "#7a7566"
+ACCENT = "#1c1c19"          # кнопки основного действия — почти чёрные, не цветной акцент
+ACCENT_ACTIVE = "#3a3a34"
+DANGER = "#b3261e"
+DANGER_ACTIVE = "#8f1e18"
+OK_COLOR = "#3f6b3f"
+ERR_COLOR = "#b3261e"
+BUSY_COLOR = "#9c7a29"
+
+_FONT_CANDIDATES = ("Century Gothic", "Yanone Kaffeesatz", "Gill Sans MT", "Trebuchet MS", "Segoe UI")
+_FONT_FAMILY = None
+
+
+def _pick_font(root) -> str:
+    """Первый реально установленный шрифт из _FONT_CANDIDATES; Segoe UI — гарантированный запасной на Windows."""
+    global _FONT_FAMILY
+    if _FONT_FAMILY is None:
+        available = set(tkfont.families(root))
+        _FONT_FAMILY = next((f for f in _FONT_CANDIDATES if f in available), "Segoe UI")
+    return _FONT_FAMILY
+
+
+class _ScrollableFrame(ttk.Frame):
+    """
+    Вертикальный скролл без лишней навороченности (п.33): Canvas + Frame
+    внутри, колесо мыши, тонкий скроллбар без явной рамки. Нужен потому,
+    что при табличной раскладке левая панель параметров всё равно иногда
+    выше, чем помещается на маленьком мониторе — без скролла контент
+    просто обрезался бы снизу вместо того, чтобы прокручиваться.
+
+    Использование: строить содержимое внутри self.body (это ttk.Frame),
+    а не внутри самого _ScrollableFrame.
+    """
+
+    def __init__(self, parent, bg=BG):
+        super().__init__(parent)
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(0, weight=1)
+
+        self.canvas = tk.Canvas(self, highlightthickness=0, bg=bg, bd=0)
+        self.canvas.grid(row=0, column=0, sticky="nsew")
+        scrollbar = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        self.canvas.configure(yscrollcommand=scrollbar.set)
+
+        self.body = ttk.Frame(self.canvas)
+        self._window = self.canvas.create_window((0, 0), window=self.body, anchor="nw")
+
+        self.body.bind("<Configure>", self._on_body_configure)
+        self.canvas.bind("<Configure>", self._on_canvas_configure)
+        self.canvas.bind("<Enter>", lambda e: self._bind_wheel())
+        self.canvas.bind("<Leave>", lambda e: self._unbind_wheel())
+
+    def _on_body_configure(self, _event=None):
+        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+
+    def _on_canvas_configure(self, event):
+        self.canvas.itemconfigure(self._window, width=event.width)
+
+    def _bind_wheel(self):
+        self.canvas.bind_all("<MouseWheel>", self._on_mousewheel)
+
+    def _unbind_wheel(self):
+        self.canvas.unbind_all("<MouseWheel>")
+
+    def _on_mousewheel(self, event):
+        self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
 
 
 class _QueueWriter(io.TextIOBase):
@@ -130,6 +197,21 @@ class IVTraceGUI:
 
         self.skip_selftest_var = tk.BooleanVar(value=bool(getattr(args, "skip_selftest", False)))
         self.excitation_var = tk.StringVar(value="current")
+        self.output_var = tk.StringVar(value="current")
+        self.suppress_warnings_var = tk.BooleanVar(value=False)
+
+        # Все переменные формы созданы здесь заранее (не по ходу постройки
+        # виджетов) — вкладки строятся отдельными методами в произвольном
+        # порядке, а предпросмотр развёртки (см. _update_sweep_preview)
+        # должен уметь читать branch/preset независимо от того, какая
+        # вкладка успела построиться первой.
+        self.stop_on_error_var = tk.BooleanVar(value=False)
+        self.branch_var = tk.StringVar(value=Branch.BOTH.value)
+        self.preset_var = tk.StringVar(value=DirectionPreset.DIVERGING.value)
+        self.discard_first_var = tk.BooleanVar(value=DEFAULT_DISCARD_FIRST)
+        self.adaptive_cooling_var = tk.BooleanVar(value=False)
+        self.show_labels_var = tk.BooleanVar(value=False)
+        self.auto_range_var = tk.BooleanVar(value=True)
 
         # Ручной режим вне измерительного цикла (Ф4, п.13/40) — открытая
         # сессия живёт между кликами (реле/уставка), не одна операция за
@@ -185,8 +267,11 @@ class IVTraceGUI:
     # ------------------------------------------------------------------ style
     def _build_style(self):
         self.root.title("IVTrace")
-        self.root.geometry("1020x680")
-        self.root.minsize(920, 600)
+        self.root.geometry("1180x760")
+        # Табличная раскладка + скролл внутри вкладок (см. _ScrollableFrame)
+        # держит панель управляемой даже на небольшом экране — минимальный
+        # размер окна снижен по сравнению с прежним нескроллящимся вариантом.
+        self.root.minsize(820, 520)
         self.root.configure(bg=BG)
         # п.24: развёрнуто на весь экран при запуске (НЕ fullscreen — заголовок
         # окна и панель задач остаются на месте, это не то же самое, что
@@ -196,31 +281,46 @@ class IVTraceGUI:
         except tk.TclError:
             pass
 
+        family = _pick_font(self.root)
+        self.font_family = family
+
         style = ttk.Style(self.root)
         try:
             style.theme_use("clam")
         except tk.TclError:
             pass
 
-        base_font = ("Segoe UI", 10)
-        style.configure(".", font=base_font, background=BG)
+        base_font = (family, 10)
+        style.configure(".", font=base_font, background=BG, foreground=TEXT)
         style.configure("TFrame", background=BG)
         style.configure("Card.TFrame", background=CARD)
-        style.configure("TLabel", background=BG)
-        style.configure("Card.TLabel", background=CARD)
+        style.configure("TLabel", background=BG, foreground=TEXT)
+        style.configure("Card.TLabel", background=CARD, foreground=TEXT)
         style.configure("Muted.TLabel", background=BG, foreground=MUTED)
-        style.configure("Title.TLabel", background=BG, font=("Segoe UI Semibold", 17))
-        style.configure("Sub.TLabel", background=BG, foreground=MUTED, font=("Segoe UI", 9))
-        style.configure("TLabelframe", background=BG, bordercolor="#d1d5db")
-        style.configure("TLabelframe.Label", background=BG, foreground="#374151",
-                        font=("Segoe UI Semibold", 10))
-        style.configure("TEntry", padding=4)
-        style.configure("TButton", padding=(12, 6))
-        style.configure("Accent.TButton", padding=(16, 8), foreground="white",
-                        background=ACCENT, font=("Segoe UI Semibold", 10), borderwidth=0)
+        style.configure("Title.TLabel", background=BG, foreground=TEXT, font=(family, 18))
+        style.configure("Sub.TLabel", background=BG, foreground=MUTED, font=(family, 9))
+        style.configure("TLabelframe", background=BG, bordercolor=CARD_BORDER)
+        style.configure("TLabelframe.Label", background=BG, foreground=TEXT, font=(family, 10))
+        style.configure("TNotebook", background=BG, bordercolor=CARD_BORDER, tabmargins=(2, 4, 2, 0))
+        style.configure("TNotebook.Tab", background=BG, foreground=MUTED, padding=(14, 7), font=(family, 10))
+        style.map("TNotebook.Tab",
+                  background=[("selected", CARD)],
+                  foreground=[("selected", TEXT)])
+        style.configure("TEntry", padding=4, fieldbackground=CARD, bordercolor=CARD_BORDER)
+        style.configure("TCombobox", padding=4, fieldbackground=CARD, bordercolor=CARD_BORDER)
+        style.configure("TCheckbutton", background=BG, foreground=TEXT)
+        style.configure("TRadiobutton", background=BG, foreground=TEXT)
+        style.configure("TButton", padding=(12, 6), font=(family, 10))
+        style.configure("Accent.TButton", padding=(16, 8), foreground=CARD,
+                        background=ACCENT, font=(family, 10), borderwidth=0)
         style.map("Accent.TButton",
-                  background=[("active", ACCENT_ACTIVE), ("disabled", "#9ca3af")])
-        style.configure("Danger.TButton", padding=(14, 8))
+                  background=[("active", ACCENT_ACTIVE), ("disabled", "#b8b3a3")])
+        style.configure("Danger.TButton", padding=(14, 8), foreground=CARD,
+                        background=DANGER, font=(family, 10), borderwidth=0)
+        style.map("Danger.TButton",
+                  background=[("active", DANGER_ACTIVE), ("disabled", "#c9a6a3")])
+        style.configure("Vertical.TScrollbar", background=BG, troughcolor=BG,
+                        bordercolor=BG, arrowcolor=MUTED, relief="flat")
 
     # --------------------------------------------------------------------- ui
     def _build_ui(self):
@@ -241,11 +341,13 @@ class IVTraceGUI:
         self.status_label = ttk.Label(header, text="Инициализация…", style="Muted.TLabel")
         self.status_label.grid(row=0, column=2, rowspan=2, sticky="e")
 
-        # ---- body: two columns ----
+        # ---- body: two columns (левая — фиксированная ширина под форму,
+        # немного растёт с окном; правая — журнал/график, забирает всё
+        # остальное место) ----
         body = ttk.Frame(self.root, padding=(18, 6, 18, 6))
         body.grid(row=1, column=0, sticky="nsew")
-        body.columnconfigure(0, minsize=340)
-        body.columnconfigure(1, weight=1)
+        body.columnconfigure(0, minsize=360, weight=1)
+        body.columnconfigure(1, weight=3)
         body.rowconfigure(0, weight=1)
 
         self._build_params(body)
@@ -266,13 +368,59 @@ class IVTraceGUI:
         ttk.Button(footer_btns, text="Проверить снова", command=self._run_preflight).pack(side="left")
 
     def _build_params(self, parent):
+        """
+        п.33: левая панель разложена по вкладкам (Измерение/Датчик/Приборы/
+        Дополнительно), каждая — со своим скроллом (_ScrollableFrame), чтобы
+        не обрезаться снизу на небольших экранах. Старт/Стоп/отсчёт и
+        галочки безопасности вынесены НАД вкладками — они нужны постоянно,
+        прятать их за переключением вкладки было бы неудобно.
+        """
         left = ttk.Frame(parent)
         left.grid(row=0, column=0, sticky="nsew", padx=(0, 12))
         left.columnconfigure(0, weight=1)
+        left.rowconfigure(0, weight=1)
 
-        # --- excitation type ---
-        exc = ttk.Labelframe(left, text="Тип возбуждения", padding=10)
-        exc.grid(row=0, column=0, sticky="ew")
+        tabs = ttk.Notebook(left)
+        tabs.grid(row=0, column=0, sticky="nsew")
+        tabs.add(self._build_tab_measure(tabs), text="Измерение")
+        tabs.add(self._build_tab_sensor(tabs), text="Датчик")
+        tabs.add(self._build_tab_instruments(tabs), text="Приборы")
+        tabs.add(self._build_tab_advanced(tabs), text="Дополнительно")
+
+        bottom = ttk.Frame(left, padding=(2, 10, 2, 0))
+        bottom.grid(row=1, column=0, sticky="ew")
+        bottom.columnconfigure(0, weight=1)
+        bottom.columnconfigure(1, weight=1)
+        self.start_btn = ttk.Button(bottom, text="▶  Старт измерения", style="Accent.TButton",
+                                    command=self._start_measurement, state="disabled")
+        self.start_btn.grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        self.stop_btn = ttk.Button(bottom, text="■  Стоп", style="Danger.TButton",
+                                   command=self._request_stop, state="disabled")
+        self.stop_btn.grid(row=0, column=1, sticky="ew", padx=(6, 0))
+
+        # --- countdown (п.15) — виден только пока идёт измерение ---
+        self.countdown_label = ttk.Label(bottom, style="Muted.TLabel", text="")
+        self.countdown_label.grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+        ttk.Checkbutton(bottom, text="Игнорировать самотесты (не рекомендуется)",
+                        variable=self.skip_selftest_var,
+                        command=self._run_preflight).grid(row=2, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        ttk.Checkbutton(bottom, text="Отключить все предупреждения и уведомления (не рекомендуется)",
+                        variable=self.suppress_warnings_var).grid(row=3, column=0, columnspan=2, sticky="w", pady=(2, 0))
+
+        self._on_excitation_change()
+        self._on_stop_on_error_change()
+        self._on_branch_change()
+        self._update_sweep_preview()
+
+    # -- вкладка «Измерение»: что и как возбуждаем, диапазон, предпросмотр --
+    def _build_tab_measure(self, parent):
+        scroll = _ScrollableFrame(parent)
+        body = scroll.body
+        body.columnconfigure(0, weight=1)
+
+        exc = ttk.Labelframe(body, text="Тип возбуждения", padding=10)
+        exc.grid(row=0, column=0, sticky="ew", padx=10, pady=(10, 8))
         ttk.Radiobutton(exc, text="Ток (источник тока)", value="current",
                         variable=self.excitation_var, command=self._on_excitation_change).grid(row=0, column=0, sticky="w")
         ttk.Radiobutton(exc, text="Напряжение (источник напряжения) — BETA", value="voltage",
@@ -286,46 +434,99 @@ class IVTraceGUI:
         out_row = ttk.Frame(exc)
         out_row.grid(row=3, column=0, sticky="w")
         ttk.Label(out_row, text="Выход датчика:").pack(side="left", padx=(0, 6))
-        self.output_var = tk.StringVar(value="current")
         ttk.Combobox(
             out_row, textvariable=self.output_var, state="readonly", width=10,
             values=["current", "voltage"],
         ).pack(side="left")
         ttk.Label(exc, text="выход «напряжение» — BETA, не проверено на реальном стенде",
-                  foreground="gray").grid(row=4, column=0, sticky="w", pady=(4, 0))
+                  style="Muted.TLabel").grid(row=4, column=0, sticky="w", pady=(4, 0))
 
-        # --- numeric params ---
-        pf = ttk.Labelframe(left, text="Параметры измерения", padding=10)
-        pf.grid(row=1, column=0, sticky="ew", pady=(10, 0))
+        pf = ttk.Labelframe(body, text="Параметры развёртки", padding=10)
+        pf.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 8))
         pf.columnconfigure(1, weight=1)
 
         self.e_start, self.u_start = self._param_row(pf, 0, "Начало")
         self.e_stop, self.u_stop = self._param_row(pf, 1, "Конец")
         self.e_step, self.u_step = self._param_row(pf, 2, "Шаг")
-        self.e_vlimit, self.u_vlimit = self._param_row(pf, 3, "Огр. напряжения", unit="В")
+        for entry in (self.e_start, self.e_stop, self.e_step):
+            entry.bind("<FocusOut>", lambda e: self._update_sweep_preview())
+            entry.bind("<Return>", lambda e: self._update_sweep_preview())
+
+        # V_limit — в своём контейнере, чтобы полностью прятать при
+        # возбуждении напряжением, а не просто гасить (п.33: показывать
+        # только те поля, что реально будут использованы).
+        self._vlimit_frame = ttk.Frame(pf)
+        self._vlimit_frame.grid(row=3, column=0, columnspan=3, sticky="ew")
+        self._vlimit_frame.columnconfigure(1, weight=1)
+        self.e_vlimit, self.u_vlimit = self._param_row(self._vlimit_frame, 0, "Огр. напряжения", unit="В")
+
         self.e_delay, self.u_delay = self._param_row(pf, 4, "Задержка установки", unit="с")
         self.e_cool, self.u_cool = self._param_row(pf, 5, "Задержка охлаждения", unit="с")
 
-        ttk.Label(pf, text="I ном., А").grid(row=6, column=0, sticky="w", pady=3)
-        self.e_inom = ttk.Entry(pf, width=12)
-        self.e_inom.grid(row=6, column=1, sticky="ew", pady=3, padx=(8, 6))
-        ttk.Label(pf, text="Коэфф. 1:X").grid(row=7, column=0, sticky="w", pady=3)
-        self.e_ratio = ttk.Entry(pf, width=12)
-        self.e_ratio.grid(row=7, column=1, sticky="ew", pady=3, padx=(8, 6))
-        ttk.Label(pf, text="Витки").grid(row=8, column=0, sticky="w", pady=3)
-        self.e_turns = ttk.Entry(pf, width=12)
-        self.e_turns.grid(row=8, column=1, sticky="ew", pady=3, padx=(8, 6))
+        ttk.Label(pf, text="Комментарий").grid(row=6, column=0, sticky="w", pady=(6, 0))
+        self.e_label = ttk.Entry(pf)
+        self.e_label.grid(row=6, column=1, columnspan=2, sticky="ew", pady=(6, 0))
+
+        # --- предпросмотр развёртки: что реально получится при текущих
+        # значениях (не то, что напечатано, а то, что посчитает планировщик,
+        # см. _update_sweep_preview) ---
+        preview = ttk.Labelframe(body, text="Предпросмотр развёртки", padding=10)
+        preview.grid(row=2, column=0, sticky="ew", padx=10, pady=(0, 10))
+        self.sweep_preview_label = ttk.Label(preview, text="—", style="Muted.TLabel",
+                                             wraplength=300, justify="left")
+        self.sweep_preview_label.pack(anchor="w", fill="x")
+
+        return scroll
+
+    # -- вкладка «Датчик»: метаданные + профиль (п.39-UI) --
+    def _build_tab_sensor(self, parent):
+        scroll = _ScrollableFrame(parent)
+        body = scroll.body
+        body.columnconfigure(0, weight=1)
+
+        meta = ttk.Labelframe(body, text="Метаданные датчика", padding=10)
+        meta.grid(row=0, column=0, sticky="ew", padx=10, pady=(10, 8))
+        meta.columnconfigure(1, weight=1)
+        ttk.Label(meta, text="I ном., А").grid(row=0, column=0, sticky="w", pady=3)
+        self.e_inom = ttk.Entry(meta, width=14)
+        self.e_inom.grid(row=0, column=1, sticky="ew", pady=3, padx=(8, 0))
+        ttk.Label(meta, text="Коэфф. 1:X").grid(row=1, column=0, sticky="w", pady=3)
+        self.e_ratio = ttk.Entry(meta, width=14)
+        self.e_ratio.grid(row=1, column=1, sticky="ew", pady=3, padx=(8, 0))
+
+        # Витки не имеют смысла для возбуждения напряжением — прячется в
+        # _on_excitation_change (п.33: показывать только нужные поля).
+        self._turns_row = ttk.Frame(meta)
+        self._turns_row.grid(row=2, column=0, columnspan=2, sticky="ew")
+        self._turns_row.columnconfigure(1, weight=1)
+        ttk.Label(self._turns_row, text="Витки").grid(row=0, column=0, sticky="w", pady=3)
+        self.e_turns = ttk.Entry(self._turns_row, width=14)
+        self.e_turns.grid(row=0, column=1, sticky="ew", pady=3, padx=(8, 0))
         self.e_turns.insert(0, "1")
 
-        ttk.Label(pf, text="Комментарий").grid(row=9, column=0, sticky="w", pady=(6, 0))
-        self.e_label = ttk.Entry(pf)
-        self.e_label.grid(row=9, column=1, columnspan=2, sticky="ew", pady=(6, 0))
+        cfg = ttk.Labelframe(body, text="Профиль датчика", padding=10)
+        cfg.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 10))
+        cfg.columnconfigure(1, weight=1)
+        ttk.Label(cfg, text="Имя").grid(row=0, column=0, sticky="w", pady=3)
+        self.e_config_name = ttk.Combobox(cfg, state="normal")
+        self.e_config_name.grid(row=0, column=1, sticky="ew", pady=3, padx=(8, 0))
+        btn_frame = ttk.Frame(cfg)
+        btn_frame.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        ttk.Button(btn_frame, text="Сохранить", command=self._save_config).pack(side="left", padx=(0, 6))
+        ttk.Button(btn_frame, text="Загрузить", command=self._load_config).pack(side="left", padx=(0, 6))
+        ttk.Button(btn_frame, text="Переименовать", command=self._rename_config).pack(side="left", padx=(0, 6))
+        ttk.Button(btn_frame, text="Удалить", command=self._delete_config).pack(side="left")
 
-        # --- optional instrument addresses (п.12: выпадающий список найденных
-        # приборов вместо пустого поля ручного ввода; поле остаётся
-        # редактируемым — на случай, если что-то ещё не попало в скан) ---
-        adv = ttk.Labelframe(left, text="Приборы (необязательно, иначе автопоиск)", padding=10)
-        adv.grid(row=2, column=0, sticky="ew", pady=(10, 0))
+        return scroll
+
+    # -- вкладка «Приборы»: адреса (п.12) + мигание (п.11) + скан (п.25) --
+    def _build_tab_instruments(self, parent):
+        scroll = _ScrollableFrame(parent)
+        body = scroll.body
+        body.columnconfigure(0, weight=1)
+
+        adv = ttk.Labelframe(body, text="Приборы (необязательно, иначе автопоиск)", padding=10)
+        adv.grid(row=0, column=0, sticky="ew", padx=10, pady=(10, 10))
         adv.columnconfigure(1, weight=1)
         self.e_dmm, btn_dmm = self._combo_addr_row(adv, 0, "Мультиметр VISA")
         btn_dmm.configure(command=lambda: self._do_blink('dmm'))
@@ -334,96 +535,71 @@ class IVTraceGUI:
         self.e_relay = self._addr_row(adv, 2, "Порт реле (COMx)")
 
         self.discovery_status_label = ttk.Label(adv, style="Muted.TLabel", text="Поиск приборов…")
-        self.discovery_status_label.grid(row=3, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        self.discovery_status_label.grid(row=3, column=0, columnspan=3, sticky="w", pady=(6, 0))
         ttk.Button(adv, text="Обновить список", command=self._rescan_discovery_now).grid(
-            row=4, column=0, columnspan=2, sticky="w", pady=(4, 0))
+            row=4, column=0, columnspan=3, sticky="w", pady=(4, 0))
 
-        # --- additional options ---
-        opts = ttk.Labelframe(left, text="Дополнительные опции", padding=10)
-        opts.grid(row=3, column=0, sticky="ew", pady=(10, 0))
-        opts.columnconfigure(1, weight=1)
+        return scroll
 
-        self.stop_on_error_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(opts, text="Остановить при превышении погрешности",
-                        variable=self.stop_on_error_var).grid(row=0, column=0, columnspan=2, sticky="w")
-        ttk.Label(opts, text="Порог погрешности, %").grid(row=1, column=0, sticky="w", pady=3)
-        self.e_error_threshold = ttk.Entry(opts, width=10)
-        self.e_error_threshold.grid(row=1, column=1, sticky="w", pady=3, padx=(8, 0))
+    # -- вкладка «Дополнительно»: отсечка/направление/усреднение/охлаждение --
+    def _build_tab_advanced(self, parent):
+        scroll = _ScrollableFrame(parent)
+        body = scroll.body
+        body.columnconfigure(0, weight=1)
+
+        err_box = ttk.Labelframe(body, text="Отсечка по погрешности", padding=10)
+        err_box.grid(row=0, column=0, sticky="ew", padx=10, pady=(10, 8))
+        ttk.Checkbutton(err_box, text="Остановить при превышении погрешности",
+                        variable=self.stop_on_error_var,
+                        command=self._on_stop_on_error_change).grid(row=0, column=0, sticky="w")
+        # Порог показывается только когда отсечка реально включена (п.33).
+        self._error_threshold_row = ttk.Frame(err_box)
+        self._error_threshold_row.grid(row=1, column=0, sticky="ew", pady=(4, 0))
+        ttk.Label(self._error_threshold_row, text="Порог погрешности, %").pack(side="left")
+        self.e_error_threshold = ttk.Entry(self._error_threshold_row, width=10)
+        self.e_error_threshold.pack(side="left", padx=(8, 0))
         self.e_error_threshold.insert(0, "1.0")
 
-        ttk.Label(opts, text="Полярность").grid(row=2, column=0, sticky="w", pady=(6, 3))
-        self.branch_var = tk.StringVar(value=Branch.BOTH.value)
-        ttk.Combobox(
-            opts, textvariable=self.branch_var, state="readonly", width=10,
-            values=[b.value for b in Branch],
-        ).grid(row=2, column=1, sticky="w", pady=(6, 3))
+        dir_box = ttk.Labelframe(body, text="Направление развёртки", padding=10)
+        dir_box.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 8))
+        ttk.Label(dir_box, text="Полярность").grid(row=0, column=0, sticky="w", pady=3)
+        branch_combo = ttk.Combobox(dir_box, textvariable=self.branch_var, state="readonly", width=10,
+                                    values=[b.value for b in Branch])
+        branch_combo.grid(row=0, column=1, sticky="w", pady=3, padx=(8, 0))
+        branch_combo.bind("<<ComboboxSelected>>",
+                          lambda e: (self._on_branch_change(), self._update_sweep_preview()))
 
-        ttk.Label(opts, text="Схема прохода").grid(row=3, column=0, sticky="w", pady=3)
-        self.preset_var = tk.StringVar(value=DirectionPreset.DIVERGING.value)
-        ttk.Combobox(
-            opts, textvariable=self.preset_var, state="readonly", width=10,
-            values=[p.value for p in DirectionPreset],
-        ).grid(row=3, column=1, sticky="w", pady=3)
-        ttk.Label(opts, text="(имеет значение только при «both»)",
-                  foreground="gray").grid(row=4, column=0, columnspan=2, sticky="w")
+        # Схема прохода имеет смысл только при branch=both — прячется,
+        # когда снимается только одна полярность (п.33).
+        self._preset_row = ttk.Frame(dir_box)
+        self._preset_row.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(4, 0))
+        ttk.Label(self._preset_row, text="Схема прохода").pack(side="left")
+        preset_combo = ttk.Combobox(self._preset_row, textvariable=self.preset_var, state="readonly", width=10,
+                                    values=[p.value for p in DirectionPreset])
+        preset_combo.pack(side="left", padx=(8, 0))
+        preset_combo.bind("<<ComboboxSelected>>", lambda e: self._update_sweep_preview())
 
-        ttk.Label(opts, text="Отсчётов на усреднение").grid(row=5, column=0, sticky="w", pady=(6, 3))
-        self.e_avg_count = ttk.Entry(opts, width=6)
-        self.e_avg_count.grid(row=5, column=1, sticky="w", pady=(6, 3))
+        avg_box = ttk.Labelframe(body, text="Усреднение", padding=10)
+        avg_box.grid(row=2, column=0, sticky="ew", padx=10, pady=(0, 8))
+        ttk.Label(avg_box, text="Отсчётов на усреднение").grid(row=0, column=0, sticky="w", pady=3)
+        self.e_avg_count = ttk.Entry(avg_box, width=6)
+        self.e_avg_count.grid(row=0, column=1, sticky="w", pady=3, padx=(8, 0))
         self.e_avg_count.insert(0, str(DEFAULT_AVERAGING_COUNT))
-        ttk.Label(opts, text="Задержка между ними, с").grid(row=6, column=0, sticky="w", pady=3)
-        self.e_avg_delay = ttk.Entry(opts, width=6)
-        self.e_avg_delay.grid(row=6, column=1, sticky="w", pady=3)
+        ttk.Label(avg_box, text="Задержка между ними, с").grid(row=1, column=0, sticky="w", pady=3)
+        self.e_avg_delay = ttk.Entry(avg_box, width=6)
+        self.e_avg_delay.grid(row=1, column=1, sticky="w", pady=3, padx=(8, 0))
         self.e_avg_delay.insert(0, str(DEFAULT_AVERAGING_DELAY))
-        self.discard_first_var = tk.BooleanVar(value=DEFAULT_DISCARD_FIRST)
-        ttk.Checkbutton(opts, text="Отбрасывать первый отсчёт",
-                        variable=self.discard_first_var).grid(row=7, column=0, columnspan=2, sticky="w")
+        ttk.Checkbutton(avg_box, text="Отбрасывать первый отсчёт",
+                        variable=self.discard_first_var).grid(row=2, column=0, columnspan=2, sticky="w", pady=(4, 0))
 
-        self.adaptive_cooling_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(opts, text="Адаптивное охлаждение (BETA, растёт с током)",
-                        variable=self.adaptive_cooling_var).grid(row=8, column=0, columnspan=2, sticky="w", pady=(6, 0))
-        ttk.Label(opts, text="не проверено на реальном стенде",
-                  foreground="gray").grid(row=9, column=0, columnspan=2, sticky="w")
+        cool_box = ttk.Labelframe(body, text="Охлаждение", padding=10)
+        cool_box.grid(row=3, column=0, sticky="ew", padx=10, pady=(0, 10))
+        ttk.Checkbutton(cool_box, text="Адаптивное охлаждение (BETA, растёт с током)",
+                        variable=self.adaptive_cooling_var).grid(row=0, column=0, sticky="w")
+        ttk.Label(cool_box, text="не проверено на реальном стенде",
+                  style="Muted.TLabel").grid(row=1, column=0, sticky="w")
 
-        # --- sensor configuration (п.39-UI: выпадающий список профилей
-        # вместо текстового поля, кнопки Сохранить/Загрузить/Переименовать/Удалить) ---
-        cfg = ttk.Labelframe(left, text="Конфигурация датчика", padding=10)
-        cfg.grid(row=4, column=0, sticky="ew", pady=(10, 0))
-        cfg.columnconfigure(1, weight=1)
-        ttk.Label(cfg, text="Профиль").grid(row=0, column=0, sticky="w", pady=3)
-        self.e_config_name = ttk.Combobox(cfg, state="normal")
-        self.e_config_name.grid(row=0, column=1, sticky="ew", pady=3, padx=(8, 0))
-        btn_frame = ttk.Frame(cfg)
-        btn_frame.grid(row=1, column=0, columnspan=2, sticky="ew", pady=3)
-        ttk.Button(btn_frame, text="Сохранить", command=self._save_config).pack(side="left", padx=(0, 6))
-        ttk.Button(btn_frame, text="Загрузить", command=self._load_config).pack(side="left", padx=(0, 6))
-        ttk.Button(btn_frame, text="Переименовать", command=self._rename_config).pack(side="left", padx=(0, 6))
-        ttk.Button(btn_frame, text="Удалить", command=self._delete_config).pack(side="left")
-
-        # --- action buttons ---
-        actions = ttk.Frame(left)
-        actions.grid(row=5, column=0, sticky="ew", pady=(12, 0))
-        actions.columnconfigure(0, weight=1)
-        actions.columnconfigure(1, weight=1)
-        self.start_btn = ttk.Button(actions, text="▶  Старт измерения", style="Accent.TButton",
-                                    command=self._start_measurement, state="disabled")
-        self.start_btn.grid(row=0, column=0, sticky="ew", padx=(0, 6))
-        self.stop_btn = ttk.Button(actions, text="■  Стоп", style="Danger.TButton",
-                                   command=self._request_stop, state="disabled")
-        self.stop_btn.grid(row=0, column=1, sticky="ew", padx=(6, 0))
-
-        # --- countdown (п.15) — виден только пока идёт измерение ---
-        self.countdown_label = ttk.Label(left, style="Muted.TLabel", text="")
-        self.countdown_label.grid(row=6, column=0, sticky="w", pady=(6, 0))
-
-        ttk.Checkbutton(left, text="Игнорировать самотесты (не рекомендуется)",
-                        variable=self.skip_selftest_var,
-                        command=self._run_preflight).grid(row=7, column=0, sticky="w", pady=(8, 0))
-        self.suppress_warnings_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(left, text="Отключить все предупреждения и уведомления (не рекомендуется)",
-                        variable=self.suppress_warnings_var).grid(row=8, column=0, sticky="w", pady=(2, 0))
-
-        self._on_excitation_change()
+        return scroll
 
     def _param_row(self, parent, row, label, unit=""):
         ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", pady=3)
@@ -516,11 +692,9 @@ class IVTraceGUI:
         # -- отображение: подписи погрешности (п.30) + диапазоны осей (п.36) --
         disp = ttk.Labelframe(plot_tab, text="Отображение", padding=8)
         disp.grid(row=2, column=0, sticky="ew", pady=(0, 6))
-        self.show_labels_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(disp, text="Подписи погрешности над точками",
                         variable=self.show_labels_var).grid(row=0, column=0, columnspan=6, sticky="w")
 
-        self.auto_range_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(disp, text="Авто-диапазон осей", variable=self.auto_range_var,
                         command=self._on_auto_range_change).grid(row=1, column=0, columnspan=6, sticky="w", pady=(4, 0))
         ttk.Label(disp, text="X мин/макс").grid(row=2, column=0, sticky="w", pady=(4, 0))
@@ -590,8 +764,14 @@ class IVTraceGUI:
         не закроет её или не нажмёт аварийный «СТОП» — тот же путь
         безопасности (SessionHandle.emergency_stop), что и у измерения.
         """
-        tab = ttk.Frame(nb, padding=10)
-        nb.add(tab, text="  Ручное управление  ")
+        outer = ttk.Frame(nb, padding=2)
+        nb.add(outer, text="  Ручное управление  ")
+        outer.rowconfigure(0, weight=1)
+        outer.columnconfigure(0, weight=1)
+        scroll = _ScrollableFrame(outer)
+        scroll.grid(row=0, column=0, sticky="nsew")
+        tab = ttk.Frame(scroll.body, padding=10)
+        tab.grid(row=0, column=0, sticky="ew")
         tab.columnconfigure(0, weight=1)
 
         warn = ttk.Label(
@@ -630,7 +810,7 @@ class IVTraceGUI:
                                           command=self._manual_stop)
         self.manual_stop_btn.grid(row=0, column=3)
         ttk.Label(setpoint_box, text="(> 0 — прямое направление, < 0 — обратное, 0 — выключить)",
-                  foreground="gray").grid(row=1, column=0, columnspan=4, sticky="w", pady=(4, 0))
+                  style="Muted.TLabel").grid(row=1, column=0, columnspan=4, sticky="w", pady=(4, 0))
 
         self.manual_status_label = ttk.Label(tab, style="Muted.TLabel", text="Сессия не открыта.")
         self.manual_status_label.grid(row=4, column=0, sticky="w")
@@ -661,14 +841,97 @@ class IVTraceGUI:
         unit = "А" if is_current else "В"
         for lbl in (self.u_start, self.u_stop, self.u_step):
             lbl.configure(text=unit)
-        # Огр. напряжения актуально только для источника тока.
-        self.e_vlimit.configure(state="normal" if is_current else "disabled")
+        # п.33: показываем только то, что реально будет использовано —
+        # огр. напряжения и витки не имеют смысла при возбуждении
+        # напряжением, поэтому прячутся целиком, а не просто гаснут.
+        if is_current:
+            self._vlimit_frame.grid()
+            self._turns_row.grid()
+        else:
+            self._vlimit_frame.grid_remove()
+            self._turns_row.grid_remove()
         self._refresh_profile_list()
+        self._update_sweep_preview()
 
     def _refresh_profile_list(self):
         """п.39-UI: список профилей датчиков в выпадающем списке зависит от текущего типа возбуждения."""
         names = self.sensor_config_mgr.list_sensor_configs(excitation_type=self.excitation_var.get())
         self.e_config_name['values'] = names
+
+    def _on_stop_on_error_change(self):
+        """п.33: порог погрешности виден только когда отсечка реально включена."""
+        if self.stop_on_error_var.get():
+            self._error_threshold_row.grid()
+        else:
+            self._error_threshold_row.grid_remove()
+
+    def _on_branch_change(self):
+        """п.33: схема прохода имеет смысл только при полярности «both»."""
+        if self.branch_var.get() == Branch.BOTH.value:
+            self._preset_row.grid()
+        else:
+            self._preset_row.grid_remove()
+
+    def _set_branch_safe(self, raw):
+        """
+        Загруженный профиль датчика мог быть сохранён другой версией/руками
+        отредактирован — некорректное значение в readonly Combobox иначе
+        просто повисло бы как нечитаемая строка вместо того, чтобы выпадающий
+        список показывал реальный выбор. Откатываемся на дефолт и явно
+        говорим об этом в журнале — то самое "если прога скорректировала
+        значение, оператор должен увидеть, что именно она выбрала".
+        """
+        try:
+            Branch(raw)
+            self.branch_var.set(raw)
+        except ValueError:
+            self.branch_var.set(Branch.BOTH.value)
+            self._append_log(f"Предупреждение: некорректная полярность в конфиге ('{raw}'), использовано 'both'.\n")
+
+    def _set_preset_safe(self, raw):
+        try:
+            DirectionPreset(raw)
+            self.preset_var.set(raw)
+        except ValueError:
+            self.preset_var.set(DirectionPreset.DIVERGING.value)
+            self._append_log(
+                f"Предупреждение: некорректная схема прохода в конфиге ('{raw}'), использована 'diverging'.\n")
+
+    def _update_sweep_preview(self):
+        """
+        Показывает, что РЕАЛЬНО получится при текущих значениях полей —
+        считается тем же планировщиком (sweep.plan_sweep), что и сам
+        измерительный цикл, а не отдельной, потенциально расходящейся
+        копией той же логики. Отвечает на «а что на самом деле произойдёт»
+        сразу, без необходимости запускать измерение, чтобы это увидеть —
+        включая случаи, когда ввод скорректирован программой (например,
+        обе полярности сходятся в одном общем нуле для diverging/converging).
+        """
+        if not hasattr(self, 'sweep_preview_label'):
+            return
+        try:
+            x_start = float(self.e_start.get().strip().replace(",", "."))
+            x_stop = float(self.e_stop.get().strip().replace(",", "."))
+            x_step = float(self.e_step.get().strip().replace(",", "."))
+            if x_step <= 0:
+                raise ValueError
+            branch = Branch(self.branch_var.get())
+            preset = DirectionPreset(self.preset_var.get())
+            plan = plan_sweep(x_start, x_stop, x_step, branch=branch, preset=preset)
+        except Exception:
+            self.sweep_preview_label.configure(text="— заполните начало/конец/шаг корректными числами —")
+            return
+
+        if not plan:
+            self.sweep_preview_label.configure(text="— развёртка пуста —")
+            return
+
+        unit = "А" if self.excitation_var.get() == "current" else "В"
+        values = [p.x_set for p in plan]
+        shown = " → ".join(f"{v:+g}" if v != 0 else "0" for v in values[:6])
+        if len(values) > 6:
+            shown += " → …"
+        self.sweep_preview_label.configure(text=f"Точек: {len(plan)}  ·  {shown}  {unit}")
 
     def _append_log(self, text):
         self.log.configure(state="normal")
@@ -1155,14 +1418,17 @@ class IVTraceGUI:
         self.e_turns.delete(0, 'end'); self.e_turns.insert(0, str(params.get('turns', 1.0)))
         self.stop_on_error_var.set(params.get('stop_on_error', False))
         self.e_error_threshold.delete(0, 'end'); self.e_error_threshold.insert(0, str(params.get('error_threshold', 1.0)))
-        self.branch_var.set(params.get('branch', Branch.BOTH.value))
-        self.preset_var.set(params.get('preset', DirectionPreset.DIVERGING.value))
+        self._set_branch_safe(params.get('branch', Branch.BOTH.value))
+        self._set_preset_safe(params.get('preset', DirectionPreset.DIVERGING.value))
         self.e_avg_count.delete(0, 'end'); self.e_avg_count.insert(0, str(params.get('averaging_count', DEFAULT_AVERAGING_COUNT)))
         self.e_avg_delay.delete(0, 'end'); self.e_avg_delay.insert(0, str(params.get('averaging_delay', DEFAULT_AVERAGING_DELAY)))
         self.discard_first_var.set(params.get('discard_first', DEFAULT_DISCARD_FIRST))
         self.adaptive_cooling_var.set(params.get('adaptive_cooling', False))
 
         self._on_excitation_change()
+        self._on_stop_on_error_change()
+        self._on_branch_change()
+        self._update_sweep_preview()
         self._append_log(f"Конфиг датчика загружен: {name}\n")
         messagebox.showinfo("Успех", f"Конфиг '{name}' загружен.")
 
