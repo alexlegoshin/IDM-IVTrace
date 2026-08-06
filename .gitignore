@@ -4,7 +4,11 @@
 # Артефакты сборки PyInstaller
 /build/
 /dist/
+/release_pkg/
 *.manifest
+
+# Пишется CI перед сборкой (installer.spec/ivtrace.spec), тег релиза — не коммитим
+/assets/VERSION
 
 # Пользовательские данные измерений
 /data/

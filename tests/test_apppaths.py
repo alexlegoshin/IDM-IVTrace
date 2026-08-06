@@ -58,25 +58,28 @@ def test_write_then_read_install_record_roundtrip(monkeypatch, tmp_path):
     _isolate_install_record(monkeypatch, tmp_path)
     chosen = tmp_path / "chosen" / "Legoshi" / "IVTrace"
     chosen.mkdir(parents=True)
-    apppaths.write_install_record(chosen, version="2.0.1")
+    apppaths.write_install_record(chosen, tag="v2.0", release_date="2026-08-10T12:00:00Z")
     record = apppaths.read_install_record()
     assert record['install_root'] == str(chosen)
-    assert record['version'] == "2.0.1"
+    assert record['tag'] == "v2.0"
+    assert record['release_date'] == "2026-08-10T12:00:00Z"
 
 
-def test_write_install_record_defaults_version_to_app_version(monkeypatch, tmp_path):
+def test_write_install_record_defaults_release_date_to_none(monkeypatch, tmp_path):
+    # Офлайн-установка из уже скачанного архива — без обращения к GitHub
+    # API дата релиза неизвестна, апдейтер сравнивает только по тегу.
     _isolate_install_record(monkeypatch, tmp_path)
     chosen = tmp_path / "chosen"
     chosen.mkdir(parents=True)
-    apppaths.write_install_record(chosen)
-    assert apppaths.read_install_record()['version'] == apppaths.APP_VERSION
+    apppaths.write_install_record(chosen, tag="v2.0")
+    assert apppaths.read_install_record()['release_date'] is None
 
 
 def test_install_root_uses_recorded_path_when_it_exists(monkeypatch, tmp_path):
     _isolate_install_record(monkeypatch, tmp_path)
     chosen = tmp_path / "chosen" / "Legoshi" / "IVTrace"
     chosen.mkdir(parents=True)
-    apppaths.write_install_record(chosen)
+    apppaths.write_install_record(chosen, tag="v2.0")
     assert apppaths.install_root() == chosen
 
 
@@ -85,7 +88,7 @@ def test_install_root_falls_back_to_app_root_when_recorded_path_vanished(monkeyp
     # не должно ронять приложение, просто ведём себя как без записи вовсе.
     _isolate_install_record(monkeypatch, tmp_path)
     vanished = tmp_path / "chosen" / "Legoshi" / "IVTrace"
-    apppaths.write_install_record(vanished)  # не создаём саму папку
+    apppaths.write_install_record(vanished, tag="v2.0")  # не создаём саму папку
     assert apppaths.install_root() == apppaths.app_root()
 
 
@@ -93,7 +96,7 @@ def test_config_dir_and_default_data_dir_follow_install_root(monkeypatch, tmp_pa
     _isolate_install_record(monkeypatch, tmp_path)
     chosen = tmp_path / "chosen" / "Legoshi" / "IVTrace"
     chosen.mkdir(parents=True)
-    apppaths.write_install_record(chosen)
+    apppaths.write_install_record(chosen, tag="v2.0")
     assert apppaths.config_dir() == chosen / "config"
     assert apppaths.default_data_dir() == chosen / "data"
 

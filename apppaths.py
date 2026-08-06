@@ -119,11 +119,14 @@ def _install_record_path() -> Path:
 
 def read_install_record() -> Optional[dict]:
     """
-    {'install_root': str, 'version': str} — куда установлено ПО и версия
-    установленного билда (для будущего апдейтера — сравнивать версии перед
-    обновлением), либо None, если записи нет или она повреждена. Отсутствие
-    записи — штатный случай (запуск из исходников или portable exe без
-    инсталлятора), а не ошибка.
+    {'install_root': str, 'tag': str, 'release_date': Optional[str]} — куда
+    установлено ПО, из какого релиза GitHub (тег + ISO-дата публикации,
+    installer_core.fetch_releases) и когда — апдейтеру (Ф6, installer.py)
+    нужны обе величины: тег для обычного сравнения версий, дата — для
+    редкого случая "тот же тег, но релиз на GitHub переопубликован заново"
+    (см. installer_core.is_newer). None, если записи нет или она
+    повреждена. Отсутствие записи — штатный случай (запуск из исходников
+    или portable exe без инсталлятора), а не ошибка.
     """
     path = _install_record_path()
     if not path.exists():
@@ -135,16 +138,22 @@ def read_install_record() -> Optional[dict]:
     return data if isinstance(data, dict) else None
 
 
-def write_install_record(root: Path, version: str = APP_VERSION) -> None:
+def write_install_record(root: Path, tag: str, release_date: Optional[str] = None) -> None:
     """
     Пишет запись "куда установлено ПО" (см. _install_record_path). Вызывает
-    будущий инсталлятор/апдейтер (Ф6) — сегодня этот вызов ничей, функция
-    подготовлена заранее, чтобы её было к чему подключить.
+    инсталлятор/апдейтер (installer.py, Ф6). `tag` — версия релиза GitHub
+    (например "v2.0"), НЕ apppaths.APP_VERSION (тот — отдельный, для меток
+    в профилях датчиков, см. config.py). `release_date` может быть
+    неизвестна (офлайн-установка из уже скачанного архива без обращения к
+    GitHub API) — тогда None, и апдейтер сравнивает только по тегу.
     """
     path = _install_record_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
-        json.dumps({'install_root': str(Path(root)), 'version': version}, indent=4, ensure_ascii=False),
+        json.dumps(
+            {'install_root': str(Path(root)), 'tag': tag, 'release_date': release_date},
+            indent=4, ensure_ascii=False,
+        ),
         encoding='utf-8',
     )
 

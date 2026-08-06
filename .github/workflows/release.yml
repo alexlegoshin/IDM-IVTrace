@@ -1,0 +1,63 @@
+name: Build and release Windows package
+
+# Триггер — push тега vX.Y[...] (см. PLAN_V2.md, "Порядок выпуска": v2.0,
+# впоследствии v2.0-alpha/beta и т.д.). Билд теперь делаем здесь, а не
+# локально — у разработчика нет Windows для PyInstaller-сборки.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write  # нужно softprops/action-gh-release, чтобы создать релиз и приложить архив
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Run test suite (gate — как в build_windows.ps1)
+        run: python -m pytest -q
+
+      - name: Stamp build tag into assets/VERSION
+        shell: pwsh
+        run: Set-Content -Path assets/VERSION -Value "${{ github.ref_name }}" -NoNewline -Encoding utf8
+
+      - name: Build IVTrace.exe (onedir)
+        run: pyinstaller ivtrace.spec --noconfirm
+
+      - name: Build Setup.exe (onefile, инсталлятор/апдейтер)
+        run: pyinstaller installer.spec --noconfirm
+
+      - name: Assemble release archive
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path release_pkg | Out-Null
+          Copy-Item -Path dist/IVTrace -Destination release_pkg/IVTrace -Recurse
+          Copy-Item -Path dist/Setup.exe -Destination release_pkg/Setup.exe
+          Compress-Archive -Path release_pkg/* -DestinationPath "IVTrace-${{ github.ref_name }}-win64.zip"
+
+      - name: Detect pre-release tag
+        id: prerelease
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $isPre = [bool]($tag -match "(?i)(alpha|beta|rc)")
+          "value=$isPre" >> $env:GITHUB_OUTPUT
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: IVTrace-${{ github.ref_name }}-win64.zip
+          generate_release_notes: true
+          prerelease: ${{ steps.prerelease.outputs.value }}
