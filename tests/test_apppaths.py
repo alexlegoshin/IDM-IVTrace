@@ -26,6 +26,79 @@ def test_default_data_dir_under_app_root():
 
 
 # ----------------------------------------------------------------------
+# install_root/read_install_record/write_install_record (Ф6, будущий
+# инсталлятор/апдейтер) — изолируем от настоящей записи на диске
+# (%LOCALAPPDATA%\Legoshi\IVTrace\install_info.json), чтобы тесты не
+# читали/не писали реальную запись на машине, где они запускаются.
+# ----------------------------------------------------------------------
+
+def _isolate_install_record(monkeypatch, tmp_path):
+    monkeypatch.setattr(apppaths, "_install_record_path", lambda: tmp_path / "install_info.json")
+
+
+def test_install_root_defaults_to_app_root_without_record(monkeypatch, tmp_path):
+    _isolate_install_record(monkeypatch, tmp_path)
+    assert apppaths.install_root() == apppaths.app_root()
+
+
+def test_read_install_record_missing_file_returns_none(monkeypatch, tmp_path):
+    _isolate_install_record(monkeypatch, tmp_path)
+    assert apppaths.read_install_record() is None
+
+
+def test_read_install_record_corrupt_file_returns_none(monkeypatch, tmp_path):
+    _isolate_install_record(monkeypatch, tmp_path)
+    path = tmp_path / "install_info.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("{not valid json", encoding='utf-8')
+    assert apppaths.read_install_record() is None
+
+
+def test_write_then_read_install_record_roundtrip(monkeypatch, tmp_path):
+    _isolate_install_record(monkeypatch, tmp_path)
+    chosen = tmp_path / "chosen" / "Legoshi" / "IVTrace"
+    chosen.mkdir(parents=True)
+    apppaths.write_install_record(chosen, version="2.0.1")
+    record = apppaths.read_install_record()
+    assert record['install_root'] == str(chosen)
+    assert record['version'] == "2.0.1"
+
+
+def test_write_install_record_defaults_version_to_app_version(monkeypatch, tmp_path):
+    _isolate_install_record(monkeypatch, tmp_path)
+    chosen = tmp_path / "chosen"
+    chosen.mkdir(parents=True)
+    apppaths.write_install_record(chosen)
+    assert apppaths.read_install_record()['version'] == apppaths.APP_VERSION
+
+
+def test_install_root_uses_recorded_path_when_it_exists(monkeypatch, tmp_path):
+    _isolate_install_record(monkeypatch, tmp_path)
+    chosen = tmp_path / "chosen" / "Legoshi" / "IVTrace"
+    chosen.mkdir(parents=True)
+    apppaths.write_install_record(chosen)
+    assert apppaths.install_root() == chosen
+
+
+def test_install_root_falls_back_to_app_root_when_recorded_path_vanished(monkeypatch, tmp_path):
+    # Инсталлятор записал путь, но папку потом снесли/перенесли руками —
+    # не должно ронять приложение, просто ведём себя как без записи вовсе.
+    _isolate_install_record(monkeypatch, tmp_path)
+    vanished = tmp_path / "chosen" / "Legoshi" / "IVTrace"
+    apppaths.write_install_record(vanished)  # не создаём саму папку
+    assert apppaths.install_root() == apppaths.app_root()
+
+
+def test_config_dir_and_default_data_dir_follow_install_root(monkeypatch, tmp_path):
+    _isolate_install_record(monkeypatch, tmp_path)
+    chosen = tmp_path / "chosen" / "Legoshi" / "IVTrace"
+    chosen.mkdir(parents=True)
+    apppaths.write_install_record(chosen)
+    assert apppaths.config_dir() == chosen / "config"
+    assert apppaths.default_data_dir() == chosen / "data"
+
+
+# ----------------------------------------------------------------------
 # work_dir/cache_dir/app settings (п.23) — изолируем от настоящего
 # config_dir() (%LOCALAPPDATA%), чтобы тесты не читали/не писали реальные
 # пользовательские настройки на машине, где они запускаются.
