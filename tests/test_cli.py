@@ -443,6 +443,37 @@ def test_analyze_parser_flags_default_to_false():
     assert args.estimate_ratio is False
 
 
+# ----------------------------------------------------------------------
+# relay/discover — новые подкоманды (Ф4, п.13/25)
+# ----------------------------------------------------------------------
+
+def test_relay_parser_requires_direction_choice():
+    parser = build_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["relay", "sideways"])
+
+
+def test_relay_parser_accepts_valid_directions():
+    parser = build_parser()
+    for direction in ("forward", "reverse", "off"):
+        args = parser.parse_args(["relay", direction, "--yes"])
+        assert args.direction == direction
+        assert args.yes is True
+
+
+def test_relay_parser_relay_port_optional_and_defaults_to_none():
+    parser = build_parser()
+    args = parser.parse_args(["relay", "off"])
+    assert args.relay_port is None
+    assert args.yes is False
+
+
+def test_discover_subcommand_parses_with_no_extra_args():
+    parser = build_parser()
+    args = parser.parse_args(["discover"])
+    assert args.command == "discover"
+
+
 def test_resolve_measure_params_interactive_full_flow(monkeypatch, tmp_path):
     parser = build_parser()
     args = _measure_args(parser, [])  # ничего не передано флагами

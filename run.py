@@ -234,6 +234,84 @@ def cmd_selftest(args) -> int:
     return 0 if st.ok else 1
 
 
+def cmd_discover(args) -> int:
+    """Разовый поиск приборов и платы реле (Ф4, п.25) — диагностика без запуска измерения."""
+    from apppaths import (
+        multimeter_cfg_dir, voltmeter_cfg_dir, current_source_cfg_dir, voltage_source_cfg_dir,
+    )
+    from discovery import scan_instruments
+    from relay import discover_relay_port
+
+    try:
+        from visa_backend import make_resource_manager
+        rm = make_resource_manager()
+    except RuntimeError as e:
+        print(f"Ошибка VISA: {e}")
+        return 1
+
+    print("=== Поиск приборов ===")
+    found = scan_instruments(rm, {
+        'multimeter': multimeter_cfg_dir(),
+        'voltmeter': voltmeter_cfg_dir(),
+        'current_source': current_source_cfg_dir(),
+        'voltage_source': voltage_source_cfg_dir(),
+    })
+    try:
+        rm.close()
+    except Exception:
+        pass
+
+    if not found:
+        print("Ничего не найдено.")
+    for instr in found:
+        model = instr.config_path.stem if instr.config_path else "не опознан"
+        print(f"  {instr.address}  [{instr.kind}]  {instr.idn}  ->  {model}")
+
+    print("\n=== Поиск платы реле ===")
+    try:
+        port = discover_relay_port()
+        print(f"Плата реле найдена на {port}")
+    except RuntimeError as e:
+        print(f"{e}")
+
+    return 0
+
+
+def cmd_relay(args) -> int:
+    """Ручное управление платой реле напрямую, вне измерительного цикла (Ф4, п.13)."""
+    from relay import RelayController, discover_relay_port
+
+    label = {"forward": "прямое направление (IFW)", "reverse": "обратное направление (IRW)",
+             "off": "разомкнуть (I_0)"}[args.direction]
+    if not args.yes:
+        confirm = input(f"Переключить реле в положение: {label}? (y/n): ").strip().lower()
+        if confirm != 'y':
+            print("Отменено.")
+            return 1
+
+    port = args.relay_port
+    if not port:
+        try:
+            port = discover_relay_port()
+        except RuntimeError as e:
+            print(f"Ошибка: {e}")
+            return 1
+
+    relay = RelayController(port)
+    try:
+        if args.direction == "forward":
+            resp = relay.forward()
+        elif args.direction == "reverse":
+            resp = relay.reverse()
+        else:
+            resp = relay.off()
+        print(f"Реле ({port}): {label} -> {resp}")
+    finally:
+        relay.close()
+
+    return 0
+
+
 def main(argv=None) -> int:
     parser = build_parser(default_data_dir=default_data_dir())
     args = parser.parse_args(argv)
@@ -247,6 +325,10 @@ def main(argv=None) -> int:
         return cmd_analyze(args)
     if args.command == "selftest":
         return cmd_selftest(args)
+    if args.command == "discover":
+        return cmd_discover(args)
+    if args.command == "relay":
+        return cmd_relay(args)
 
     parser.print_help()
     return 1

@@ -5,6 +5,7 @@ import pytest
 from instruments import (
     Multimeter, CurrentSource, VoltageSource,
     find_config_for_idn, discover_instruments, is_overflow_reading, parse_scpi_number,
+    identify_instrument,
 )
 from tests.conftest import FakeVisaResource, FakeResourceManager
 
@@ -707,3 +708,35 @@ def test_discover_instruments_raises_when_source_missing(instruments_dir):
 
     with pytest.raises(RuntimeError, match="источник"):
         discover_instruments(instruments_dir / "multimeters_current", instruments_dir / "current_sources", rm=rm)
+
+
+# ----------------------------------------------------------------------
+# identify_instrument (п.11 — "мигнуть")
+# ----------------------------------------------------------------------
+
+def test_identify_returns_false_when_config_has_no_identify_command():
+    # Ни один реальный конфиг в репозитории пока не объявляет
+    # identify_command (не сочиняем непроверенные SCPI-команды) — это
+    # штатный, ожидаемый случай, не ошибка.
+    rm = FakeResourceManager({"ADDR": FakeVisaResource()})
+    assert identify_instrument(rm, "ADDR", {}) is False
+
+
+def test_identify_sends_configured_command_and_returns_true():
+    res = FakeVisaResource()
+    rm = FakeResourceManager({"ADDR": res})
+    ok = identify_instrument(rm, "ADDR", {"identify_command": "DISP:TEXT 'HELLO'"})
+    assert ok is True
+    assert res.written == ["DISP:TEXT 'HELLO'"]
+
+
+def test_identify_closes_resource_even_if_write_fails():
+    class DyingResource(FakeVisaResource):
+        def write(self, cmd):
+            raise RuntimeError("порт занят")
+
+    res = DyingResource()
+    rm = FakeResourceManager({"ADDR": res})
+    with pytest.raises(RuntimeError):
+        identify_instrument(rm, "ADDR", {"identify_command": "BLINK"})
+    assert res.closed is True

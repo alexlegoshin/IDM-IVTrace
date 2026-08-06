@@ -349,6 +349,35 @@ def find_config_for_idn(idn: str, config_dir: Path) -> Optional[Path]:
     return None
 
 
+def identify_instrument(rm: pyvisa.ResourceManager, address: str, config: dict) -> bool:
+    """
+    «Мигнуть» прибором (п.11) — оператор выбрал адрес в выпадающем списке
+    (п.12) и хочет физически убедиться, какой это прибор на столе.
+
+    Читает необязательное поле `identify_command` из конфига и, если оно
+    есть, один раз отправляет его выбранному прибору. Ни один из
+    json-конфигов в этом репозитории сейчас такую команду не объявляет —
+    универсальной SCPI-команды "мигни" не существует, а какая конкретно
+    команда (если вообще есть) работает на каждой модели стенда, не
+    проверялось на реальном железе (см. PLAN_V2.md: не сочинять
+    неподтверждённые SCPI-команды). Отсутствие поля — не ошибка, просто
+    "для этого прибора не настроено"; True/False сообщает вызывающей
+    стороне (GUI), показывать ли операцию как выполненную или как
+    неподдерживаемую.
+    """
+    cmd = config.get('identify_command')
+    if not cmd:
+        return False
+    instr = rm.open_resource(address)
+    try:
+        instr.encoding = config.get('encoding', 'utf-8')
+        instr.timeout = config.get('timeout', 5000)
+        instr.write(cmd)
+    finally:
+        instr.close()
+    return True
+
+
 def discover_instruments(
     multimeter_dir: Path,
     source_dir: Path,

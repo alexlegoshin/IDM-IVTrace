@@ -26,10 +26,15 @@ from tkinter import ttk, scrolledtext, messagebox
 
 import pandas as pd
 
-from apppaths import default_data_dir, sensor_config_dir
+from apppaths import (
+    default_data_dir, sensor_config_dir,
+    multimeter_cfg_dir, voltmeter_cfg_dir, current_source_cfg_dir, voltage_source_cfg_dir,
+)
 from config import ConfigManager, SensorConfigManager
 from cli import current_sweep_max_abs, make_csv_filename, validate_measure_params
-from limits import relay_current_warning
+from discovery import DiscoveryService
+from instruments import identify_instrument
+from limits import relay_current_warning, relay_current_block_reason
 from measurement import (
     EXCITATION_UNITS,
     DEFAULT_AVERAGING_COUNT, DEFAULT_AVERAGING_DELAY, DEFAULT_DISCARD_FIRST,
@@ -122,16 +127,48 @@ class IVTraceGUI:
         self.skip_selftest_var = tk.BooleanVar(value=bool(getattr(args, "skip_selftest", False)))
         self.excitation_var = tk.StringVar(value="current")
 
+        # Ручной режим вне измерительного цикла (Ф4, п.13/40) — открытая
+        # сессия живёт между кликами (реле/уставка), не одна операция за
+        # вызов, поэтому хранится отдельно от self._session (та — только на
+        # время измерения, см. _measure_worker).
+        self._manual_session = None
+        self._manual_lock = threading.Lock()
+
         self._closing = False
         self._after_id = None
+        self._discovery_after_id = None
 
         self._build_style()
         self._build_ui()
         self._prefill_from_config()
 
+        # Служба обнаружения приборов (Ф4, п.25): фоновые периодические
+        # сканы, UI просто читает последний снимок — то же устройство
+        # взаимодействия поток<->Tk, что и у измерения (события через
+        # очередь/после через root.after, а не прямые вызовы в виджеты из
+        # чужого потока). НЕ участвует в открытии приборов для самого
+        # измерения — тот путь (_resolve_instruments) всегда сканирует
+        # заново, см. discovery.py и PLAN_V2.md, п.25.
+        self.discovery = DiscoveryService(
+            self._make_discovery_rm,
+            config_dirs={
+                'multimeter': multimeter_cfg_dir(),
+                'voltmeter': voltmeter_cfg_dir(),
+                'current_source': current_source_cfg_dir(),
+                'voltage_source': voltage_source_cfg_dir(),
+            },
+        )
+        self.discovery.start()
+        self._discovery_after_id = self.root.after(1000, self._refresh_discovery_ui)
+
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self._after_id = self.root.after(120, self._drain_events)
         self._run_preflight()
+
+    @staticmethod
+    def _make_discovery_rm():
+        from visa_backend import make_resource_manager
+        return make_resource_manager()
 
     # ------------------------------------------------------------------ style
     def _build_style(self):
@@ -217,7 +254,9 @@ class IVTraceGUI:
                         variable=self.excitation_var, command=self._on_excitation_change).grid(row=1, column=0, sticky="w")
 
         # --- output type (ось А-1, независимая от возбуждения: чем датчик
-        # возбуждают — не то же самое, что и то, что он выдаёт на выходе) ---
+        # возбуждают — не то же самое, что и то, что он выдаёт на выходе;
+        # действительны любые сочетания — ток/ток, ток/напряжение,
+        # напряжение/ток, напряжение/напряжение) ---
         ttk.Separator(exc, orient="horizontal").grid(row=2, column=0, sticky="ew", pady=(8, 6))
         out_row = ttk.Frame(exc)
         out_row.grid(row=3, column=0, sticky="w")
@@ -227,6 +266,8 @@ class IVTraceGUI:
             out_row, textvariable=self.output_var, state="readonly", width=10,
             values=["current", "voltage"],
         ).pack(side="left")
+        ttk.Label(exc, text="выход «напряжение» — BETA, не проверено на реальном стенде",
+                  foreground="gray").grid(row=4, column=0, sticky="w", pady=(4, 0))
 
         # --- numeric params ---
         pf = ttk.Labelframe(left, text="Параметры измерения", padding=10)
@@ -255,13 +296,22 @@ class IVTraceGUI:
         self.e_label = ttk.Entry(pf)
         self.e_label.grid(row=9, column=1, columnspan=2, sticky="ew", pady=(6, 0))
 
-        # --- optional instrument addresses ---
+        # --- optional instrument addresses (п.12: выпадающий список найденных
+        # приборов вместо пустого поля ручного ввода; поле остаётся
+        # редактируемым — на случай, если что-то ещё не попало в скан) ---
         adv = ttk.Labelframe(left, text="Приборы (необязательно, иначе автопоиск)", padding=10)
         adv.grid(row=2, column=0, sticky="ew", pady=(10, 0))
         adv.columnconfigure(1, weight=1)
-        self.e_dmm = self._addr_row(adv, 0, "Мультиметр VISA")
-        self.e_src = self._addr_row(adv, 1, "Источник VISA")
+        self.e_dmm, btn_dmm = self._combo_addr_row(adv, 0, "Мультиметр VISA")
+        btn_dmm.configure(command=lambda: self._do_blink('dmm'))
+        self.e_src, btn_src = self._combo_addr_row(adv, 1, "Источник VISA")
+        btn_src.configure(command=lambda: self._do_blink('src'))
         self.e_relay = self._addr_row(adv, 2, "Порт реле (COMx)")
+
+        self.discovery_status_label = ttk.Label(adv, style="Muted.TLabel", text="Поиск приборов…")
+        self.discovery_status_label.grid(row=3, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        ttk.Button(adv, text="Обновить список", command=self._rescan_discovery_now).grid(
+            row=4, column=0, columnspan=2, sticky="w", pady=(4, 0))
 
         # --- additional options ---
         opts = ttk.Labelframe(left, text="Дополнительные опции", padding=10)
@@ -353,6 +403,34 @@ class IVTraceGUI:
         entry = ttk.Entry(parent)
         entry.grid(row=row, column=1, sticky="ew", pady=3, padx=(8, 0))
         return entry
+
+    def _combo_addr_row(self, parent, row, label):
+        """
+        Как _addr_row, но выпадающий список (п.12) вместо пустого поля —
+        заполняется найденными приборами (см. _refresh_discovery_ui). Поле
+        остаётся редактируемым (state="normal", не "readonly"): скан мог
+        ещё не найти нужный прибор, и поручать оператору набрать адрес
+        руками в этом случае — не регресс, а разумный запасной путь.
+        Рядом — кнопка «Мигнуть» (п.11).
+        """
+        ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", pady=3)
+        combo = ttk.Combobox(parent, state="normal")
+        combo.grid(row=row, column=1, sticky="ew", pady=3, padx=(8, 6))
+        blink_btn = ttk.Button(parent, text="Мигнуть", width=9)
+        blink_btn.grid(row=row, column=2, pady=3)
+        return combo, blink_btn
+
+    @staticmethod
+    def _combo_address(combo) -> str:
+        """
+        Значение поля может быть либо адресом, набранным вручную, либо
+        строкой из выпадающего списка вида "АДРЕС — конфиг" (см.
+        _refresh_discovery_ui) — оттуда нужен только сам адрес.
+        """
+        text = combo.get().strip()
+        if not text:
+            return ""
+        return text.split(" — ", 1)[0].strip()
 
     def _build_right(self, parent):
         right = ttk.Frame(parent)
@@ -464,7 +542,63 @@ class IVTraceGUI:
                                         "Либо откройте любой CSV кнопкой выше.")
         self.plot_hint.grid(row=0, column=0)
 
+        self._build_manual_tab(nb)
+
         self.notebook = nb
+
+    # ---------------------------------------------------------- manual control
+    def _build_manual_tab(self, nb):
+        """
+        Вкладка «Ручное управление» (Ф4, п.13 — реле напрямую, п.40 — прямая
+        знаковая уставка). Отдельно от измерительного цикла: сессия
+        открывается один раз («Открыть сессию») и держится, пока оператор
+        не закроет её или не нажмёт аварийный «СТОП» — тот же путь
+        безопасности (SessionHandle.emergency_stop), что и у измерения.
+        """
+        tab = ttk.Frame(nb, padding=10)
+        nb.add(tab, text="  Ручное управление  ")
+        tab.columnconfigure(0, weight=1)
+
+        warn = ttk.Label(
+            tab, style="Muted.TLabel", wraplength=520, justify="left",
+            text="Вне измерительного цикла: держит уставку/положение реле до явной остановки. "
+                 "Уважает лимиты платы реле (жёсткий запрет 800 А) и аварийный останов.",
+        )
+        warn.grid(row=0, column=0, sticky="w", pady=(0, 10))
+
+        session_bar = ttk.Frame(tab)
+        session_bar.grid(row=1, column=0, sticky="w", pady=(0, 10))
+        self.manual_open_btn = ttk.Button(session_bar, text="Открыть сессию", command=self._manual_open_session)
+        self.manual_open_btn.pack(side="left", padx=(0, 6))
+        self.manual_close_btn = ttk.Button(session_bar, text="Закрыть сессию",
+                                           command=self._manual_close_session, state="disabled")
+        self.manual_close_btn.pack(side="left")
+
+        relay_box = ttk.Labelframe(tab, text="Реле напрямую", padding=10)
+        relay_box.grid(row=2, column=0, sticky="ew", pady=(0, 10))
+        self.manual_relay_buttons = []
+        for text, direction in (("Прямо (IFW)", "forward"), ("Обратно (IRW)", "reverse"), ("Выкл (I_0)", "off")):
+            btn = ttk.Button(relay_box, text=text, state="disabled",
+                             command=lambda d=direction: self._manual_set_relay(d))
+            btn.pack(side="left", padx=(0, 6))
+            self.manual_relay_buttons.append(btn)
+
+        setpoint_box = ttk.Labelframe(tab, text="Прямая уставка (со знаком)", padding=10)
+        setpoint_box.grid(row=3, column=0, sticky="ew", pady=(0, 10))
+        ttk.Label(setpoint_box, text="Значение").grid(row=0, column=0, sticky="w")
+        self.e_manual_setpoint = ttk.Entry(setpoint_box, width=12, state="disabled")
+        self.e_manual_setpoint.grid(row=0, column=1, sticky="w", padx=(8, 6))
+        self.manual_apply_btn = ttk.Button(setpoint_box, text="Применить", state="disabled",
+                                           command=self._manual_apply_setpoint)
+        self.manual_apply_btn.grid(row=0, column=2, padx=(0, 6))
+        self.manual_stop_btn = ttk.Button(setpoint_box, text="Остановить", state="disabled",
+                                          command=self._manual_stop)
+        self.manual_stop_btn.grid(row=0, column=3)
+        ttk.Label(setpoint_box, text="(> 0 — прямое направление, < 0 — обратное, 0 — выключить)",
+                  foreground="gray").grid(row=1, column=0, columnspan=4, sticky="w", pady=(4, 0))
+
+        self.manual_status_label = ttk.Label(tab, style="Muted.TLabel", text="Сессия не открыта.")
+        self.manual_status_label.grid(row=4, column=0, sticky="w")
 
     # ---------------------------------------------------------------- helpers
     def _prefill_from_config(self):
@@ -535,6 +669,188 @@ class IVTraceGUI:
             self.events.put(("preflight", (st.ok, status, st.output if not st.ok else visa.message)))
         except Exception as e:
             self.events.put(("preflight", (False, "Ошибка проверки", str(e))))
+
+    # -------------------------------------------------------------- discovery
+    def _refresh_discovery_ui(self):
+        """
+        Периодический опрос снимка DiscoveryService (п.25) — так же, как
+        _drain_events опрашивает очередь измерения: сервис живёт в своём
+        потоке и никогда не трогает виджеты напрямую, только через этот
+        цикл на главном потоке Tk.
+        """
+        if self._closing:
+            return
+        self._apply_discovery_state(self.discovery.snapshot())
+        self._discovery_after_id = self.root.after(1000, self._refresh_discovery_ui)
+
+    def _apply_discovery_state(self, state):
+        dmm_kind = 'multimeter' if self.output_var.get() == 'current' else 'voltmeter'
+        src_kind = 'current_source' if self.excitation_var.get() == 'current' else 'voltage_source'
+
+        # Текущее значение поля не затираем (оператор мог начать печатать
+        # адрес руками) — обновляем только список выпадающих вариантов.
+        self.e_dmm['values'] = [i.label for i in state.by_kind(dmm_kind)]
+        self.e_src['values'] = [i.label for i in state.by_kind(src_kind)]
+
+        if state.scanning:
+            status = "Идёт поиск приборов…"
+        elif state.last_scan_error:
+            status = f"Поиск приборов не удался: {state.last_scan_error}"
+        else:
+            status = f"Найдено VISA-приборов: {len(state.instruments)}"
+        status += "  ·  реле: " + (f"{state.relay_port}" if state.relay_port else "не найдено")
+        self.discovery_status_label.configure(text=status)
+
+    def _rescan_discovery_now(self):
+        """Кнопка «Обновить список» — форсирует один скан вне очереди опроса."""
+        threading.Thread(target=self.discovery.rescan_now, daemon=True).start()
+
+    def _do_blink(self, which: str):
+        """
+        «Мигнуть» (п.11): отправляет identify_command выбранному прибору,
+        если он у него в конфиге настроен (у большинства сейчас — нет, см.
+        instruments.identify_instrument — не сочиняем непроверенные SCPI-
+        команды). Ищет конфиг по совпадению адреса с последним снимком
+        обнаружения, а не переоткрывает *IDN? заново.
+        """
+        combo = self.e_dmm if which == 'dmm' else self.e_src
+        addr = self._combo_address(combo)
+        if not addr:
+            messagebox.showinfo("Мигнуть", "Сначала выберите или введите адрес прибора.")
+            return
+        state = self.discovery.snapshot()
+        match = next((i for i in state.instruments if i.address == addr), None)
+        if match is None or match.config_path is None:
+            messagebox.showinfo("Мигнуть", "Прибор по этому адресу пока не опознан сканом — "
+                                           "нечем определить конфиг с командой мигания.")
+            return
+
+        import json as _json
+
+        def worker():
+            try:
+                from visa_backend import make_resource_manager
+                rm = make_resource_manager()
+                cfg = _json.loads(match.config_path.read_text(encoding='utf-8'))
+                ok = identify_instrument(rm, addr, cfg)
+                rm.close()
+            except Exception as e:
+                self.events.put(("log", f"[Мигнуть] Ошибка: {e}\n"))
+                return
+            if ok:
+                self.events.put(("log", f"[Мигнуть] Команда отправлена: {addr} ({match.config_path.stem})\n"))
+            else:
+                self.events.put(("log", f"[Мигнуть] Для {match.config_path.stem} не настроена команда "
+                                        "мигания (identify_command в конфиге отсутствует).\n"))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    # ---------------------------------------------------------- manual control
+    def _manual_log(self, msg: str):
+        self.events.put(("log", msg + "\n"))
+
+    def _manual_open_session(self):
+        if not self._preflight_ok:
+            messagebox.showwarning("Проверка не пройдена",
+                                   "Ручной режим недоступен: не пройдена предполётная проверка (NI-VISA/самотесты).")
+            return
+        excitation_type = self.excitation_var.get()
+        v_limit = None
+        if excitation_type == 'current':
+            try:
+                v_limit = float(self.e_vlimit.get().strip().replace(",", "."))
+                if v_limit <= 0:
+                    raise ValueError
+            except ValueError:
+                messagebox.showerror("Проверьте параметры",
+                                     "Для возбуждения током укажите положительное «Огр. напряжения» в панели параметров.")
+                return
+
+        addr = {
+            "dmm_addr": self._combo_address(self.e_dmm) or None,
+            "src_addr": self._combo_address(self.e_src) or None,
+            "relay_port": self.e_relay.get().strip() or None,
+        }
+        self.manual_open_btn.configure(state="disabled")
+        self.manual_status_label.configure(text="Открываю сессию…")
+        self.discovery.pause()
+
+        def worker():
+            from visa_backend import make_resource_manager
+            from orchestrate import open_manual_control_session
+            try:
+                rm = make_resource_manager()
+                session = open_manual_control_session(
+                    rm, excitation_type, V_limit=v_limit,
+                    dmm_addr=addr["dmm_addr"], src_addr=addr["src_addr"], relay_port=addr["relay_port"],
+                    log=self._manual_log, on_session_open=self._session.set,
+                )
+            except Exception as e:
+                self.discovery.resume()
+                self.events.put(("manual_error", str(e)))
+                return
+            self.events.put(("manual_opened", session))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _manual_close_session(self):
+        with self._manual_lock:
+            session = self._manual_session
+            self._manual_session = None
+        if session is None:
+            return
+        self.manual_close_btn.configure(state="disabled")
+
+        def worker():
+            try:
+                session.stop()
+            except Exception:
+                pass
+            session.close()
+            self._session.clear()
+            self.discovery.resume()
+            self.events.put(("manual_closed", None))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _manual_set_relay(self, direction: str):
+        with self._manual_lock:
+            session = self._manual_session
+        if session is None:
+            return
+        threading.Thread(target=session.set_relay, args=(direction,), daemon=True).start()
+
+    def _manual_apply_setpoint(self):
+        with self._manual_lock:
+            session = self._manual_session
+        if session is None:
+            return
+        try:
+            value = float(self.e_manual_setpoint.get().strip().replace(",", "."))
+        except ValueError:
+            messagebox.showerror("Проверьте значение", "Уставка должна быть числом.")
+            return
+
+        # Жёсткий запрет платы реле (п.28) — та же проверка, что и для
+        # обычной развёртки, здесь на одно число вместо диапазона. Ток
+        # реально идёт через реле только при возбуждении током.
+        if self.excitation_var.get() == 'current':
+            block = relay_current_block_reason(abs(value))
+            if block:
+                messagebox.showerror("Недопустимая уставка", block)
+                return
+            warning = relay_current_warning(abs(value))
+            if warning and not messagebox.askyesno("Подтверждение", f"⚠ {warning}\n\nПродолжить?"):
+                return
+
+        threading.Thread(target=session.apply_setpoint, args=(value,), daemon=True).start()
+
+    def _manual_stop(self):
+        with self._manual_lock:
+            session = self._manual_session
+        if session is None:
+            return
+        threading.Thread(target=session.stop, daemon=True).start()
 
     # -------------------------------------------------------------- sensor config
     def _save_config(self):
@@ -714,10 +1030,13 @@ class IVTraceGUI:
         self._last_measure_params = params
 
         addr = {
-            "dmm_addr": self.e_dmm.get().strip() or None,
-            "src_addr": self.e_src.get().strip() or None,
+            "dmm_addr": self._combo_address(self.e_dmm) or None,
+            "src_addr": self._combo_address(self.e_src) or None,
             "relay_port": self.e_relay.get().strip() or None,
         }
+        # Служба обнаружения (п.25) не должна спорить с измерением за те же
+        # VISA-ресурсы/serial-порт реле — возобновляется в _measure_worker.finally.
+        self.discovery.pause()
         self.worker = threading.Thread(target=self._measure_worker, args=(params, csv_path, addr), daemon=True)
         self.worker.start()
 
@@ -744,6 +1063,7 @@ class IVTraceGUI:
             # Приборы этой сессии закрыты — ручка больше не должна вести на
             # мёртвые сессии, иначе следующий «Стоп» попытается писать в них.
             self._session.clear()
+            self.discovery.resume()
             if rm is not None:
                 try:
                     rm.close()
@@ -1089,10 +1409,29 @@ class IVTraceGUI:
                 handle.emergency_stop()
             except Exception:
                 pass
+        # Открытая ручная сессия (п.13/40) — та же логика: закрытие окна не
+        # должно оставить стенд под током только потому, что оператор не
+        # нажал отдельную кнопку «Остановить» в ручном режиме.
+        with self._manual_lock:
+            manual = self._manual_session
+        if manual is not None:
+            try:
+                manual.emergency_stop()
+            except Exception:
+                pass
         self.stop_event.set()
+        try:
+            self.discovery.stop()
+        except Exception:
+            pass
         if self._after_id is not None:
             try:
                 self.root.after_cancel(self._after_id)
+            except Exception:
+                pass
+        if self._discovery_after_id is not None:
+            try:
+                self.root.after_cancel(self._discovery_after_id)
             except Exception:
                 pass
         if self._current_fig is not None:
@@ -1130,6 +1469,30 @@ class IVTraceGUI:
                     self._set_running(False)
                     self._set_status("Ошибка измерения", "error")
                     messagebox.showerror("Ошибка измерения", payload)
+                elif kind == "manual_opened":
+                    with self._manual_lock:
+                        self._manual_session = payload
+                    self.manual_close_btn.configure(state="normal")
+                    for btn in self.manual_relay_buttons:
+                        btn.configure(state="normal")
+                    self.e_manual_setpoint.configure(state="normal")
+                    self.manual_apply_btn.configure(state="normal")
+                    self.manual_stop_btn.configure(state="normal")
+                    self.manual_status_label.configure(text="Сессия открыта.")
+                elif kind == "manual_error":
+                    self.manual_open_btn.configure(state="normal")
+                    self.manual_status_label.configure(text="Сессия не открыта.")
+                    self._append_log(f"\n✖ Не удалось открыть ручной режим: {payload}\n")
+                    messagebox.showerror("Ошибка ручного режима", payload)
+                elif kind == "manual_closed":
+                    self.manual_open_btn.configure(state="normal")
+                    self.manual_close_btn.configure(state="disabled")
+                    for btn in self.manual_relay_buttons:
+                        btn.configure(state="disabled")
+                    self.e_manual_setpoint.configure(state="disabled")
+                    self.manual_apply_btn.configure(state="disabled")
+                    self.manual_stop_btn.configure(state="disabled")
+                    self.manual_status_label.configure(text="Сессия закрыта.")
         except queue.Empty:
             pass
         if not self._closing:

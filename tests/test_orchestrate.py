@@ -1,6 +1,10 @@
 import pandas as pd
+import pytest
 
-from orchestrate import write_results_csv, _log_calibration_warnings, _resolve_instruments
+from orchestrate import (
+    write_results_csv, _log_calibration_warnings, _resolve_instruments,
+    SessionHandle, ManualControlSession,
+)
 from analysis import _read_metadata, load_and_analyze
 from tests.conftest import FakeVisaResource, FakeResourceManager
 
@@ -82,6 +86,37 @@ def test_explicit_voltage_output_type_is_written_to_header(tmp_path):
     meta = _read_metadata(csv_path)
     assert meta['Тип выхода датчика'] == 'voltage'
     assert meta['Единица измерения выхода'] == 'V'
+
+
+def test_voltage_output_type_gets_beta_note_in_csv(tmp_path):
+    csv_path = tmp_path / "IVtrace_out_beta_20260101_000000.csv"
+    p = _params(); p['output_type'] = 'voltage'
+    write_results_csv(csv_path, _one_row_df(), p, excitation_type='current', unit='A')
+    text = csv_path.read_text(encoding='utf-8')
+    assert 'BETA' in text
+
+
+def test_current_output_type_has_no_beta_note(tmp_path):
+    csv_path = tmp_path / "IVtrace_out_nobeta_20260101_000000.csv"
+    write_results_csv(csv_path, _one_row_df(), _params(), excitation_type='current', unit='A')
+    text = csv_path.read_text(encoding='utf-8')
+    assert 'BETA' not in text
+
+
+def test_all_four_excitation_output_combinations_write_independent_headers(tmp_path):
+    # п. запроса пользователя: возбуждение и выход датчика — независимые
+    # оси, любое сочетание допустимо.
+    for excitation_type, output_type in (
+        ('current', 'current'), ('current', 'voltage'),
+        ('voltage', 'current'), ('voltage', 'voltage'),
+    ):
+        csv_path = tmp_path / f"IVtrace_combo_{excitation_type}_{output_type}_20260101_000000.csv"
+        p = _params(); p['output_type'] = output_type
+        write_results_csv(csv_path, _one_row_df(), p, excitation_type=excitation_type,
+                          unit='A' if excitation_type == 'current' else 'V')
+        meta = _read_metadata(csv_path)
+        assert meta['Тип возбуждения'] == excitation_type
+        assert meta['Тип выхода датчика'] == output_type
 
 
 def test_resolve_instruments_uses_ammeter_role_dir_by_default(instruments_dir):
@@ -302,3 +337,179 @@ def test_log_notifies_for_unknown_alongside_overdue_as_separate_lines():
     assert len(lines) == 2
     assert any(l.startswith('ℹ') and 'Без даты' in l for l in lines)
     assert any(l.startswith('⚠') and 'Просрочен' in l for l in lines)
+
+
+# ----------------------------------------------------------------------
+# ManualControlSession (Ф4, п.13 — ручное реле, п.40 — прямая уставка)
+# ----------------------------------------------------------------------
+
+class _FakeManualSrc:
+    def __init__(self):
+        self.calls = []
+        self.current_setpoints = []
+        self.voltage_setpoints = []
+
+    def setup(self, voltage_limit, slew_rate=10.0):
+        self.calls.append(('setup', voltage_limit))
+
+    def set_current(self, current):
+        self.current_setpoints.append(current)
+        self.calls.append(('set_current', current))
+
+    def set_voltage(self, voltage):
+        self.voltage_setpoints.append(voltage)
+        self.calls.append(('set_voltage', voltage))
+
+    def output_on(self):
+        self.calls.append(('output_on',))
+
+    def output_off(self):
+        self.calls.append(('output_off',))
+
+    def shutdown(self):
+        self.calls.append(('shutdown',))
+
+
+class _FakeManualRelay:
+    def __init__(self):
+        self.calls = []
+
+    def forward(self):
+        self.calls.append('forward')
+        return 'OK'
+
+    def reverse(self):
+        self.calls.append('reverse')
+        return 'OK'
+
+    def off(self):
+        self.calls.append('off')
+        return 'OK'
+
+
+class _FakeManualDmm:
+    def __init__(self, readings=None):
+        self.readings = list(readings or [])
+
+    def measure(self):
+        if not self.readings:
+            raise RuntimeError("нет заготовленных показаний")
+        return self.readings.pop(0)
+
+
+def _make_manual_session(excitation_type='current', with_dmm=True):
+    handle = SessionHandle()
+    handle.src = _FakeManualSrc()
+    handle.relay = _FakeManualRelay()
+    handle.dmm = _FakeManualDmm([0.1, 0.2]) if with_dmm else None
+    return ManualControlSession(handle, excitation_type, log=lambda msg: None), handle
+
+
+def test_set_relay_forward_reverse_off_call_the_right_relay_method():
+    session, handle = _make_manual_session()
+    session.set_relay('forward')
+    session.set_relay('reverse')
+    session.set_relay('off')
+    assert handle.relay.calls == ['forward', 'reverse', 'off']
+
+
+def test_set_relay_rejects_unknown_direction():
+    session, _ = _make_manual_session()
+    with pytest.raises(ValueError):
+        session.set_relay('sideways')
+
+
+def test_apply_setpoint_positive_value_drives_forward_and_sets_current():
+    session, handle = _make_manual_session('current')
+    session.apply_setpoint(5.0)
+    assert handle.relay.calls == ['forward']
+    assert handle.src.current_setpoints == [5.0]
+    assert ('output_on',) in handle.src.calls
+
+
+def test_apply_setpoint_negative_value_drives_reverse_with_positive_magnitude():
+    session, handle = _make_manual_session('current')
+    session.apply_setpoint(-5.0)
+    assert handle.relay.calls == ['reverse']
+    assert handle.src.current_setpoints == [5.0]  # магнитуда, не -5.0 — знак кодирует реле, не уставка
+
+
+def test_apply_setpoint_voltage_excitation_calls_set_voltage():
+    session, handle = _make_manual_session('voltage')
+    session.apply_setpoint(12.0)
+    assert handle.src.voltage_setpoints == [12.0]
+
+
+def test_apply_setpoint_zero_stops_instead_of_touching_relay():
+    # Симметрично точке X=0 в измерительном цикле: реле не трогается ради
+    # нулевого сигнала (см. measurement._measure_zero_row).
+    session, handle = _make_manual_session()
+    session.apply_setpoint(0.0)
+    assert handle.relay.calls == ['off']
+    assert ('shutdown',) in handle.src.calls
+
+
+def test_apply_setpoint_does_not_reswitch_relay_when_direction_unchanged():
+    session, handle = _make_manual_session()
+    session.apply_setpoint(5.0)
+    session.apply_setpoint(7.0)
+    assert handle.relay.calls == ['forward']  # реле переключено только один раз
+    assert handle.src.current_setpoints == [5.0, 7.0]
+
+
+def test_apply_setpoint_switches_relay_when_sign_flips():
+    session, handle = _make_manual_session()
+    session.apply_setpoint(5.0)
+    session.apply_setpoint(-3.0)
+    assert handle.relay.calls == ['forward', 'reverse']
+
+
+def test_stop_zeroes_source_and_opens_relay():
+    session, handle = _make_manual_session()
+    session.apply_setpoint(5.0)
+    session.stop()
+    assert ('shutdown',) in handle.src.calls
+    assert handle.relay.calls[-1] == 'off'
+
+
+def test_read_returns_dmm_measurement_when_dmm_present():
+    session, _ = _make_manual_session(with_dmm=True)
+    assert session.read() == 0.1
+    assert session.read() == 0.2
+
+
+def test_read_returns_none_when_dmm_absent():
+    session, _ = _make_manual_session(with_dmm=False)
+    assert session.read() is None
+
+
+def test_read_returns_none_instead_of_raising_on_dmm_error():
+    session, handle = _make_manual_session(with_dmm=True)
+    handle.dmm.readings = []  # следующий measure() бросит исключение
+    assert session.read() is None
+
+
+def test_emergency_stop_delegates_to_session_handle():
+    session, handle = _make_manual_session()
+    calls = []
+    handle.emergency_stop = lambda log=None: calls.append(log) or ["выключено"]
+    result = session.emergency_stop()
+    assert result == ["выключено"]
+    assert calls == [None]
+
+
+def test_close_closes_every_open_instrument():
+    session, handle = _make_manual_session(with_dmm=True)
+    closed = []
+    handle.dmm.close = lambda: closed.append('dmm')
+    handle.src.close = lambda: closed.append('src')
+    handle.relay.close = lambda: closed.append('relay')
+    session.close()
+    assert set(closed) == {'dmm', 'src', 'relay'}
+
+
+def test_close_tolerates_missing_dmm():
+    session, handle = _make_manual_session(with_dmm=False)
+    handle.src.close = lambda: None
+    handle.relay.close = lambda: None
+    session.close()  # не должно бросить исключение из-за handle.dmm is None

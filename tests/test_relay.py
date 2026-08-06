@@ -131,6 +131,28 @@ def test_discover_relay_port_raises_when_no_ports_available():
         discover_relay_port(candidate_ports=[])
 
 
+def test_discover_relay_port_quiet_suppresses_output(monkeypatch, capsys):
+    # Нужно фоновой службе обнаружения (п.25) — не спамить консоль на
+    # каждом периодическом опросе.
+    responses = {"COM1": b'OK\r\n'}
+
+    def fake_serial_ctor(port, baudrate, timeout):
+        return type("S", (), {
+            "reset_input_buffer": lambda self: None,
+            "write": lambda self, data: None,
+            "in_waiting": len(responses[port]),
+            "read": lambda self, n, _p=port: responses[_p][:n],
+            "close": lambda self: None,
+        })()
+
+    monkeypatch.setattr(relay.serial, "Serial", fake_serial_ctor)
+
+    port = discover_relay_port(candidate_ports=["COM1"], quiet=True)
+    assert port == "COM1"
+    captured = capsys.readouterr()
+    assert captured.out == ""
+
+
 def test_list_candidate_ports_returns_list():
     # Не проверяем содержимое (зависит от машины), только что не падает
     # и возвращает список.

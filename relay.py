@@ -134,19 +134,29 @@ def list_candidate_ports() -> List[str]:
     return [p.device for p in list_ports.comports()]
 
 
-def discover_relay_port(candidate_ports: Optional[List[str]] = None) -> str:
+def discover_relay_port(candidate_ports: Optional[List[str]] = None, quiet: bool = False) -> str:
     """
     Перебирает доступные serial-порты, пытаясь на каждом дождаться загрузки
     платы и получить осмысленный ответ на BEN (содержащий 'OK').
+
+    quiet — не печатать ход перебора в stdout. Нужно фоновой службе
+    обнаружения (п.25, см. discovery.py): она может дёргать эту функцию
+    периодически, и обычный печатный вывод, уместный при однократном ручном
+    поиске (CLI/GUI-лог измерения), в фоне был бы просто спамом в консоль,
+    не привязанным ни к какому конкретному действию оператора.
 
     Возвращает имя найденного порта. Бросает RuntimeError, если ничего не найдено.
     """
     ports = candidate_ports if candidate_ports is not None else list_candidate_ports()
 
+    def _say(msg):
+        if not quiet:
+            print(msg)
+
     if not ports:
         raise RuntimeError("Не найдено ни одного serial-порта. Проверьте подключение платы реле.")
 
-    print("Поиск платы реле...")
+    _say("Поиск платы реле...")
     for port in ports:
         try:
             ser = serial.Serial(port, baudrate=BAUDRATE, timeout=RESPONSE_TIMEOUT)
@@ -155,12 +165,12 @@ def discover_relay_port(candidate_ports: Optional[List[str]] = None) -> str:
             ser.write(b'BEN\r\n')
             resp = _read_response(ser)
             ser.close()
-            print(f"  {port}  ->  {resp!r}")
+            _say(f"  {port}  ->  {resp!r}")
             if 'OK' in resp.upper():
-                print(f"\nПлата реле найдена на {port}\n")
+                _say(f"\nПлата реле найдена на {port}\n")
                 return port
         except Exception as e:
-            print(f"  {port}  ->  Ошибка при опросе: {e}")
+            _say(f"  {port}  ->  Ошибка при опросе: {e}")
 
     raise RuntimeError(
         "Не удалось обнаружить плату реле ни на одном порту. "

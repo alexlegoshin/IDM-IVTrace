@@ -46,6 +46,24 @@ def build_parser(default_data_dir: Path = Path("data")) -> argparse.ArgumentPars
         help="Прогнать виртуальные самотесты и проверку NI-VISA, вывести отчёт и выйти",
     )
 
+    # ---------------- discover ----------------
+    subparsers.add_parser(
+        "discover",
+        help="Разовый поиск приборов и платы реле (Ф4, п.25) — диагностика без запуска измерения",
+    )
+
+    # ---------------- relay ----------------
+    p_relay = subparsers.add_parser(
+        "relay",
+        help="Ручное управление платой реле напрямую, вне измерительного цикла (Ф4, п.13)",
+    )
+    p_relay.add_argument("direction", choices=["forward", "reverse", "off"],
+                         help="forward — прямое направление (IFW), reverse — обратное (IRW), off — разомкнуть (I_0)")
+    p_relay.add_argument("--relay-port", type=str, default=None,
+                         help="Serial-порт платы реле, например COM3 (пропустить автоопределение)")
+    p_relay.add_argument("--yes", action="store_true",
+                         help="Не спрашивать подтверждения перед переключением")
+
     # ---------------- measure ----------------
     p_measure = subparsers.add_parser(
         "measure",
@@ -58,7 +76,8 @@ def build_parser(default_data_dir: Path = Path("data")) -> argparse.ArgumentPars
     p_measure.add_argument(
         "--output", choices=["current", "voltage"], default=None,
         help="Что измеряет мультиметр на выходе датчика: current (по умолчанию, амперметр) "
-             "или voltage (вольтметр) — независимо от --excitation (ось А-1, PLAN_V2.md)",
+             "или voltage (вольтметр, BETA — не проверено на реальном стенде) — независимо "
+             "от --excitation, любая комбинация допустима (ось А-1, PLAN_V2.md)",
     )
     p_measure.add_argument("--start", type=float, help="Начальное значение возбуждения (обычно 0)")
     p_measure.add_argument("--stop", type=float, help="Конечное значение возбуждения")
