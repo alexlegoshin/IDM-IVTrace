@@ -1,5 +1,6 @@
 {
     "model_name": "AKIP-2101 / Siglent SDM3055",
+    "model_id": "akip2101",
     "keywords": ["AKIP-2101", "SIGLENT"],
     "timeout": 5000,
     "encoding": "utf-8",
@@ -12,5 +13,6 @@
     "manual_range": false,
     "disable_autorange_command": "SENS:CURR:DC:RANG:AUTO OFF",
     "range_command": "SENS:CURR:DC:RANG {range_val}",
-    "ranges": [0.0002, 0.002, 0.02, 0.2, 2.0, 10.0]
+    "ranges": [0.0002, 0.002, 0.02, 0.2, 2.0, 10.0],
+    "identify_notes": "identify_command (п.11, «Мигнуть») НЕ настроен — проверено по официальному Siglent SDM Series Digital Multimeter Programming Guide (SYSTem subsystem): у этой линейки (SDM3055/SDM3045/SDM3065) в SCPI есть только 'SYSTem:BEEPer:STATe {ON|1|OFF|0}' — постоянный тумблер звука при continuity/diode/Probe Hold измерениях, привязанный к событию измерения, а не команда 'пикни прямо сейчас' по требованию. Честный вывод: у этого прибора нет verified способа мигнуть/пикнуть по одной команде — не сочиняем несуществующую."
 }

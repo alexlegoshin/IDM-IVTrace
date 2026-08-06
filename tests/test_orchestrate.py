@@ -1,12 +1,23 @@
 import pandas as pd
 import pytest
 
+import calibration
+import orchestrate
 from orchestrate import (
     write_results_csv, _log_calibration_warnings, _resolve_instruments,
-    SessionHandle, ManualControlSession,
+    SessionHandle, ManualControlSession, run_measurement_session,
 )
 from analysis import _read_metadata, load_and_analyze
 from tests.conftest import FakeVisaResource, FakeResourceManager
+
+
+def _set_registry(monkeypatch, records):
+    """
+    Подменяет calibration.load_registry() на фиксированный список записей —
+    изолирует тесты от реального instrument_registry.json на диске (см.
+    тот же приём в test_apppaths.py для config_dir).
+    """
+    monkeypatch.setattr(calibration, 'load_registry', lambda path=None: records)
 
 
 def _params():
@@ -151,6 +162,131 @@ def test_resolve_instruments_uses_voltmeter_role_dir_when_requested(instruments_
 
 
 # ----------------------------------------------------------------------
+# run_measurement_session — Branch.NO_RELAY (feature "No Relay"): не
+# должен даже пытаться искать/открывать плату реле в этом режиме.
+# ----------------------------------------------------------------------
+
+class _FakeInstrument:
+    """Заглушка Multimeter/CurrentSource для сквозного теста session — не
+    измеряет ничего осмысленного, только не падает и не трогает реле."""
+    ranges = [1.0]
+
+    def __init__(self, *args, **kwargs):
+        self.config = {'model_name': 'Fake', 'model_id': 'fake'}
+        self.current_range_idx = 0
+
+    def setup(self, **kwargs):
+        pass
+
+    def set_current(self, value):
+        pass
+
+    def set_voltage(self, value):
+        pass
+
+    def output_on(self):
+        pass
+
+    def output_off(self):
+        pass
+
+    def shutdown(self):
+        pass
+
+    def measure(self):
+        return 0.0
+
+    def auto_range(self, *args, **kwargs):
+        pass
+
+    def set_range(self, *args, **kwargs):
+        pass
+
+    def close(self):
+        pass
+
+
+def test_no_relay_branch_never_discovers_or_constructs_relay(tmp_path, monkeypatch):
+    _set_registry(monkeypatch, [])
+    relay_touch_log = []
+
+    def fake_discover_relay_port(*args, **kwargs):
+        relay_touch_log.append('discover_relay_port')
+        raise RuntimeError("не должно вызываться в режиме no_relay")
+
+    class _FakeRelayController:
+        def __init__(self, *args, **kwargs):
+            relay_touch_log.append('RelayController()')
+
+    monkeypatch.setattr(orchestrate, 'Multimeter', _FakeInstrument)
+    monkeypatch.setattr(orchestrate, 'CurrentSource', _FakeInstrument)
+    monkeypatch.setattr(orchestrate, 'discover_relay_port', fake_discover_relay_port)
+    monkeypatch.setattr(orchestrate, 'RelayController', _FakeRelayController)
+
+    rm = FakeResourceManager({
+        "DMM": FakeVisaResource(idn="AKIP-2101"),
+        "SRC": FakeVisaResource(idn="ITECH IT-M3130"),
+    })
+    csv_path = tmp_path / "IVtrace_norelay_20260101_000000.csv"
+    params = {
+        'excitation_type': 'current', 'output_type': 'current',
+        'X_start': 0.0, 'X_stop': 2.0, 'X_step': 1.0,
+        'V_limit': 5.0, 'I_limit': None, 'delay': 0, 'cooling_delay': 0,
+        'branch': 'no_relay', 'label': 'NoRelayTest',
+        'suppress_notifications': True,
+    }
+
+    df = run_measurement_session(rm, params, csv_path, dmm_addr="DMM", src_addr="SRC")
+
+    assert relay_touch_log == []  # ни discover_relay_port, ни RelayController() не вызывались
+    assert len(df) == 3  # 0, 1, 2
+
+
+def test_custom_program_plan_overrides_x_start_stop_step(tmp_path, monkeypatch):
+    _set_registry(monkeypatch, [])
+    monkeypatch.setattr(orchestrate, 'Multimeter', _FakeInstrument)
+    monkeypatch.setattr(orchestrate, 'CurrentSource', _FakeInstrument)
+
+    class _FakeRelayController:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def forward(self):
+            return 'OK'
+
+        def reverse(self):
+            return 'OK'
+
+        def off(self):
+            return 'OK'
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(orchestrate, 'RelayController', _FakeRelayController)
+    monkeypatch.setattr(orchestrate, 'discover_relay_port', lambda *a, **k: 'FAKECOM')
+
+    rm = FakeResourceManager({
+        "DMM": FakeVisaResource(idn="AKIP-2101"),
+        "SRC": FakeVisaResource(idn="ITECH IT-M3130"),
+    })
+    csv_path = tmp_path / "IVtrace_custom_session_20260101_000000.csv"
+    params = {
+        'excitation_type': 'current', 'output_type': 'current',
+        # X_start/X_stop/X_step заведомо другие — custom_program должен
+        # полностью их перекрыть (см. orchestrate.run_measurement_session).
+        'X_start': 999.0, 'X_stop': 999.0, 'X_step': 1.0,
+        'V_limit': 5.0, 'I_limit': None, 'delay': 0, 'cooling_delay': 0,
+        'custom_program': '-25, 40, -15, 5', 'label': 'CustomTest',
+        'suppress_notifications': True,
+    }
+
+    df = run_measurement_session(rm, params, csv_path, dmm_addr="DMM", src_addr="SRC")
+
+    assert list(df['X_set']) == [-25.0, 40.0, -15.0, 5.0]
+
+
+# ----------------------------------------------------------------------
 # write_results_csv — branch/preset/turns в шапке (Ф2 п.8/19/37)
 # ----------------------------------------------------------------------
 
@@ -168,6 +304,27 @@ def test_single_branch_names_which_polarity_was_measured(tmp_path):
     text = csv_path.read_text(encoding='utf-8')
     assert 'Снята только одна полярность (positive)' in text
     assert 'Обе полярности' not in text
+
+
+def test_no_relay_branch_notes_no_commutation_not_relay_board(tmp_path):
+    # Баг-репорт: старый текст для "не both" всегда упоминал "через плату
+    # реле" — неверно для no_relay, где реле физически не используется вовсе.
+    csv_path = tmp_path / "IVtrace_branch_norelay_20260101_000000.csv"
+    p = _params(); p['branch'] = 'no_relay'
+    write_results_csv(csv_path, _one_row_df(), p, excitation_type='current', unit='A')
+    text = csv_path.read_text(encoding='utf-8')
+    assert 'без платы реле' in text
+    assert 'через плату реле' not in text
+
+
+def test_custom_program_noted_in_header_instead_of_range_and_branch(tmp_path):
+    csv_path = tmp_path / "IVtrace_custom_20260101_000000.csv"
+    p = _params(); p['custom_program'] = '-25, 40, -15, 5'
+    write_results_csv(csv_path, _one_row_df(), p, excitation_type='current', unit='A')
+    text = csv_path.read_text(encoding='utf-8')
+    assert 'Кастомная программа измерения: -25, 40, -15, 5' in text
+    assert 'Диапазон заданного возбуждения' not in text
+    assert 'полярность' not in text.lower()
 
 
 def test_non_default_preset_is_noted_only_for_both_branch(tmp_path):
@@ -201,6 +358,40 @@ def test_default_turns_line_absent(tmp_path):
     assert 'витк' not in text.lower()
 
 
+def test_zero_offset_noted_in_header_when_present(tmp_path):
+    csv_path = tmp_path / "IVtrace_offset_20260101_000000.csv"
+    p = _params(); p['zero_offset'] = 0.02
+    write_results_csv(csv_path, _one_row_df(), p, excitation_type='current', unit='A')
+    text = csv_path.read_text(encoding='utf-8')
+    assert '# Смещение нуля: 0.02' in text
+
+
+def test_zero_offset_line_absent_when_zero_or_missing(tmp_path):
+    csv_path = tmp_path / "IVtrace_offset_default_20260101_000000.csv"
+    write_results_csv(csv_path, _one_row_df(), _params(), excitation_type='current', unit='A')
+    text = csv_path.read_text(encoding='utf-8')
+    assert 'Смещение нуля' not in text
+
+
+def test_smooth_ramp_notes_ramp_duration_instead_of_delay_and_cooling(tmp_path):
+    csv_path = tmp_path / "IVtrace_ramp_20260101_000000.csv"
+    p = _params(); p['smooth_ramp'] = True; p['ramp_duration'] = 3.0
+    write_results_csv(csv_path, _one_row_df(), p, excitation_type='current', unit='A')
+    text = csv_path.read_text(encoding='utf-8')
+    assert 'Плавное нарастание тока (BETA)' in text
+    assert '3.0 с' in text
+    assert 'Задержка установки' not in text
+    assert 'Задержка охлаждения' not in text
+
+
+def test_no_smooth_ramp_keeps_delay_and_cooling_lines(tmp_path):
+    csv_path = tmp_path / "IVtrace_noramp_20260101_000000.csv"
+    write_results_csv(csv_path, _one_row_df(), _params(), excitation_type='current', unit='A')
+    text = csv_path.read_text(encoding='utf-8')
+    assert 'Задержка установки' in text
+    assert 'Плавное нарастание' not in text
+
+
 def test_turns_not_mentioned_for_voltage_excitation(tmp_path):
     # Витки не имеют смысла для источника напряжения (см. PLAN_V2.md п.37).
     csv_path = tmp_path / "IVtrace_turns_voltage_20260101_000000.csv"
@@ -220,25 +411,37 @@ def _one_row_df():
     ])
 
 
-def test_instrument_without_calibration_date_notes_it_is_unspecified(tmp_path):
+def test_instrument_without_registry_record_notes_it_is_unspecified(tmp_path, monkeypatch):
+    _set_registry(monkeypatch, [])
     csv_path = tmp_path / "IVtrace_cal_unknown_20260101_000000.csv"
     write_results_csv(
         csv_path, _one_row_df(), _params(), excitation_type='current', unit='A',
-        instrument_configs=[{'model_name': 'Тестовый мультиметр'}],
+        instrument_configs=[{'model_name': 'Тестовый мультиметр', 'model_id': 'test_dmm'}],
     )
     text = csv_path.read_text(encoding='utf-8')
-    assert '# Прибор: Тестовый мультиметр (дата поверки не указана в конфиге)\n' in text
+    assert '# Прибор: Тестовый мультиметр (прибор не заведён в реестре поверки)\n' in text
 
 
-def test_instrument_with_valid_calibration_lists_last_and_next_date(tmp_path):
+def test_instrument_without_model_id_is_also_unspecified(tmp_path, monkeypatch):
+    # Немигрированный конфиг (без model_id) — тот же честный UNKNOWN, не крэш.
+    _set_registry(monkeypatch, [])
+    csv_path = tmp_path / "IVtrace_cal_nomodelid_20260101_000000.csv"
+    write_results_csv(
+        csv_path, _one_row_df(), _params(), excitation_type='current', unit='A',
+        instrument_configs=[{'model_name': 'Без model_id'}],
+    )
+    text = csv_path.read_text(encoding='utf-8')
+    assert '# Прибор: Без model_id (прибор не заведён в реестре поверки)\n' in text
+
+
+def test_instrument_with_valid_calibration_lists_last_and_next_date(tmp_path, monkeypatch):
+    _set_registry(monkeypatch, [calibration.InstrumentRecord(
+        model_id='akip1162', calibration_date='2026-01-01', calibration_interval_months=12,
+    )])
     csv_path = tmp_path / "IVtrace_cal_ok_20260101_000000.csv"
     write_results_csv(
         csv_path, _one_row_df(), _params(), excitation_type='current', unit='A',
-        instrument_configs=[{
-            'model_name': 'АКИП-1162-10-1020',
-            'calibration_date': '2026-01-01',
-            'calibration_interval_months': 12,
-        }],
+        instrument_configs=[{'model_name': 'АКИП-1162-10-1020', 'model_id': 'akip1162'}],
     )
     text = csv_path.read_text(encoding='utf-8')
     assert '# Прибор: АКИП-1162-10-1020\n' in text
@@ -246,32 +449,50 @@ def test_instrument_with_valid_calibration_lists_last_and_next_date(tmp_path):
     assert 'ПРОСРОЧЕНА' not in text
 
 
-def test_overdue_instrument_gets_flagged_in_csv(tmp_path):
+def test_overdue_instrument_gets_flagged_in_csv(tmp_path, monkeypatch):
+    _set_registry(monkeypatch, [calibration.InstrumentRecord(
+        model_id='overdue_dmm', calibration_date='2020-01-01', calibration_interval_months=12,
+    )])
     csv_path = tmp_path / "IVtrace_cal_overdue_20260101_000000.csv"
     write_results_csv(
         csv_path, _one_row_df(), _params(), excitation_type='current', unit='A',
-        instrument_configs=[{
-            'model_name': 'Просроченный прибор',
-            'calibration_date': '2020-01-01',
-            'calibration_interval_months': 12,
-        }],
+        instrument_configs=[{'model_name': 'Просроченный прибор', 'model_id': 'overdue_dmm'}],
     )
     text = csv_path.read_text(encoding='utf-8')
     assert 'ПРОСРОЧЕНА' in text
 
 
-def test_multiple_instruments_each_get_their_own_lines(tmp_path):
+def test_ambiguous_instrument_flagged_when_two_registry_records_for_same_model(tmp_path, monkeypatch):
+    # Два физических прибора одной модели в реестре — по *IDN? не различить,
+    # какой подключён (см. calibration.resolve_calibration_info).
+    _set_registry(monkeypatch, [
+        calibration.InstrumentRecord(model_id='dup_model', serial_number='SN1',
+                                      calibration_date='2026-01-01', calibration_interval_months=12),
+        calibration.InstrumentRecord(model_id='dup_model', serial_number='SN2',
+                                      calibration_date='2026-01-01', calibration_interval_months=12),
+    ])
+    csv_path = tmp_path / "IVtrace_cal_ambiguous_20260101_000000.csv"
+    write_results_csv(
+        csv_path, _one_row_df(), _params(), excitation_type='current', unit='A',
+        instrument_configs=[{'model_name': 'Прибор-двойник', 'model_id': 'dup_model'}],
+    )
+    text = csv_path.read_text(encoding='utf-8')
+    assert 'несколько приборов этой модели' in text
+
+
+def test_multiple_instruments_each_get_their_own_lines(tmp_path, monkeypatch):
+    _set_registry(monkeypatch, [])
     csv_path = tmp_path / "IVtrace_cal_multi_20260101_000000.csv"
     write_results_csv(
         csv_path, _one_row_df(), _params(), excitation_type='current', unit='A',
         instrument_configs=[
-            {'model_name': 'Мультиметр'},
-            {'model_name': 'Источник'},
+            {'model_name': 'Мультиметр', 'model_id': 'test_dmm2'},
+            {'model_name': 'Источник', 'model_id': 'test_src2'},
         ],
     )
     text = csv_path.read_text(encoding='utf-8')
-    assert '# Прибор: Мультиметр (дата поверки не указана в конфиге)\n' in text
-    assert '# Прибор: Источник (дата поверки не указана в конфиге)\n' in text
+    assert '# Прибор: Мультиметр (прибор не заведён в реестре поверки)\n' in text
+    assert '# Прибор: Источник (прибор не заведён в реестре поверки)\n' in text
 
 
 def test_no_instrument_configs_means_no_prib_lines_at_all(tmp_path):
@@ -284,55 +505,75 @@ def test_no_instrument_configs_means_no_prib_lines_at_all(tmp_path):
 
 
 # ----------------------------------------------------------------------
-# _log_calibration_warnings — молчим, пока не станет актуально (Ф1 п.3)
+# _log_calibration_warnings — молчим, пока не станет актуально (Ф1 п.3, реестр — бага 6+7)
 # ----------------------------------------------------------------------
 
-def test_log_stays_silent_for_ok_status():
+def test_log_stays_silent_for_ok_status(monkeypatch):
+    _set_registry(monkeypatch, [calibration.InstrumentRecord(
+        model_id='x', calibration_date='2026-01-01', calibration_interval_months=24,
+    )])
     lines = []
-    _log_calibration_warnings([{
-        'model_name': 'X',
-        'calibration_date': '2026-01-01',
-        'calibration_interval_months': 24,
-    }], lines.append)
+    _log_calibration_warnings([{'model_name': 'X', 'model_id': 'x'}], lines.append)
     assert lines == []
 
 
-def test_log_notifies_when_no_calibration_data_at_all():
-    # UNKNOWN — тоже не молчим: оператор должен узнать, что в конфиге
-    # просто нет даты поверки, а не решить, что раз тихо — значит всё ОК.
+def test_log_notifies_when_not_registered_at_all(monkeypatch):
+    # UNKNOWN — тоже не молчим: оператор должен узнать, что прибор не
+    # заведён в реестре, а не решить, что раз тихо — значит всё ОК.
+    _set_registry(monkeypatch, [])
     lines = []
-    _log_calibration_warnings([{'model_name': 'X'}], lines.append)
+    _log_calibration_warnings([{'model_name': 'X', 'model_id': 'x'}], lines.append)
     assert len(lines) == 1
     assert lines[0].startswith('ℹ')
-    assert 'не указана' in lines[0]
+    assert 'не заведён' in lines[0]
 
 
-def test_log_warns_loudly_when_overdue():
+def test_log_warns_loudly_when_overdue(monkeypatch):
+    _set_registry(monkeypatch, [calibration.InstrumentRecord(
+        model_id='x', calibration_date='2020-01-01', calibration_interval_months=12,
+    )])
     lines = []
-    _log_calibration_warnings([{
-        'model_name': 'X',
-        'calibration_date': '2020-01-01',
-        'calibration_interval_months': 12,
-    }], lines.append)
+    _log_calibration_warnings([{'model_name': 'X', 'model_id': 'x'}], lines.append)
     assert len(lines) == 1
     assert 'ПРОСРОЧЕНА' in lines[0]
 
 
-def test_log_reports_each_instrument_independently():
+def test_log_warns_loudly_when_ambiguous(monkeypatch):
+    _set_registry(monkeypatch, [
+        calibration.InstrumentRecord(model_id='dup', serial_number='SN1'),
+        calibration.InstrumentRecord(model_id='dup', serial_number='SN2'),
+    ])
+    lines = []
+    _log_calibration_warnings([{'model_name': 'X', 'model_id': 'dup'}], lines.append)
+    assert len(lines) == 1
+    assert lines[0].startswith('⚠')
+
+
+def test_log_reports_each_instrument_independently(monkeypatch):
+    _set_registry(monkeypatch, [
+        calibration.InstrumentRecord(model_id='overdue_m', calibration_date='2020-01-01',
+                                      calibration_interval_months=12),
+        calibration.InstrumentRecord(model_id='ok_m', calibration_date='2026-01-01',
+                                      calibration_interval_months=24),
+    ])
     lines = []
     _log_calibration_warnings([
-        {'model_name': 'Просрочен', 'calibration_date': '2020-01-01', 'calibration_interval_months': 12},
-        {'model_name': 'В порядке', 'calibration_date': '2026-01-01', 'calibration_interval_months': 24},
+        {'model_name': 'Просрочен', 'model_id': 'overdue_m'},
+        {'model_name': 'В порядке', 'model_id': 'ok_m'},
     ], lines.append)
     assert len(lines) == 1
     assert 'Просрочен' in lines[0]
 
 
-def test_log_notifies_for_unknown_alongside_overdue_as_separate_lines():
+def test_log_notifies_for_unknown_alongside_overdue_as_separate_lines(monkeypatch):
+    _set_registry(monkeypatch, [
+        calibration.InstrumentRecord(model_id='overdue_m2', calibration_date='2020-01-01',
+                                      calibration_interval_months=12),
+    ])
     lines = []
     _log_calibration_warnings([
-        {'model_name': 'Без даты'},
-        {'model_name': 'Просрочен', 'calibration_date': '2020-01-01', 'calibration_interval_months': 12},
+        {'model_name': 'Без даты', 'model_id': 'no_record_m'},
+        {'model_name': 'Просрочен', 'model_id': 'overdue_m2'},
     ], lines.append)
     assert len(lines) == 2
     assert any(l.startswith('ℹ') and 'Без даты' in l for l in lines)

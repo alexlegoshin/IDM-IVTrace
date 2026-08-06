@@ -102,6 +102,32 @@ def voltage_ceiling_block_reason(max_abs_voltage: Optional[float]) -> Optional[s
     return None
 
 
+# Плавное нарастание (feature "смягчённый пуск тока", BETA) — потолок самой
+# функции, независимый от паспорта источника (1020 А у АКИП-1162) и от
+# жёсткого предела реле (800 А выше): доверия к алгоритму сглаживания на
+# больших токах меньше, чем к простому мгновенному скачку, поэтому потолок
+# заметно ниже обоих остальных пределов. Не подтверждён на реальном стенде.
+SMOOTH_RAMP_MAX_CURRENT_A = 300.0
+
+
+def smooth_ramp_block_reason(max_abs_current_a: Optional[float]) -> Optional[str]:
+    """
+    Возвращает причину отказа, если плавное нарастание запрошено для
+    развёртки с максимальным током выше SMOOTH_RAMP_MAX_CURRENT_A, иначе
+    None. Не имеет отношения к возбуждению напряжением — вызывающая сторона
+    (cli.validate_measure_params) проверяет это только для excitation_type
+    == 'current' и только когда сам режим включён.
+    """
+    if max_abs_current_a is None:
+        return None
+    if max_abs_current_a > SMOOTH_RAMP_MAX_CURRENT_A:
+        return (
+            f"Плавное нарастание (BETA) недоступно при токе выше {SMOOTH_RAMP_MAX_CURRENT_A:.0f} А "
+            f"(запрошено {max_abs_current_a:.1f} А)."
+        )
+    return None
+
+
 def _strictest_source_limits(config_dir: Path, fields: Tuple[str, ...]) -> Dict[str, Optional[float]]:
     """
     Минимум по каждому полю из `fields` среди всех *.json в config_dir.

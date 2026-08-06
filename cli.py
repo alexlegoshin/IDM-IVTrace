@@ -11,6 +11,7 @@ from limits import (
     strictest_current_source_limits,
     strictest_voltage_source_limits,
     voltage_ceiling_block_reason,
+    smooth_ramp_block_reason,
 )
 from measurement import (
     DEFAULT_AVERAGING_COUNT, DEFAULT_AVERAGING_DELAY, DEFAULT_DISCARD_FIRST,
@@ -114,16 +115,23 @@ def build_parser(default_data_dir: Path = Path("data")) -> argparse.ArgumentPars
     p_profile_rename.add_argument("--excitation", choices=["current", "voltage"], default=None)
 
     # ---------------- calibration ----------------
-    p_cal = subparsers.add_parser("calibration", help="Даты поверки приборов (п.3-UI)")
+    p_cal = subparsers.add_parser("calibration", help="Поверка приборов — реестр физических экземпляров (п.3-UI, бага 6/7)")
     cal_sub = p_cal.add_subparsers(dest="calibration_command", required=True)
 
-    cal_sub.add_parser("list", help="Статус поверки всех сконфигурированных приборов")
+    cal_sub.add_parser("list", help="Статус поверки всех известных моделей и заведённых в реестре приборов")
 
-    p_cal_set = cal_sub.add_parser("set", help="Внести дату поверки в конфиг прибора")
-    p_cal_set.add_argument("config_file",
-                           help="Имя json-файла конфига (например akip2101.json) или полный путь к нему — см. calibration list")
+    p_cal_set = cal_sub.add_parser("set", help="Завести/обновить запись поверки прибора в реестре")
+    p_cal_set.add_argument("model_id",
+                           help="Идентификатор модели (см. поле model_id конфига или calibration list)")
+    p_cal_set.add_argument("--serial", default="",
+                           help="Серийный номер физического экземпляра — пусто, если экземпляр единственный")
     p_cal_set.add_argument("--date", required=True, help="Дата последней поверки, ISO YYYY-MM-DD")
     p_cal_set.add_argument("--interval-months", type=int, required=True)
+    p_cal_set.add_argument("--comment", default="")
+
+    p_cal_del = cal_sub.add_parser("delete", help="Удалить запись поверки прибора из реестра")
+    p_cal_del.add_argument("model_id")
+    p_cal_del.add_argument("--serial", default="")
 
     # ---------------- config ----------------
     p_config = subparsers.add_parser("config", help="Настройки приложения (п.23 — рабочая папка)")
@@ -155,11 +163,25 @@ def build_parser(default_data_dir: Path = Path("data")) -> argparse.ArgumentPars
     p_measure.add_argument("--start", type=float, help="Начальное значение возбуждения (обычно 0)")
     p_measure.add_argument("--stop", type=float, help="Конечное значение возбуждения")
     p_measure.add_argument("--step", type=float, help="Шаг возбуждения")
+    p_measure.add_argument(
+        "--custom-program", type=str, default=None,
+        help="Планировщик кастомных программ (BETA): свободный порядок точек/диапазонов через "
+             "запятую, например '-25, 0:40:10, -15, +5' — заменяет --start/--stop/--step/--branch/--preset",
+    )
     p_measure.add_argument("--vlimit", type=float, help="Ограничение напряжения на источнике тока, В (не используется для источника напряжения)")
     p_measure.add_argument("--ilimit", type=float, help="Ограничение тока на источнике напряжения, А (не используется для источника тока)")
     p_measure.add_argument("--delay", type=float, help="Задержка на установку возбуждения, с")
     p_measure.add_argument("--cool", type=float, help="Задержка на охлаждение между точками, с")
     p_measure.add_argument("--label", type=str, help="Комментарий (датчик, пометка)")
+    p_measure.add_argument(
+        "--smooth-ramp", action="store_true",
+        help="Плавное нарастание тока между точками (BETA, только ток, до 300 А) — "
+             "заменяет --delay/--cool, задавайте --ramp-duration",
+    )
+    p_measure.add_argument(
+        "--ramp-duration", type=float, default=None,
+        help="Время перехода между точками при --smooth-ramp, с",
+    )
     p_measure.add_argument(
         "--dmm-addr", type=str, default=None,
         help="VISA-адрес мультиметра (пропустить автоопределение)",
@@ -185,6 +207,10 @@ def build_parser(default_data_dir: Path = Path("data")) -> argparse.ArgumentPars
     p_measure.add_argument(
         "--ratio", type=float, default=None,
         help="Коэффициент преобразования 1:X (передать X)",
+    )
+    p_measure.add_argument(
+        "--zero-offset", type=float, default=None,
+        help="Известное смещение нуля датчика (вычитается при расчёте погрешности)",
     )
     p_measure.add_argument(
         "--error-threshold", type=float, default=None,
@@ -249,6 +275,8 @@ def build_parser(default_data_dir: Path = Path("data")) -> argparse.ArgumentPars
     p_analyze.add_argument("--file", type=Path, default=None, help="Путь к конкретному CSV (по умолчанию — последний в data-dir; п.20)")
     p_analyze.add_argument("--inom", type=float, default=None, help="Номинальный первичный ток датчика, А")
     p_analyze.add_argument("--ratio", type=float, default=None, help="Коэффициент преобразования 1:X (передать X)")
+    p_analyze.add_argument("--zero-offset", type=float, default=None,
+                           help="Смещение нуля датчика — переопределяет значение из шапки CSV, если оно там есть")
     p_analyze.add_argument("--no-show", action="store_true", help="Не открывать окно с графиком (только сохранить PNG)")
     p_analyze.add_argument("--labels", action="store_true", help="Подписывать погрешность над каждой точкой на графике (п.30)")
     p_analyze.add_argument("--xlsx", action="store_true", help="Экспортировать результаты в XLSX рядом с CSV (п.21)")
@@ -278,9 +306,23 @@ def current_sweep_max_abs(params: dict, excitation_type: str) -> Optional[float]
 
     None для возбуждения напряжением или при неполных params — сверять
     нечего.
+
+    custom_program (feature "планировщик кастомных программ") — если
+    задан, X_start/X_stop не имеют смысла вовсе, максимум берётся из
+    разбора самой программы (см. sweep.parse_custom_program). Ошибка
+    разбора здесь не поднимается — просто None (сама ошибка формулируется
+    отдельно, в validate_measure_params, чтобы не дублировать сообщение).
     """
     if excitation_type != 'current':
         return None
+    custom_program = params.get('custom_program')
+    if custom_program:
+        try:
+            from sweep import parse_custom_program
+            values = parse_custom_program(custom_program)
+        except ValueError:
+            return None
+        return max((abs(v) for v in values), default=None)
     X_start, X_stop = params.get('X_start'), params.get('X_stop')
     if X_start is None or X_stop is None:
         return None
@@ -299,14 +341,25 @@ def validate_measure_params(params: dict, excitation_type: str,
     конфигов на диске.
     """
     errors = []
-    if params.get('X_step') is None or params['X_step'] <= 0:
-        errors.append("Шаг возбуждения должен быть положительным числом.")
-    if params.get('X_start') is None or params.get('X_stop') is None:
-        errors.append("Начальное и конечное значения должны быть заданы.")
-    # X_stop < X_start больше НЕ ошибка (п.17): планировщик (sweep.py)
-    # поддерживает любой знак и порядок X_start/X_stop — 250→0 (по модулю
-    # убывающий проход) не менее корректен, чем 0→250. Порядок точек внутри
-    # развёртки определяет sweep.plan_sweep(), не эта проверка.
+    custom_program = params.get('custom_program')
+    if custom_program:
+        # Планировщик кастомных программ (feature): X_start/X_stop/X_step
+        # не имеют смысла вовсе — проверяется сам текст программы, ошибка
+        # разбора (sweep.parse_custom_program) становится ошибкой валидации.
+        from sweep import parse_custom_program
+        try:
+            parse_custom_program(custom_program)
+        except ValueError as e:
+            errors.append(str(e))
+    else:
+        if params.get('X_step') is None or params['X_step'] <= 0:
+            errors.append("Шаг возбуждения должен быть положительным числом.")
+        if params.get('X_start') is None or params.get('X_stop') is None:
+            errors.append("Начальное и конечное значения должны быть заданы.")
+        # X_stop < X_start больше НЕ ошибка (п.17): планировщик (sweep.py)
+        # поддерживает любой знак и порядок X_start/X_stop — 250→0 (по модулю
+        # убывающий проход) не менее корректен, чем 0→250. Порядок точек
+        # внутри развёртки определяет sweep.plan_sweep(), не эта проверка.
     if params.get('turns') is not None and params['turns'] <= 0:
         errors.append("Число витков должно быть положительным числом.")
     if params.get('delay') is not None and params['delay'] < 0:
@@ -317,11 +370,26 @@ def validate_measure_params(params: dict, excitation_type: str,
         errors.append("Ограничение напряжения должно быть положительным числом.")
     if excitation_type == 'voltage' and (params.get('I_limit') is None or params['I_limit'] <= 0):
         errors.append("Ограничение тока должно быть положительным числом.")
+    if excitation_type == 'voltage' and params.get('smooth_ramp'):
+        errors.append("Плавное нарастание (BETA) доступно только для возбуждения током.")
 
     if excitation_type == 'current':
-        block = relay_current_block_reason(current_sweep_max_abs(params, excitation_type))
-        if block:
-            errors.append(block)
+        # Лимиты платы реле (limits.py) — про физические контакты реле,
+        # которых в режиме "No Relay" в цепи попросту нет (стенд без платы
+        # коммутации вовсе, см. sweep.Branch.NO_RELAY) — их проверять
+        # бессмысленно. Паспортный предел самого источника (ниже) остаётся
+        # в силе независимо от режима — это ограничение источника, не реле.
+        if params.get('branch') != Branch.NO_RELAY.value:
+            block = relay_current_block_reason(current_sweep_max_abs(params, excitation_type))
+            if block:
+                errors.append(block)
+
+        if params.get('smooth_ramp'):
+            ramp_block = smooth_ramp_block_reason(current_sweep_max_abs(params, excitation_type))
+            if ramp_block:
+                errors.append(ramp_block)
+            if params.get('ramp_duration') is None or params['ramp_duration'] <= 0:
+                errors.append("Время шага плавного нарастания должно быть положительным числом.")
 
         if current_source_limits is None:
             current_source_limits = strictest_current_source_limits()
@@ -446,6 +514,7 @@ def resolve_measure_params(args, config_mgr: ConfigManager, sensor_config_mgr=No
         'X_start': args.start if args.start is not None else loaded.get('X_start'),
         'X_stop': args.stop if args.stop is not None else loaded.get('X_stop'),
         'X_step': args.step if args.step is not None else loaded.get('X_step'),
+        'custom_program': args.custom_program if args.custom_program is not None else loaded.get('custom_program'),
         'V_limit': args.vlimit if args.vlimit is not None else loaded.get('V_limit'),
         'I_limit': args.ilimit if args.ilimit is not None else loaded.get('I_limit'),
         'delay': args.delay if args.delay is not None else loaded.get('delay'),
@@ -454,6 +523,7 @@ def resolve_measure_params(args, config_mgr: ConfigManager, sensor_config_mgr=No
         # Новые параметры
         'I_nom': args.inom if args.inom is not None else loaded.get('I_nom'),
         'ratio': args.ratio if args.ratio is not None else loaded.get('ratio'),
+        'zero_offset': args.zero_offset if args.zero_offset is not None else loaded.get('zero_offset', 0.0),
         'error_threshold': args.error_threshold if args.error_threshold is not None else loaded.get('error_threshold', 1.0),
         'stop_on_error': args.stop_on_error or loaded.get('stop_on_error', False),
         'branch': args.branch if args.branch is not None else loaded.get('branch', Branch.BOTH.value),
@@ -466,6 +536,8 @@ def resolve_measure_params(args, config_mgr: ConfigManager, sensor_config_mgr=No
         # ВЫКЛЮЧИТЬ отбрасывание первого отсчёта, а включить — конфиг.
         'discard_first': loaded.get('discard_first', DEFAULT_DISCARD_FIRST) and not args.avg_keep_first,
         'adaptive_cooling': args.adaptive_cooling or loaded.get('adaptive_cooling', False),
+        'smooth_ramp': args.smooth_ramp or loaded.get('smooth_ramp', False),
+        'ramp_duration': args.ramp_duration if args.ramp_duration is not None else loaded.get('ramp_duration', 1.0),
         'adaptive_cooling_max_multiplier': (
             args.adaptive_cooling_max_multiplier if args.adaptive_cooling_max_multiplier is not None
             else loaded.get('adaptive_cooling_max_multiplier', DEFAULT_ADAPTIVE_COOLING_MAX_MULTIPLIER)
@@ -479,7 +551,21 @@ def resolve_measure_params(args, config_mgr: ConfigManager, sensor_config_mgr=No
     else:
         params['I_limit'] = 0.0
 
-    numeric_keys = ['X_start', 'X_stop', 'X_step', 'delay', 'cooling_delay']
+    # Планировщик кастомных программ (BETA) заменяет X_start/X_stop/X_step
+    # текстом программы — эти три поля становятся ненужными вовсе. Плавное
+    # нарастание (BETA) заменяет delay/cooling_delay ramp_duration — эти
+    # два переключателя независимы друг от друга (custom_program можно
+    # сочетать со smooth_ramp: план другой, но задержки/охлаждение внутри
+    # плана работают как обычно, если ramp не включён). Проверка полноты
+    # параметров должна спрашивать про НУЖНОЕ для текущей комбинации
+    # режимов, а не про всё сразу.
+    numeric_keys = ['custom_program'] if params.get('custom_program') else ['X_start', 'X_stop', 'X_step']
+    if params.get('smooth_ramp'):
+        numeric_keys.append('ramp_duration')
+        params['delay'] = params.get('delay') or 0.0
+        params['cooling_delay'] = params.get('cooling_delay') or 0.0
+    else:
+        numeric_keys.extend(['delay', 'cooling_delay'])
     if excitation_type == 'current':
         numeric_keys.append('V_limit')
     else:
@@ -508,20 +594,37 @@ def resolve_measure_params(args, config_mgr: ConfigManager, sensor_config_mgr=No
         # Если всё ещё чего-то не хватает — спрашиваем интерактивно
         if not all(params[k] is not None for k in numeric_keys):
             print("\n=== Настройка измерения ===")
-            if params['X_start'] is None:
-                params['X_start'] = _prompt_float(f"Начальное значение возбуждения ({unit}): ")
-            if params['X_stop'] is None:
-                params['X_stop'] = _prompt_float(
-                    f"Конечное значение возбуждения ({unit}): ",
-                    validator=lambda v: v >= params['X_start'],
-                    error_msg=f"Конечное значение должно быть не меньше начального ({params['X_start']} {unit}).",
-                )
-            if params['X_step'] is None:
-                params['X_step'] = _prompt_float(
-                    f"Шаг возбуждения ({unit}): ",
-                    validator=lambda v: v > 0,
-                    error_msg="Шаг возбуждения должен быть положительным числом.",
-                )
+            # Планировщик кастомных программ (BETA) заменяет X_start/X_stop/
+            # X_step текстом программы — эти три поля не спрашиваются вовсе.
+            if params.get('custom_program'):
+                if not params['custom_program']:
+                    while True:
+                        text = input(
+                            "Кастомная программа (например '-25, 0:40:10, -15, +5'): "
+                        ).strip()
+                        try:
+                            from sweep import parse_custom_program
+                            parse_custom_program(text)
+                        except ValueError as e:
+                            print(f"Ошибка: {e}")
+                            continue
+                        params['custom_program'] = text
+                        break
+            else:
+                if params['X_start'] is None:
+                    params['X_start'] = _prompt_float(f"Начальное значение возбуждения ({unit}): ")
+                if params['X_stop'] is None:
+                    params['X_stop'] = _prompt_float(
+                        f"Конечное значение возбуждения ({unit}): ",
+                        validator=lambda v: v >= params['X_start'],
+                        error_msg=f"Конечное значение должно быть не меньше начального ({params['X_start']} {unit}).",
+                    )
+                if params['X_step'] is None:
+                    params['X_step'] = _prompt_float(
+                        f"Шаг возбуждения ({unit}): ",
+                        validator=lambda v: v > 0,
+                        error_msg="Шаг возбуждения должен быть положительным числом.",
+                    )
             if excitation_type == 'current' and params['V_limit'] is None:
                 params['V_limit'] = _prompt_float(
                     "Ограничение напряжения на источнике (В): ",
@@ -534,18 +637,31 @@ def resolve_measure_params(args, config_mgr: ConfigManager, sensor_config_mgr=No
                     validator=lambda v: v > 0,
                     error_msg="Ограничение тока должно быть положительным числом.",
                 )
-            if params['delay'] is None:
-                params['delay'] = _prompt_float(
-                    "Задержка на установку возбуждения (с): ",
-                    validator=lambda v: v >= 0,
-                    error_msg="Задержка не может быть отрицательной.",
-                )
-            if params['cooling_delay'] is None:
-                params['cooling_delay'] = _prompt_float(
-                    "Задержка на охлаждение между точками (с): ",
-                    validator=lambda v: v >= 0,
-                    error_msg="Задержка не может быть отрицательной.",
-                )
+            # Плавное нарастание (BETA) взаимно исключает delay/cooling_delay
+            # (см. measurement.run_measurement) — не спрашиваем их вовсе,
+            # спрашиваем время шага вместо них.
+            if params.get('smooth_ramp'):
+                params['delay'] = 0.0
+                params['cooling_delay'] = 0.0
+                if params.get('ramp_duration') is None:
+                    params['ramp_duration'] = _prompt_float(
+                        "Время перехода между точками при плавном нарастании (с): ",
+                        validator=lambda v: v > 0,
+                        error_msg="Время перехода должно быть положительным числом.",
+                    )
+            else:
+                if params['delay'] is None:
+                    params['delay'] = _prompt_float(
+                        "Задержка на установку возбуждения (с): ",
+                        validator=lambda v: v >= 0,
+                        error_msg="Задержка не может быть отрицательной.",
+                    )
+                if params['cooling_delay'] is None:
+                    params['cooling_delay'] = _prompt_float(
+                        "Задержка на охлаждение между точками (с): ",
+                        validator=lambda v: v >= 0,
+                        error_msg="Задержка не может быть отрицательной.",
+                    )
 
     # I_nom и ratio — необязательные метаданные датчика: без них измерение
     # проводится как обычно, они лишь попадают в шапку CSV. Спрашивать их
@@ -576,7 +692,7 @@ def resolve_measure_params(args, config_mgr: ConfigManager, sensor_config_mgr=No
     # Печатается даже под --yes: это техника безопасности, а не вопрос, на
     # который можно молча ответить "да" за оператора. Единственное, что его
     # гасит, — явный --suppress-warnings (п.38), а не обычный --yes.
-    if not params['suppress_notifications']:
+    if not params['suppress_notifications'] and params.get('branch') != Branch.NO_RELAY.value:
         warning = relay_current_warning(current_sweep_max_abs(params, excitation_type))
         if warning:
             print(f"\n⚠ {warning}\n")

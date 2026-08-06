@@ -90,3 +90,67 @@ def test_load_app_settings_corrupt_file_returns_empty_dict(monkeypatch, tmp_path
     settings_path.parent.mkdir(parents=True)
     settings_path.write_text("{not valid json", encoding='utf-8')
     assert apppaths.load_app_settings() == {}
+
+
+# ----------------------------------------------------------------------
+# clear_results_cache (баг-репорт: "очистка кэша" — CSV/PNG/XLSX + файл
+# параметров последнего запуска в work_dir(), плюс содержимое Cache/;
+# конфиги приборов и профили датчиков живут в других директориях и не
+# должны быть даже видны этой функции).
+# ----------------------------------------------------------------------
+
+def _setup_work_dir(monkeypatch, tmp_path):
+    _isolate_config_dir(monkeypatch, tmp_path)
+    custom = tmp_path / "results"
+    apppaths.set_work_dir(custom)
+    custom.mkdir(parents=True, exist_ok=True)
+    return custom
+
+
+def test_clear_results_cache_removes_result_files_and_last_run_config(monkeypatch, tmp_path):
+    base = _setup_work_dir(monkeypatch, tmp_path)
+    (base / "IVtrace_Sensor1_20260101_120000.csv").write_text("data")
+    (base / "IVtrace_Sensor1_20260101_120000.png").write_bytes(b"png")
+    (base / "IVtrace_Sensor1_20260101_120000.xlsx").write_bytes(b"xlsx")
+    (base / "IVtrace_Sensor1_20260101_120000_inverted.csv").write_text("data")
+    (base / "ivtrace_config.json").write_text("{}")
+
+    removed = apppaths.clear_results_cache()
+
+    assert len(removed) == 5
+    assert list(base.glob("IVtrace_*")) == []
+    assert not (base / "ivtrace_config.json").exists()
+
+
+def test_clear_results_cache_clears_cache_subfolder(monkeypatch, tmp_path):
+    base = _setup_work_dir(monkeypatch, tmp_path)
+    cache = base / "Cache"
+    (cache / "nested").mkdir(parents=True)
+    (cache / "nested" / "temp.png").write_bytes(b"x")
+
+    removed = apppaths.clear_results_cache()
+
+    assert base / "Cache" / "nested" / "temp.png" in removed
+    assert not (cache / "nested" / "temp.png").exists()
+    assert not (cache / "nested").exists()
+    assert cache.is_dir()  # Cache сама остаётся, чистится только содержимое
+
+
+def test_clear_results_cache_does_not_touch_instrument_configs_or_sensor_profiles(monkeypatch, tmp_path):
+    base = _setup_work_dir(monkeypatch, tmp_path)
+    (base / "IVtrace_x.csv").write_text("data")
+
+    sensor_dir = apppaths.sensor_config_dir()
+    sensor_dir.mkdir(parents=True, exist_ok=True)
+    (sensor_dir / "MySensor.json").write_text("{}")
+
+    apppaths.clear_results_cache()
+
+    assert (sensor_dir / "MySensor.json").exists()
+    assert apppaths.multimeter_cfg_dir().is_dir()
+    assert any(apppaths.multimeter_cfg_dir().glob("*.json"))
+
+
+def test_clear_results_cache_on_empty_dirs_removes_nothing(monkeypatch, tmp_path):
+    _setup_work_dir(monkeypatch, tmp_path)
+    assert apppaths.clear_results_cache() == []

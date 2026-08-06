@@ -5,8 +5,9 @@ import pytest
 from measurement import (
     run_measurement, _read_attempts, _read_averaged, _adaptive_cooling_delay,
     EXCITATION_UNITS, OUTPUT_UNITS, estimate_duration_seconds,
+    _ease_in_out, _ramp_steps, SMOOTH_RAMP_MIN_DURATION_FOR_STEPS_S,
 )
-from sweep import Branch, DirectionPreset, plan_sweep
+from sweep import Branch, DirectionPreset, plan_sweep, plan_custom_sweep
 
 
 class FakeDMM:
@@ -286,6 +287,31 @@ def test_branch_negative_never_touches_forward():
 
 
 # ----------------------------------------------------------------------
+# run_measurement — Branch.NO_RELAY (feature "No Relay") — relay=None
+# ----------------------------------------------------------------------
+
+def test_no_relay_runs_with_relay_none_without_crashing():
+    dmm = FakeDMM(readings=[1.0] * 100)
+    src = FakeSource()
+    results, aborted = _run(dmm, src, None, X_start=0, X_stop=2, X_step=1, branch=Branch.NO_RELAY)
+    assert aborted is None
+    assert len(results) == 3  # 0, 1, 2
+
+
+def test_no_relay_never_calls_any_relay_method():
+    # Плата реле физически ОТСУТСТВУЕТ в этом режиме — если бы код всё же
+    # попытался дёрнуть forward/reverse/off, это тут же упало бы на None,
+    # так что сам факт "не упало" уже частично доказывает это, но проверим
+    # явно и через настоящий (не None) объект — методы не должны вызываться
+    # вовсе, даже если релe физически подключено, но выбран этот режим.
+    dmm = FakeDMM(readings=[1.0] * 100)
+    src = FakeSource()
+    relay = FakeRelay()
+    _run(dmm, src, relay, X_start=0, X_stop=2, X_step=1, branch=Branch.NO_RELAY)
+    assert relay.calls == []
+
+
+# ----------------------------------------------------------------------
 # run_measurement — пресеты направления (п.19)
 # ----------------------------------------------------------------------
 
@@ -485,6 +511,58 @@ def test_polarity_mismatch_requires_ratio_to_be_meaningful():
     relay = FakeRelay()
     results, _ = _run(dmm, src, relay, X_start=1, X_stop=1, X_step=1, branch=Branch.POSITIVE)
     assert results[0]['PolarityMismatch'] is False
+
+
+# ----------------------------------------------------------------------
+# zero_offset (feature "offset нуля") — известное смещение нуля датчика
+# ----------------------------------------------------------------------
+
+def test_zero_offset_prevents_false_polarity_mismatch():
+    # Сырое показание -0.3 при положительной уставке само по себе выглядело
+    # бы как перепутанная полярность (см. test_polarity_mismatch_flagged_...
+    # выше), но это ровно тот случай, для которого offset существует: после
+    # вычитания -1.0 корректированное значение положительное.
+    dmm = FakeDMM(readings=[-0.3, -0.3, -0.3, -0.3])
+    src = FakeSource()
+    relay = FakeRelay()
+    results, _ = _run(
+        dmm, src, relay, X_start=1, X_stop=1, X_step=1, branch=Branch.POSITIVE,
+        ratio=1.0, error_threshold=1000.0, zero_offset=-1.0,
+    )
+    assert results[0]['PolarityMismatch'] is False
+
+
+def test_zero_offset_stores_raw_reading_in_y_meas_not_corrected():
+    dmm = FakeDMM(readings=[0.5] * 4)
+    src = FakeSource()
+    relay = FakeRelay()
+    results, _ = _run(dmm, src, relay, X_start=1, X_stop=1, X_step=1, branch=Branch.POSITIVE,
+                       zero_offset=0.2)
+    assert results[0]['Y_meas'] == 0.5  # сырое, поправка не модифицирует данные
+
+
+def test_zero_offset_shifts_error_percent_used_for_rejection():
+    # X_set=1, ratio=1 -> expected=1. Сырое показание 1.2 при zero_offset=0
+    # даёт 20% ошибки (порог 10% -> брак после MAX_MEASUREMENT_ATTEMPTS).
+    # С zero_offset=0.2 корректированное показание 1.0 -> 0% ошибки, точка
+    # принимается сразу, без повторов.
+    dmm = FakeDMM(readings=[1.2] * 4)
+    src = FakeSource()
+    relay = FakeRelay()
+    results, _ = _run(
+        dmm, src, relay, X_start=1, X_stop=1, X_step=1, branch=Branch.POSITIVE,
+        ratio=1.0, error_threshold=10.0, zero_offset=0.2,
+    )
+    assert results[0]['Rejected'] is False
+
+
+def test_zero_offset_defaults_to_zero_and_behaves_as_before():
+    dmm = FakeDMM(readings=[-1.0, -1.0, -1.0, -1.0])
+    src = FakeSource()
+    relay = FakeRelay()
+    results, _ = _run(dmm, src, relay, X_start=1, X_stop=1, X_step=1, branch=Branch.POSITIVE,
+                       ratio=1.0, error_threshold=1000.0)
+    assert results[0]['PolarityMismatch'] is True  # как в test_polarity_mismatch_flagged_..., без offset
 
 
 # ----------------------------------------------------------------------
@@ -719,6 +797,153 @@ def test_suppress_notifications_does_not_affect_polarity_mismatch_data():
 # estimate_duration_seconds (п.15 — только для countdown в GUI)
 # ----------------------------------------------------------------------
 
+# ----------------------------------------------------------------------
+# _ease_in_out / _ramp_steps (feature "плавное нарастание", BETA)
+# ----------------------------------------------------------------------
+
+def test_ease_in_out_boundaries():
+    assert _ease_in_out(0.0) == 0.0
+    assert _ease_in_out(1.0) == 1.0
+
+
+def test_ease_in_out_midpoint_is_half():
+    assert _ease_in_out(0.5) == pytest.approx(0.5, abs=1e-9)
+
+
+def test_ease_in_out_is_monotonically_increasing():
+    xs = [i / 20 for i in range(21)]
+    ys = [_ease_in_out(x) for x in xs]
+    assert all(b >= a for a, b in zip(ys, ys[1:]))
+
+
+def test_ramp_steps_short_duration_is_single_direct_step():
+    # Баг-репорт (прямое указание заказчика): не спамить источник частыми
+    # командами — если времени мало, один прямой переход, без промежуточных.
+    steps = _ramp_steps(0.0, 10.0, SMOOTH_RAMP_MIN_DURATION_FOR_STEPS_S - 0.1)
+    assert steps == [(10.0, 0.0)]
+
+
+def test_ramp_steps_long_duration_batches_roughly_one_command_per_second():
+    steps = _ramp_steps(0.0, 10.0, 5.0)
+    assert len(steps) == 5  # ~1 команда в секунду на переход длиной 5с
+    assert sum(wait for _, wait in steps) == pytest.approx(5.0)
+
+
+def test_ramp_steps_ends_exactly_at_target():
+    steps = _ramp_steps(0.0, 10.0, 5.0)
+    assert steps[-1][0] == 10.0
+
+
+def test_ramp_steps_values_stay_monotonic_between_start_and_target():
+    steps = _ramp_steps(0.0, 10.0, 6.0)
+    values = [v for v, _ in steps]
+    assert all(b >= a for a, b in zip(values, values[1:]))
+    assert all(0.0 <= v <= 10.0 for v in values)
+
+
+def test_ramp_steps_no_op_when_start_equals_target():
+    steps = _ramp_steps(5.0, 5.0, 10.0)
+    assert steps == [(5.0, 0.0)]
+
+
+def test_ramp_steps_handles_descending_transition():
+    steps = _ramp_steps(10.0, 0.0, 5.0)
+    values = [v for v, _ in steps]
+    assert values[-1] == 0.0
+    assert all(b <= a for a, b in zip(values, values[1:]))
+
+
+# ----------------------------------------------------------------------
+# run_measurement — smooth_ramp (feature, BETA)
+# ----------------------------------------------------------------------
+
+def test_smooth_ramp_never_calls_output_off_within_same_branch():
+    # X_start=1 (не 0) — исключает нулевую точку из плана: у неё СВОЯ
+    # логика (_measure_zero_row), которая всегда гасит выход, независимо
+    # от smooth_ramp, — это не про режим и не то, что здесь проверяется.
+    # Один output_off() перед ПЕРВЫМ включением реле — ожидаемая защитная
+    # мера (безвредна, реле ещё ни разу не переключалось); а вот МЕЖДУ
+    # точками ОДНОЙ и той же ветви (после первой) output_off вызываться
+    # не должен вовсе — источник остаётся включённым непрерывно.
+    dmm = FakeDMM(readings=[1.0] * 100)
+    src = FakeSource()
+    relay = FakeRelay()
+    _run(dmm, src, relay, X_start=1, X_stop=2, X_step=1, branch=Branch.POSITIVE,
+         smooth_ramp=True, ramp_duration=0.0)
+    assert src.calls.count(('output_off',)) == 1
+
+
+def test_smooth_ramp_calls_output_on_and_writes_target_setpoint():
+    dmm = FakeDMM(readings=[1.0] * 100)
+    src = FakeSource()
+    relay = FakeRelay()
+    _run(dmm, src, relay, X_start=0, X_stop=2, X_step=1, branch=Branch.POSITIVE,
+         smooth_ramp=True, ramp_duration=0.0)
+    assert ('output_on',) in src.calls
+    assert src.current_setpoints[-1] == 2.0  # последняя точка развёртки
+
+
+def test_smooth_ramp_turns_output_off_before_relay_switch():
+    dmm = FakeDMM(readings=[1.0] * 100)
+    src = FakeSource()
+    relay = FakeRelay()
+    _run(dmm, src, relay, X_start=-1, X_stop=1, X_step=1, branch=Branch.BOTH,
+         smooth_ramp=True, ramp_duration=0.0)
+    # Реле переключилось (обе полярности), значит output_off был вызван
+    # хотя бы раз перед этим переключением, несмотря на то что в
+    # smooth_ramp обычная точка сама output_off не зовёт.
+    assert ('output_off',) in src.calls
+    assert 'reverse' in relay.calls or 'forward' in relay.calls
+
+
+def test_smooth_ramp_voltage_excitation_uses_normal_path_not_ramp():
+    # smooth_ramp предназначен только для тока — для напряжения обычный
+    # путь (_measure_point_row), даже если флаг выставлен по ошибке.
+    dmm = FakeDMM(readings=[1.0] * 100)
+    src = FakeSource()
+    relay = FakeRelay()
+    results, _ = _run(dmm, src, relay, excitation_type='voltage', X_start=0, X_stop=2, X_step=1,
+                       branch=Branch.POSITIVE, smooth_ramp=True, ramp_duration=0.0)
+    assert len(results) == 3
+    assert ('output_off',) in src.calls  # обычный путь гасит выход между точками
+
+
+# ----------------------------------------------------------------------
+# run_measurement — plan_override (feature "планировщик кастомных программ")
+# ----------------------------------------------------------------------
+
+def test_plan_override_is_used_verbatim_ignoring_x_start_stop_step():
+    dmm = FakeDMM(readings=[1.0] * 100)
+    src = FakeSource()
+    relay = FakeRelay()
+    custom_plan = plan_custom_sweep("-25, 40, -15, 5")
+    # X_start/X_stop/X_step передаются заведомо другими — plan_override
+    # должен их полностью перекрыть, а не смешаться с ними.
+    results, _ = _run(dmm, src, relay, X_start=999, X_stop=999, X_step=1,
+                       plan_override=custom_plan)
+    assert [r['X_set'] for r in results] == [-25.0, 40.0, -15.0, 5.0]
+
+
+def test_plan_override_relay_commutation_follows_custom_plan_order():
+    dmm = FakeDMM(readings=[1.0] * 100)
+    src = FakeSource()
+    relay = FakeRelay()
+    custom_plan = plan_custom_sweep("-25, 40, -15, 5")
+    _run(dmm, src, relay, X_start=0, X_stop=1, X_step=1, plan_override=custom_plan)
+    # Порядок точек: reverse, forward, reverse, forward -> переключений реле
+    # три (после каждой смены знака), а не одно; финальный 'off' — штатное
+    # обесточивание в конце всего измерения (см. run_measurement finally).
+    assert relay.calls == ['reverse', 'forward', 'reverse', 'forward', 'off']
+
+
+def test_plan_override_none_falls_back_to_plan_sweep():
+    dmm = FakeDMM(readings=[1.0] * 100)
+    src = FakeSource()
+    relay = FakeRelay()
+    results, _ = _run(dmm, src, relay, X_start=0, X_stop=2, X_step=1, branch=Branch.POSITIVE)
+    assert [r['X_set'] for r in results] == [0.0, 1.0, 2.0]
+
+
 def test_estimate_duration_zero_for_empty_plan():
     assert estimate_duration_seconds([], delay=1.0, cooling_delay=1.0) == 0.0
 
@@ -755,3 +980,11 @@ def test_estimate_duration_scales_with_adaptive_cooling():
                                          adaptive_cooling=True, adaptive_cooling_max_multiplier=5.0)
     # Точка X=2 при адаптивном охлаждении получает cooling_delay*5, а не *1.
     assert adaptive > flat
+
+
+def test_estimate_duration_smooth_ramp_uses_ramp_duration_not_delay_or_cooling():
+    plan = plan_sweep(0, 2, 1, branch=Branch.POSITIVE)  # 0, 1, 2 -> ноль + 2 ненулевые
+    total = estimate_duration_seconds(plan, delay=100.0, cooling_delay=100.0,
+                                      averaging_count=1, averaging_delay=0.0,
+                                      smooth_ramp=True, ramp_duration=1.5)
+    assert total == pytest.approx(2 * 1.5)  # delay/cooling (100с) полностью игнорируются

@@ -159,11 +159,12 @@ def cmd_analyze(args) -> int:
     print(f"Файл: {csv_path}")
 
     if args.estimate_ratio:
-        from analysis import estimate_ratio_from_data
+        from analysis import estimate_ratio_from_data, metadata_zero_offset
         import pandas as pd
         df = pd.read_csv(csv_path, comment='#')
+        zero_offset = args.zero_offset if args.zero_offset is not None else (metadata_zero_offset(csv_path) or 0.0)
         try:
-            result = estimate_ratio_from_data(df)
+            result = estimate_ratio_from_data(df, zero_offset=zero_offset)
         except ValueError as e:
             print(f"Ошибка: {e}")
             return 1
@@ -198,7 +199,7 @@ def cmd_analyze(args) -> int:
                 print("Введите число.")
 
     stats = load_and_analyze(csv_path, I_nom=I_nom, X=X, show=not args.no_show,
-                             show_error_labels=args.labels)
+                             show_error_labels=args.labels, zero_offset=args.zero_offset)
 
     print(f"\nГрафик сохранён: {stats['png_path']}")
     print(f"Максимальная приведённая погрешность: {stats['max_error_percent']:+.4f} %")
@@ -464,44 +465,44 @@ def cmd_profile(args) -> int:
 
 
 def cmd_calibration(args) -> int:
-    """Даты поверки приборов (п.3-UI — CLI-паритет)."""
-    import json
+    """Поверка приборов — реестр физических экземпляров (п.3-UI, бага 6/7 — CLI-паритет)."""
     from apppaths import (
         multimeter_cfg_dir, voltmeter_cfg_dir, current_source_cfg_dir, voltage_source_cfg_dir,
     )
-    from calibration import list_instrument_configs, update_calibration_date, check_calibration
+    from calibration import (
+        known_models, list_calibration_rows, set_calibration_record, delete_calibration_record,
+    )
 
     config_dirs = [multimeter_cfg_dir(), voltmeter_cfg_dir(), current_source_cfg_dir(), voltage_source_cfg_dir()]
 
     if args.calibration_command == "list":
-        configs = list_instrument_configs(config_dirs)
-        if not configs:
+        rows = list_calibration_rows(config_dirs)
+        if not rows:
             print("Конфигов приборов не найдено.")
-        for path in configs:
-            try:
-                cfg = json.loads(path.read_text(encoding='utf-8'))
-            except (ValueError, OSError) as e:
-                print(f"  {path.name}: ошибка чтения ({e})")
-                continue
-            info = check_calibration(cfg)
-            print(f"  {path.name}  [{info.status.value}]  {info.message}")
+        for row in rows:
+            info = row['info']
+            serial = row['serial_number'] or '—'
+            print(f"  {row['model_id']}  S/N {serial}  [{info.status.value}]  {info.message}")
         return 0
 
     if args.calibration_command == "set":
-        config_file = Path(args.config_file)
-        if not config_file.is_absolute():
-            matches = [p for p in list_instrument_configs(config_dirs) if p.name == config_file.name]
-            if not matches:
-                print(f"Конфиг {args.config_file} не найден ни в одном из каталогов приборов "
-                      "(см. calibration list).")
-                return 1
-            config_file = matches[0]
+        models = known_models(config_dirs)
+        if args.model_id not in models:
+            print(f"Модель {args.model_id!r} не найдена ни в одном из каталогов приборов "
+                  "(см. calibration list).")
+            return 1
         try:
-            update_calibration_date(config_file, args.date, args.interval_months)
+            set_calibration_record(args.model_id, args.serial, args.date, args.interval_months,
+                                    comment=args.comment)
         except ValueError as e:
             print(f"Ошибка: {e}")
             return 1
-        print(f"Записано: {config_file}")
+        print(f"Записано: {args.model_id} (S/N {args.serial or '—'})")
+        return 0
+
+    if args.calibration_command == "delete":
+        delete_calibration_record(args.model_id, args.serial)
+        print(f"Удалено (если существовало): {args.model_id} (S/N {args.serial or '—'})")
         return 0
 
     return 1

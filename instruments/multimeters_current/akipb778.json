@@ -1,5 +1,6 @@
 {
     "model_name": "АКИП-B7-78/1 (PICOTEST)",
+    "model_id": "akipb778",
     "keywords": ["PICOTEST", "AKIP-B7-78", "V7-78"],
     "timeout": 5000,
     "encoding": "utf-8",
@@ -12,5 +13,7 @@
     "manual_range": false,
     "disable_autorange_command": "SENS:CURR:DC:RANG:AUTO OFF",
     "range_command": "SENS:CURR:DC:RANG {range_val}",
-    "ranges": [0.01, 0.1, 1.0, 3.0]
+    "ranges": [0.01, 0.1, 1.0, 3.0],
+    "identify_command": "SYST:BEEP",
+    "notes": "identify_command (п.11, «Мигнуть») — 'SYSTem:BEEPer' подтверждён по официальному Keysight/Agilent 34401A Remote Interface Reference (Chapter 4, System-Related Commands): 'Issue a single beep immediately', без предусловий (в отличие от Rigol, где нужно сначала включить STATe). Прибор — Picotest M3500A, сверен по voltage-конфигу того же устройства (см. instruments/multimeters_voltage/akipb778.json) как совместимый с платформой 34401A по шкалам DCV; сама команда мигания на реальном Picotest M3500A НЕ проверялась (перенесена по совместимости платформы, тот же уровень доверия, что у disable_autorange_command в voltage-конфиге)."
 }

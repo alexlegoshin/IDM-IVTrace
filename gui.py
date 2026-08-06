@@ -29,21 +29,22 @@ from tkinter import font as tkfont
 import pandas as pd
 
 from apppaths import (
-    default_data_dir, sensor_config_dir, work_dir, set_work_dir, cache_dir, config_dir, instruments_dir,
+    default_data_dir, sensor_config_dir, work_dir, set_work_dir, cache_dir, config_dir,
     multimeter_cfg_dir, voltmeter_cfg_dir, current_source_cfg_dir, voltage_source_cfg_dir,
+    clear_results_cache,
 )
-from calibration import list_instrument_configs, update_calibration_date, check_calibration, CalibrationStatus
+from calibration import known_models, list_calibration_rows, set_calibration_record, delete_calibration_record
 from config import ConfigManager, SensorConfigManager
 from cli import current_sweep_max_abs, make_csv_filename, validate_measure_params
 from discovery import DiscoveryService
 from instruments import identify_instrument
-from limits import relay_current_warning, relay_current_block_reason
+from limits import relay_current_warning, relay_current_block_reason, SMOOTH_RAMP_MAX_CURRENT_A
 from measurement import (
     EXCITATION_UNITS,
     DEFAULT_AVERAGING_COUNT, DEFAULT_AVERAGING_DELAY, DEFAULT_DISCARD_FIRST,
     estimate_duration_seconds,
 )
-from sweep import Branch, DirectionPreset, plan_sweep
+from sweep import Branch, DirectionPreset, plan_sweep, plan_custom_sweep
 
 
 # п.33 — минимализм: бело-кремовый фон, чёрный текст, геометричный
@@ -226,6 +227,10 @@ class IVTraceGUI:
         self._session = _SessionSlot()
         self.worker = None
         self._preflight_ok = False
+        # "No Relay" (см. _apply_discovery_state): пока плата реле не
+        # найдена, полярность заблокирована на Branch.NO_RELAY — физически
+        # без реле нельзя ни коммутировать, ни выбрать positive/negative/both.
+        self._branch_locked_no_relay = False
         self.last_csv = None
         self._current_fig = None
         # Вкладка «График» (Ф3): какой файл сейчас разобран (может быть не
@@ -251,6 +256,8 @@ class IVTraceGUI:
         self.preset_var = tk.StringVar(value=DirectionPreset.DIVERGING.value)
         self.discard_first_var = tk.BooleanVar(value=DEFAULT_DISCARD_FIRST)
         self.adaptive_cooling_var = tk.BooleanVar(value=False)
+        self.smooth_ramp_var = tk.BooleanVar(value=False)
+        self.custom_program_var = tk.BooleanVar(value=False)
         self.show_labels_var = tk.BooleanVar(value=False)
         self.auto_range_var = tk.BooleanVar(value=True)
 
@@ -414,12 +421,20 @@ class IVTraceGUI:
         open_folder_menu.add_command(label="Кэш", command=lambda: self._open_folder(cache_dir()))
         open_folder_menu.add_command(label="Профили датчиков",
                                      command=lambda: self._open_folder(sensor_config_dir()))
-        open_folder_menu.add_command(label="Конфиги приборов (мультиметры/источники)",
-                                     command=lambda: self._open_folder(instruments_dir()))
+        open_folder_menu.add_command(label="Конфиги: мультиметр как амперметр",
+                                     command=lambda: self._open_folder(multimeter_cfg_dir()))
+        open_folder_menu.add_command(label="Конфиги: мультиметр как вольтметр",
+                                     command=lambda: self._open_folder(voltmeter_cfg_dir()))
+        open_folder_menu.add_command(label="Конфиги: источники тока",
+                                     command=lambda: self._open_folder(current_source_cfg_dir()))
+        open_folder_menu.add_command(label="Конфиги: источники напряжения",
+                                     command=lambda: self._open_folder(voltage_source_cfg_dir()))
         open_folder_menu.add_command(label="Конфигурация приложения",
                                      command=lambda: self._open_folder(config_dir()))
         open_folder_mb.configure(menu=open_folder_menu)
         open_folder_mb.pack(side="left", padx=(0, 6))
+
+        ttk.Button(footer_btns, text="Очистить кэш…", command=self._clear_cache_dialog).pack(side="left", padx=(0, 6))
 
         ttk.Button(footer_btns, text="Даты поверки…", command=self._open_calibration_editor).pack(side="left", padx=(0, 6))
         ttk.Button(footer_btns, text="⚠ Баннер предупреждения", command=self._open_warning_banner).pack(side="left", padx=(0, 6))
@@ -467,6 +482,7 @@ class IVTraceGUI:
                         variable=self.suppress_warnings_var).grid(row=3, column=0, columnspan=2, sticky="w", pady=(2, 0))
 
         self._on_excitation_change()
+        self._on_custom_program_change()
         self._on_stop_on_error_change()
         self._on_branch_change()
         self._on_preset_change()
@@ -504,18 +520,46 @@ class IVTraceGUI:
         pf.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 8))
         pf.columnconfigure(1, weight=1)
 
-        self.e_start, self.u_start = self._param_row(pf, 0, "Начало")
-        self.e_stop, self.u_stop = self._param_row(pf, 1, "Конец")
-        self.e_step, self.u_step = self._param_row(pf, 2, "Шаг")
+        # Свой сценарий (feature "планировщик кастомных программ", BETA) —
+        # переключает между обычным X_start/X_stop/X_step и свободным
+        # текстовым DSL (см. sweep.parse_custom_program); branch/preset
+        # (вкладка «Дополнительно») в этом режиме тоже прячутся целиком —
+        # полярность каждой точки в кастомной программе определяется её
+        # буквальным знаком, комбинаторике там нет места (п.33).
+        self.custom_program_check = ttk.Checkbutton(
+            pf, text="Свой сценарий (BETA)", variable=self.custom_program_var,
+            command=self._on_custom_program_change,
+        )
+        self.custom_program_check.grid(row=0, column=0, columnspan=3, sticky="w")
+
+        self._range_fields_frame = ttk.Frame(pf)
+        self._range_fields_frame.grid(row=1, column=0, columnspan=3, sticky="ew")
+        self._range_fields_frame.columnconfigure(1, weight=1)
+        self.e_start, self.u_start = self._param_row(self._range_fields_frame, 0, "Начало")
+        self.e_stop, self.u_stop = self._param_row(self._range_fields_frame, 1, "Конец")
+        self.e_step, self.u_step = self._param_row(self._range_fields_frame, 2, "Шаг")
         for entry in (self.e_start, self.e_stop, self.e_step):
             entry.bind("<FocusOut>", lambda e: self._update_sweep_preview())
             entry.bind("<Return>", lambda e: self._update_sweep_preview())
+
+        self._custom_program_frame = ttk.Frame(pf)
+        self._custom_program_frame.grid(row=1, column=0, columnspan=3, sticky="ew")
+        self._custom_program_frame.columnconfigure(0, weight=1)
+        ttk.Label(self._custom_program_frame,
+                 text="Точки/диапазоны через запятую — любой порядок, знак, повторы:\n"
+                      "число (\"-25\") — одна точка; \"начало:конец:шаг\" — диапазон.\n"
+                      "Пример: -25, 0:40:10, -15, +5",
+                 style="Muted.TLabel", justify="left").grid(row=0, column=0, sticky="w")
+        self.e_custom_program = tk.Text(self._custom_program_frame, height=3, wrap="word")
+        self.e_custom_program.grid(row=1, column=0, sticky="ew", pady=(4, 0))
+        self.e_custom_program.bind("<FocusOut>", lambda e: self._update_sweep_preview())
+        self.e_custom_program.bind("<KeyRelease>", lambda e: self._update_sweep_preview())
 
         # V_limit — в своём контейнере, чтобы полностью прятать при
         # возбуждении напряжением, а не просто гасить (п.33: показывать
         # только те поля, что реально будут использованы).
         self._vlimit_frame = ttk.Frame(pf)
-        self._vlimit_frame.grid(row=3, column=0, columnspan=3, sticky="ew")
+        self._vlimit_frame.grid(row=2, column=0, columnspan=3, sticky="ew")
         self._vlimit_frame.columnconfigure(1, weight=1)
         self.e_vlimit, self.u_vlimit = self._param_row(self._vlimit_frame, 0, "Огр. напряжения", unit="В")
 
@@ -524,16 +568,40 @@ class IVTraceGUI:
         # баг-репорт: у уставки тока есть огр. по напряжению, у уставки
         # напряжения должно быть огр. по току).
         self._ilimit_frame = ttk.Frame(pf)
-        self._ilimit_frame.grid(row=3, column=0, columnspan=3, sticky="ew")
+        self._ilimit_frame.grid(row=2, column=0, columnspan=3, sticky="ew")
         self._ilimit_frame.columnconfigure(1, weight=1)
         self.e_ilimit, self.u_ilimit = self._param_row(self._ilimit_frame, 0, "Огр. тока", unit="А")
 
-        self.e_delay, self.u_delay = self._param_row(pf, 4, "Задержка установки", unit="с")
-        self.e_cool, self.u_cool = self._param_row(pf, 5, "Задержка охлаждения", unit="с")
+        # Плавное нарастание (feature, BETA) — только для тока: чекбокс
+        # виден только при этом возбуждении (для напряжения прячется целиком,
+        # см. _on_excitation_change), взаимно исключает delay/cooling_delay
+        # (см. measurement.run_measurement) — ниже переключаются местами.
+        self._smooth_ramp_row = ttk.Frame(pf)
+        self._smooth_ramp_row.grid(row=3, column=0, columnspan=3, sticky="ew")
+        self.smooth_ramp_check = ttk.Checkbutton(
+            self._smooth_ramp_row, text="Плавное нарастание (BETA, до 300 А)",
+            variable=self.smooth_ramp_var, command=self._on_smooth_ramp_change,
+        )
+        self.smooth_ramp_check.pack(anchor="w")
+        self.smooth_ramp_note_label = ttk.Label(self._smooth_ramp_row, style="Muted.TLabel",
+                                                wraplength=300, justify="left")
+        self.smooth_ramp_note_label.pack(anchor="w")
 
-        ttk.Label(pf, text="Комментарий").grid(row=6, column=0, sticky="w", pady=(6, 0))
+        self._delay_cool_frame = ttk.Frame(pf)
+        self._delay_cool_frame.grid(row=4, column=0, columnspan=3, sticky="ew")
+        self._delay_cool_frame.columnconfigure(1, weight=1)
+        self.e_delay, self.u_delay = self._param_row(self._delay_cool_frame, 0, "Задержка установки", unit="с")
+        self.e_cool, self.u_cool = self._param_row(self._delay_cool_frame, 1, "Задержка охлаждения", unit="с")
+
+        self._ramp_duration_frame = ttk.Frame(pf)
+        self._ramp_duration_frame.grid(row=4, column=0, columnspan=3, sticky="ew")
+        self._ramp_duration_frame.columnconfigure(1, weight=1)
+        self.e_ramp_duration, self.u_ramp_duration = self._param_row(
+            self._ramp_duration_frame, 0, "Время шага", unit="с")
+
+        ttk.Label(pf, text="Комментарий").grid(row=5, column=0, sticky="w", pady=(6, 0))
         self.e_label = ttk.Entry(pf)
-        self.e_label.grid(row=6, column=1, columnspan=2, sticky="ew", pady=(6, 0))
+        self.e_label.grid(row=5, column=1, columnspan=2, sticky="ew", pady=(6, 0))
 
         # --- предпросмотр развёртки: что реально получится при текущих
         # значениях (не то, что напечатано, а то, что посчитает планировщик,
@@ -562,10 +630,18 @@ class IVTraceGUI:
         self.e_ratio = ttk.Entry(meta, width=14)
         self.e_ratio.grid(row=1, column=1, sticky="ew", pady=3, padx=(8, 0))
 
+        # Смещение нуля (feature): у некоторых датчиков ноль осознанно
+        # смещён — вычитается из показания при расчёте погрешности и при
+        # живой отсечке по погрешности (см. measurement._measure_point_row,
+        # analysis.load_and_analyze). Пусто/0 — поведение как раньше.
+        ttk.Label(meta, text="Смещение нуля").grid(row=2, column=0, sticky="w", pady=3)
+        self.e_zero_offset = ttk.Entry(meta, width=14)
+        self.e_zero_offset.grid(row=2, column=1, sticky="ew", pady=3, padx=(8, 0))
+
         # Витки не имеют смысла для возбуждения напряжением — прячется в
         # _on_excitation_change (п.33: показывать только нужные поля).
         self._turns_row = ttk.Frame(meta)
-        self._turns_row.grid(row=2, column=0, columnspan=2, sticky="ew")
+        self._turns_row.grid(row=3, column=0, columnspan=2, sticky="ew")
         self._turns_row.columnconfigure(1, weight=1)
         ttk.Label(self._turns_row, text="Витки").grid(row=0, column=0, sticky="w", pady=3)
         self.e_turns = ttk.Entry(self._turns_row, width=14)
@@ -596,10 +672,10 @@ class IVTraceGUI:
         adv = ttk.Labelframe(body, text="Приборы (необязательно, иначе автопоиск)", padding=10)
         adv.grid(row=0, column=0, sticky="ew", padx=10, pady=(10, 10))
         adv.columnconfigure(1, weight=1)
-        self.e_dmm, btn_dmm = self._combo_addr_row(adv, 0, "Мультиметр VISA")
-        btn_dmm.configure(command=lambda: self._do_blink('dmm'))
-        self.e_src, btn_src = self._combo_addr_row(adv, 1, "Источник VISA")
-        btn_src.configure(command=lambda: self._do_blink('src'))
+        self.e_dmm, self._blink_btn_dmm = self._combo_addr_row(adv, 0, "Мультиметр VISA")
+        self._blink_btn_dmm.configure(command=lambda: self._do_blink('dmm'))
+        self.e_src, self._blink_btn_src = self._combo_addr_row(adv, 1, "Источник VISA")
+        self._blink_btn_src.configure(command=lambda: self._do_blink('src'))
         self.e_relay = self._addr_row(adv, 2, "Порт реле (COMx)")
 
         self.discovery_status_label = ttk.Label(adv, style="Muted.TLabel", text="Поиск приборов…")
@@ -628,18 +704,18 @@ class IVTraceGUI:
         self.e_error_threshold.pack(side="left", padx=(8, 0))
         self.e_error_threshold.insert(0, "1.0")
 
-        dir_box = ttk.Labelframe(body, text="Направление развёртки", padding=10)
-        dir_box.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 8))
-        ttk.Label(dir_box, text="Полярность").grid(row=0, column=0, sticky="w", pady=3)
-        branch_combo = ttk.Combobox(dir_box, textvariable=self.branch_var, state="readonly", width=10,
-                                    values=[b.value for b in Branch])
-        branch_combo.grid(row=0, column=1, sticky="w", pady=3, padx=(8, 0))
-        branch_combo.bind("<<ComboboxSelected>>",
-                          lambda e: (self._on_branch_change(), self._update_sweep_preview()))
+        self._dir_box = ttk.Labelframe(body, text="Направление развёртки", padding=10)
+        self._dir_box.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 8))
+        ttk.Label(self._dir_box, text="Полярность").grid(row=0, column=0, sticky="w", pady=3)
+        self.branch_combo = ttk.Combobox(self._dir_box, textvariable=self.branch_var, state="readonly", width=10,
+                                         values=[b.value for b in Branch])
+        self.branch_combo.grid(row=0, column=1, sticky="w", pady=3, padx=(8, 0))
+        self.branch_combo.bind("<<ComboboxSelected>>",
+                               lambda e: (self._on_branch_change(), self._update_sweep_preview()))
 
         # Схема прохода имеет смысл только при branch=both — прячется,
         # когда снимается только одна полярность (п.33).
-        self._preset_row = ttk.Frame(dir_box)
+        self._preset_row = ttk.Frame(self._dir_box)
         self._preset_row.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(4, 0))
         preset_line = ttk.Frame(self._preset_row)
         preset_line.pack(side="top", fill="x")
@@ -668,11 +744,11 @@ class IVTraceGUI:
         ttk.Checkbutton(avg_box, text="Отбрасывать первый отсчёт",
                         variable=self.discard_first_var).grid(row=2, column=0, columnspan=2, sticky="w", pady=(4, 0))
 
-        cool_box = ttk.Labelframe(body, text="Охлаждение", padding=10)
-        cool_box.grid(row=3, column=0, sticky="ew", padx=10, pady=(0, 10))
-        ttk.Checkbutton(cool_box, text="Адаптивное охлаждение (BETA, растёт с током)",
+        self._cool_box = ttk.Labelframe(body, text="Охлаждение", padding=10)
+        self._cool_box.grid(row=3, column=0, sticky="ew", padx=10, pady=(0, 10))
+        ttk.Checkbutton(self._cool_box, text="Адаптивное охлаждение (BETA, растёт с током)",
                         variable=self.adaptive_cooling_var).grid(row=0, column=0, sticky="w")
-        ttk.Label(cool_box, text="не проверено на реальном стенде",
+        ttk.Label(self._cool_box, text="не проверено на реальном стенде",
                   style="Muted.TLabel").grid(row=1, column=0, sticky="w")
 
         return scroll
@@ -925,11 +1001,59 @@ class IVTraceGUI:
             self._vlimit_frame.grid()
             self._ilimit_frame.grid_remove()
             self._turns_row.grid()
+            self._smooth_ramp_row.grid()
         else:
             self._vlimit_frame.grid_remove()
             self._ilimit_frame.grid()
             self._turns_row.grid_remove()
+            # Плавное нарастание — только для тока (см. measurement.py);
+            # для напряжения чекбокс прячется целиком и режим форсированно
+            # выключается, чтобы поле не осталось незаметно включённым.
+            self._smooth_ramp_row.grid_remove()
+            self.smooth_ramp_var.set(False)
+        self._on_smooth_ramp_change()
         self._refresh_profile_list()
+        self._update_sweep_preview()
+
+    def _on_custom_program_change(self):
+        """
+        Свой сценарий (feature "планировщик кастомных программ", BETA) —
+        заменяет X_start/X_stop/X_step свободным текстовым DSL (см.
+        sweep.parse_custom_program). branch/preset (вкладка «Направление
+        развёртки») в этом режиме не участвуют вовсе — полярность каждой
+        точки определяется её буквальным знаком, а не комбинаторикой,
+        поэтому вкладка прячется целиком, а не просто гаснет (п.33).
+        """
+        custom = self.custom_program_var.get()
+        if custom:
+            self._range_fields_frame.grid_remove()
+            self._custom_program_frame.grid()
+        else:
+            self._range_fields_frame.grid()
+            self._custom_program_frame.grid_remove()
+        if hasattr(self, '_dir_box'):
+            if custom:
+                self._dir_box.grid_remove()
+            else:
+                self._dir_box.grid()
+        self._update_sweep_preview()
+
+    def _on_smooth_ramp_change(self):
+        """
+        Плавное нарастание (BETA) взаимно исключает delay/cooling_delay и
+        адаптивное охлаждение (см. measurement.run_measurement) — при
+        включении прячем эти поля целиком, показываем время шага (п.33:
+        показывать только то, что реально будет использовано).
+        """
+        smooth = self.excitation_var.get() == "current" and self.smooth_ramp_var.get()
+        if smooth:
+            self._delay_cool_frame.grid_remove()
+            self._ramp_duration_frame.grid()
+            self._cool_box.grid_remove()
+        else:
+            self._delay_cool_frame.grid()
+            self._ramp_duration_frame.grid_remove()
+            self._cool_box.grid()
         self._update_sweep_preview()
 
     def _refresh_profile_list(self):
@@ -1002,29 +1126,74 @@ class IVTraceGUI:
         """
         if not hasattr(self, 'sweep_preview_label'):
             return
-        try:
-            x_start = float(self.e_start.get().strip().replace(",", "."))
-            x_stop = float(self.e_stop.get().strip().replace(",", "."))
-            x_step = float(self.e_step.get().strip().replace(",", "."))
-            if x_step <= 0:
-                raise ValueError
-            branch = Branch(self.branch_var.get())
-            preset = DirectionPreset(self.preset_var.get())
-            plan = plan_sweep(x_start, x_stop, x_step, branch=branch, preset=preset)
-        except Exception:
-            self.sweep_preview_label.configure(text="— заполните начало/конец/шаг корректными числами —")
-            return
+
+        is_custom = self.custom_program_var.get()
+        if is_custom:
+            text = self.e_custom_program.get("1.0", "end")
+            try:
+                plan = plan_custom_sweep(text)
+            except Exception as e:
+                self.sweep_preview_label.configure(text=f"— {e} —")
+                self._update_smooth_ramp_availability(None)
+                return
+        else:
+            try:
+                x_start = float(self.e_start.get().strip().replace(",", "."))
+                x_stop = float(self.e_stop.get().strip().replace(",", "."))
+                x_step = float(self.e_step.get().strip().replace(",", "."))
+                if x_step <= 0:
+                    raise ValueError
+                branch = Branch(self.branch_var.get())
+                preset = DirectionPreset(self.preset_var.get())
+                plan = plan_sweep(x_start, x_stop, x_step, branch=branch, preset=preset)
+            except Exception:
+                self.sweep_preview_label.configure(text="— заполните начало/конец/шаг корректными числами —")
+                self._update_smooth_ramp_availability(None)
+                return
 
         if not plan:
             self.sweep_preview_label.configure(text="— развёртка пуста —")
+            self._update_smooth_ramp_availability(None)
             return
 
         unit = "А" if self.excitation_var.get() == "current" else "В"
         values = [p.x_set for p in plan]
-        shown = " → ".join(f"{v:+g}" if v != 0 else "0" for v in values[:6])
-        if len(values) > 6:
-            shown += " → …"
+        if is_custom:
+            # Свой сценарий (feature): полный список точек, без обрезки —
+            # оператор сам написал каждую из них и должен видеть их все
+            # (в отличие от обычной развёртки, где точек может быть много
+            # и капать до первых 6 достаточно).
+            shown = " → ".join(f"{v:+g}" if v != 0 else "0" for v in values)
+        else:
+            shown = " → ".join(f"{v:+g}" if v != 0 else "0" for v in values[:6])
+            if len(values) > 6:
+                shown += " → …"
         self.sweep_preview_label.configure(text=f"Точек: {len(plan)}  ·  {shown}  {unit}")
+
+        max_magnitude = max((p.magnitude for p in plan), default=0.0)
+        self._update_smooth_ramp_availability(max_magnitude if self.excitation_var.get() == "current" else None)
+
+    def _update_smooth_ramp_availability(self, max_current):
+        """
+        Плавное нарастание (BETA) недоступно выше limits.SMOOTH_RAMP_MAX_CURRENT_A
+        (см. limits.smooth_ramp_block_reason) — чекбокс блокируется целиком
+        (не просто "ошибка при старте"), а не тихо остаётся кликабельным
+        для развёртки, которая всё равно не пройдёт валидацию.
+        """
+        if not hasattr(self, 'smooth_ramp_check'):
+            return
+        too_high = max_current is not None and max_current > SMOOTH_RAMP_MAX_CURRENT_A
+        if too_high:
+            self.smooth_ramp_check.configure(state="disabled")
+            self.smooth_ramp_note_label.configure(
+                text=f"Недоступно: максимум развёртки {max_current:.1f} А превышает "
+                     f"{SMOOTH_RAMP_MAX_CURRENT_A:.0f} А.")
+            if self.smooth_ramp_var.get():
+                self.smooth_ramp_var.set(False)
+                self._on_smooth_ramp_change()
+        else:
+            self.smooth_ramp_check.configure(state="normal")
+            self.smooth_ramp_note_label.configure(text="")
 
     def _append_log(self, text):
         self.log.configure(state="normal")
@@ -1102,6 +1271,27 @@ class IVTraceGUI:
         status += "  ·  реле: " + (f"{state.relay_port}" if state.relay_port else "не найдено")
         self.discovery_status_label.configure(text=status)
 
+        # "No Relay" (feature): без платы реле positive/negative/both
+        # физически невыполнимы (нечем коммутировать) — полярность
+        # заблокирована на единственном исполнимом значении, а не просто
+        # "предложена". Разблокируется, как только сервис обнаружения
+        # снова видит плату — но НЕ откатывает выбор автоматически назад
+        # (оператор сам решает, переключаться ли, см. остальные автокоррекции).
+        relay_found = bool(state.relay_port)
+        if not relay_found and not self._branch_locked_no_relay:
+            self._branch_locked_no_relay = True
+            self.branch_var.set(Branch.NO_RELAY.value)
+            self.branch_combo.configure(state="disabled")
+            self._on_branch_change()
+            self._update_sweep_preview()
+            self._append_log("[Реле] Плата реле не найдена — полярность заблокирована на "
+                             "\"no_relay\" (без коммутации, одна полярность).\n")
+        elif relay_found and self._branch_locked_no_relay:
+            self._branch_locked_no_relay = False
+            self.branch_combo.configure(state="readonly")
+            self._append_log("[Реле] Плата реле обнаружена — снова доступны "
+                             "positive/negative/both.\n")
+
         # Живой счётчик "ресурсов видно" в статус-строке NI-VISA (баг-репорт:
         # раньше строка застывала на значении со старта программы). Трогаем
         # её только когда предполётная проверка прошла и сейчас не идёт
@@ -1122,7 +1312,16 @@ class IVTraceGUI:
         instruments.identify_instrument — не сочиняем непроверенные SCPI-
         команды). Ищет конфиг по совпадению адреса с последним снимком
         обнаружения, а не переоткрывает *IDN? заново.
+
+        Баг-репорт: спам по кнопке иногда ронял фоновое обнаружение
+        (VI_ERROR_INV_OBJECT) — запрос гонялся за тот же VISA-ресурс
+        параллельно с периодическим сканом DiscoveryService, без единой
+        точки синхронизации. Фикс — тот же приём, что уже используется
+        вокруг измерения и ручного режима (discovery.pause()/resume()),
+        плюс блокировка самой кнопки на время запроса, чтобы повторный
+        клик не породил вторую параллельную попытку.
         """
+        btn = self._blink_btn_dmm if which == 'dmm' else self._blink_btn_src
         combo = self.e_dmm if which == 'dmm' else self.e_src
         addr = self._combo_address(combo)
         if not addr:
@@ -1137,21 +1336,28 @@ class IVTraceGUI:
 
         import json as _json
 
+        btn.configure(state="disabled")
+        self.discovery.pause()
+
         def worker():
             try:
-                from visa_backend import make_resource_manager
-                rm = make_resource_manager()
-                cfg = _json.loads(match.config_path.read_text(encoding='utf-8'))
-                ok = identify_instrument(rm, addr, cfg)
-                rm.close()
-            except Exception as e:
-                self.events.put(("log", f"[Мигнуть] Ошибка: {e}\n"))
-                return
-            if ok:
-                self.events.put(("log", f"[Мигнуть] Команда отправлена: {addr} ({match.config_path.stem})\n"))
-            else:
-                self.events.put(("log", f"[Мигнуть] Для {match.config_path.stem} не настроена команда "
-                                        "мигания (identify_command в конфиге отсутствует).\n"))
+                try:
+                    from visa_backend import make_resource_manager
+                    rm = make_resource_manager()
+                    cfg = _json.loads(match.config_path.read_text(encoding='utf-8'))
+                    ok = identify_instrument(rm, addr, cfg)
+                    rm.close()
+                except Exception as e:
+                    self.events.put(("log", f"[Мигнуть] Ошибка: {e}\n"))
+                    return
+                if ok:
+                    self.events.put(("log", f"[Мигнуть] Команда отправлена: {addr} ({match.config_path.stem})\n"))
+                else:
+                    self.events.put(("log", f"[Мигнуть] Для {match.config_path.stem} не настроена команда "
+                                            "мигания (identify_command в конфиге отсутствует).\n"))
+            finally:
+                self.discovery.resume()
+                self.events.put(("blink_done", which))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -1351,26 +1557,66 @@ class IVTraceGUI:
             "Действует для новых измерений и построения графика по умолчанию.",
         )
 
+    def _clear_cache_dialog(self):
+        """
+        Очистка накопленных результатов (CSV/PNG/XLSX в рабочей папке +
+        Cache) и файла параметров последнего запуска — см.
+        apppaths.clear_results_cache(). Конфиги приборов и профили
+        датчиков в других директориях, эта функция их не видит вовсе.
+        Подтверждение с точным числом файлов — действие безвозвратное.
+        """
+        from apppaths import work_dir as _work_dir_fn
+        base = _work_dir_fn()
+        candidates = []
+        if base.is_dir():
+            for pattern in ("IVtrace_*.csv", "IVtrace_*.png", "IVtrace_*.xlsx"):
+                candidates.extend(base.glob(pattern))
+            if (base / "ivtrace_config.json").exists():
+                candidates.append(base / "ivtrace_config.json")
+        cache = cache_dir()
+        cache_files = [p for p in cache.rglob("*") if p.is_file()] if cache.is_dir() else []
+        total = len(candidates) + len(cache_files)
+        if total == 0:
+            messagebox.showinfo("Очистить кэш", "Нечего чистить — рабочая папка и кэш уже пусты.")
+            return
+        if not messagebox.askyesno(
+            "Очистить кэш",
+            f"Будет удалено файлов: {total} (CSV/PNG/XLSX результатов, файл последних "
+            "параметров, содержимое папки Cache).\n\n"
+            "Конфиги приборов и профили датчиков не затрагиваются.\n\n"
+            "Продолжить?",
+        ):
+            return
+        removed = clear_results_cache()
+        self._append_log(f"[Кэш] Удалено файлов: {len(removed)}\n")
+        messagebox.showinfo("Очистить кэш", f"Удалено файлов: {len(removed)}.")
+
     # -------------------------------------------------------- calibration editor
     def _open_calibration_editor(self):
         """
-        п.3-UI: редактор дат поверки приборов — до этого пункта плана
-        единственным способом внести реальную дату поверки было вручную
-        редактировать JSON. Список собирается из всех каталогов конфигов
-        (мультиметр в обеих ролях + оба типа источника), а не только тех,
-        что реально сейчас подключены — оператор может готовить даты заранее.
+        п.3-UI + бага 6/7: редактор поверки ФИЗИЧЕСКИХ приборов (реестр,
+        см. calibration.py), а не конфигов моделей. Одна модель может дать
+        несколько строк (по одному экземпляру, различённых серийным
+        номером) — обе проблемы бага 6 (один прибор, два конфига
+        current/voltage — теперь один model_id, одна строка) и бага 7
+        (два физических прибора одной модели — теперь два S/N, две строки)
+        решены на уровне данных, а не UI-костылём.
+
+        Список моделей собирается из всех каталогов конфигов (мультиметр в
+        обеих ролях + оба типа источника), а не только тех, что реально
+        сейчас подключены — оператор может готовить записи заранее.
         """
         win = tk.Toplevel(self.root)
-        win.title("Даты поверки приборов")
-        win.geometry("760x460")
+        win.title("Поверка приборов")
+        win.geometry("820x480")
         win.columnconfigure(0, weight=1)
         win.rowconfigure(0, weight=1)
 
-        columns = ("file", "model", "status", "date", "interval")
+        columns = ("model", "serial", "status", "date", "interval", "comment")
         tree = ttk.Treeview(win, columns=columns, show="headings", selectmode="browse")
         for col, text, width in (
-            ("file", "Файл", 160), ("model", "Модель", 200), ("status", "Статус", 90),
-            ("date", "Поверка", 100), ("interval", "Интервал, мес.", 110),
+            ("model", "Модель", 190), ("serial", "S/N", 90), ("status", "Статус", 90),
+            ("date", "Поверка", 100), ("interval", "Интервал, мес.", 100), ("comment", "Комментарий", 140),
         ):
             tree.heading(col, text=text)
             tree.column(col, width=width, anchor="w")
@@ -1380,67 +1626,124 @@ class IVTraceGUI:
         scroll.grid(row=0, column=4, sticky="ns", pady=(10, 6))
 
         config_dirs = [multimeter_cfg_dir(), voltmeter_cfg_dir(), current_source_cfg_dir(), voltage_source_cfg_dir()]
-        paths_by_iid = {}
+        rows_by_iid = {}
+        model_name_by_id = {}
+        model_id_by_name = {}
 
         def refresh():
             for item in tree.get_children():
                 tree.delete(item)
-            paths_by_iid.clear()
-            import json
-            for path in list_instrument_configs(config_dirs):
-                try:
-                    cfg = json.loads(path.read_text(encoding='utf-8'))
-                except (ValueError, OSError):
-                    continue
-                info = check_calibration(cfg)
-                iid = str(path)
-                paths_by_iid[iid] = path
+            rows_by_iid.clear()
+            model_name_by_id.clear()
+            model_id_by_name.clear()
+            model_name_by_id.update(known_models(config_dirs))
+            for model_id, model_name in model_name_by_id.items():
+                model_id_by_name[model_name] = model_id
+            for row in list_calibration_rows(config_dirs):
+                iid = f"{row['model_id']}::{row['serial_number']}"
+                rows_by_iid[iid] = row
+                info = row['info']
                 tree.insert("", "end", iid=iid, values=(
-                    path.name, info.model_name, info.status.value,
-                    cfg.get('calibration_date', ''), cfg.get('calibration_interval_months', ''),
+                    row['model_name'], row['serial_number'], info.status.value,
+                    info.last_date.isoformat() if info.last_date else '',
+                    row['calibration_interval_months'] or '',
+                    row['comment'],
                 ))
 
         refresh()
 
-        form = ttk.Frame(win, padding=(10, 0, 10, 10))
-        form.grid(row=1, column=0, columnspan=5, sticky="ew")
-        ttk.Label(form, text="Дата поверки (ГГГГ-ММ-ДД)").grid(row=0, column=0, sticky="w")
+        form = ttk.Labelframe(win, text="Прибор", padding=8)
+        form.grid(row=1, column=0, columnspan=5, sticky="ew", padx=10, pady=(0, 10))
+        for c in range(6):
+            form.columnconfigure(c, weight=1 if c in (1, 5) else 0)
+
+        ttk.Label(form, text="Модель").grid(row=0, column=0, sticky="w")
+        cb_model = ttk.Combobox(form, state="readonly", width=28)
+        cb_model.grid(row=0, column=1, sticky="ew", padx=(4, 14))
+        ttk.Label(form, text="S/N (пусто — единственный экземпляр)").grid(row=0, column=2, sticky="w")
+        e_serial = ttk.Entry(form, width=14)
+        e_serial.grid(row=0, column=3, padx=(4, 14))
+
+        ttk.Label(form, text="Дата поверки (ГГГГ-ММ-ДД)").grid(row=1, column=0, sticky="w", pady=(6, 0))
         e_date = ttk.Entry(form, width=14)
-        e_date.grid(row=0, column=1, padx=(6, 14))
-        ttk.Label(form, text="Интервал, мес.").grid(row=0, column=2, sticky="w")
+        e_date.grid(row=1, column=1, sticky="w", padx=(4, 14), pady=(6, 0))
+        ttk.Label(form, text="Интервал, мес.").grid(row=1, column=2, sticky="w", pady=(6, 0))
         e_interval = ttk.Entry(form, width=8)
-        e_interval.grid(row=0, column=3, padx=(6, 14))
+        e_interval.grid(row=1, column=3, sticky="w", padx=(4, 14), pady=(6, 0))
+
+        ttk.Label(form, text="Комментарий").grid(row=2, column=0, sticky="w", pady=(6, 0))
+        e_comment = ttk.Entry(form)
+        e_comment.grid(row=2, column=1, columnspan=3, sticky="ew", padx=(4, 14), pady=(6, 0))
+
+        def _refresh_model_combo():
+            names = sorted(model_name_by_id.values())
+            cb_model.configure(values=names)
+
+        _refresh_model_combo()
 
         def on_select(_event=None):
             sel = tree.selection()
             if not sel:
                 return
-            values = tree.item(sel[0])['values']
-            e_date.delete(0, 'end'); e_date.insert(0, values[3] if values[3] != '' else '')
-            e_interval.delete(0, 'end'); e_interval.insert(0, values[4] if values[4] != '' else '')
+            row = rows_by_iid.get(sel[0])
+            if row is None:
+                return
+            cb_model.set(row['model_name'])
+            e_serial.delete(0, 'end'); e_serial.insert(0, row['serial_number'])
+            e_comment.delete(0, 'end'); e_comment.insert(0, row['comment'])
+            info = row['info']
+            e_date.delete(0, 'end')
+            if info.last_date:
+                e_date.insert(0, info.last_date.isoformat())
+            e_interval.delete(0, 'end')
+            if row['calibration_interval_months']:
+                e_interval.insert(0, str(row['calibration_interval_months']))
 
         tree.bind("<<TreeviewSelect>>", on_select)
 
         def save():
-            sel = tree.selection()
-            if not sel:
-                messagebox.showinfo("Даты поверки", "Выберите прибор в списке.", parent=win)
+            model_name = cb_model.get().strip()
+            model_id = model_id_by_name.get(model_name)
+            if model_id is None:
+                messagebox.showinfo("Поверка приборов", "Выберите модель из списка.", parent=win)
                 return
-            path = paths_by_iid[sel[0]]
             try:
                 interval = int(e_interval.get().strip())
             except ValueError:
                 messagebox.showerror("Ошибка", "Интервал должен быть целым числом месяцев.", parent=win)
                 return
             try:
-                update_calibration_date(path, e_date.get().strip(), interval)
+                set_calibration_record(
+                    model_id, e_serial.get().strip(), e_date.get().strip(), interval,
+                    comment=e_comment.get().strip(),
+                )
             except ValueError as e:
                 messagebox.showerror("Ошибка", str(e), parent=win)
                 return
             refresh()
-            self._append_log(f"Дата поверки обновлена: {path.name}\n")
+            self._append_log(f"Поверка обновлена: {model_name} (S/N: {e_serial.get().strip() or '—'})\n")
 
-        ttk.Button(form, text="Сохранить", command=save).grid(row=0, column=4)
+        def delete_selected():
+            sel = tree.selection()
+            if not sel:
+                messagebox.showinfo("Поверка приборов", "Выберите запись в списке.", parent=win)
+                return
+            row = rows_by_iid.get(sel[0])
+            if row is None or not row['has_record']:
+                messagebox.showinfo("Поверка приборов", "Эта строка — незаведённая модель, удалять нечего.", parent=win)
+                return
+            if not messagebox.askyesno("Поверка приборов",
+                                       f"Удалить запись поверки: {row['model_name']} "
+                                       f"(S/N: {row['serial_number'] or '—'})?", parent=win):
+                return
+            delete_calibration_record(row['model_id'], row['serial_number'])
+            refresh()
+            self._append_log(f"Запись поверки удалена: {row['model_name']} (S/N: {row['serial_number'] or '—'})\n")
+
+        btns = ttk.Frame(form)
+        btns.grid(row=3, column=0, columnspan=4, sticky="w", pady=(10, 0))
+        ttk.Button(btns, text="Сохранить", command=save).pack(side="left", padx=(0, 6))
+        ttk.Button(btns, text="Удалить запись", command=delete_selected).pack(side="left")
 
     # -------------------------------------------------------------- sensor config
     def _save_config(self):
@@ -1451,15 +1754,17 @@ class IVTraceGUI:
         params = self._gather_params()
         if params is None:
             return
-        # Сохраняем также I_nom и ratio, если они есть
+        # Сохраняем также I_nom, ratio и смещение нуля, если они есть
         try:
             inom = float(self.e_inom.get().strip().replace(",", ".")) if self.e_inom.get().strip() else None
             ratio = float(self.e_ratio.get().strip().replace(",", ".")) if self.e_ratio.get().strip() else None
+            zero_offset = float(self.e_zero_offset.get().strip().replace(",", ".")) if self.e_zero_offset.get().strip() else None
         except ValueError:
-            messagebox.showerror("Ошибка", "I ном. и коэффициент должны быть числами.")
+            messagebox.showerror("Ошибка", "I ном., коэффициент и смещение нуля должны быть числами.")
             return
         params['I_nom'] = inom
         params['ratio'] = ratio
+        params['zero_offset'] = zero_offset
         # Добавляем дополнительные опции
         params['stop_on_error'] = self.stop_on_error_var.get()
         try:
@@ -1541,6 +1846,7 @@ class IVTraceGUI:
         self.e_label.delete(0, 'end'); self.e_label.insert(0, params.get('label', ''))
         self.e_inom.delete(0, 'end'); self.e_inom.insert(0, str(params.get('I_nom', '')))
         self.e_ratio.delete(0, 'end'); self.e_ratio.insert(0, str(params.get('ratio', '')))
+        self.e_zero_offset.delete(0, 'end'); self.e_zero_offset.insert(0, str(params.get('zero_offset', '')))
         self.e_turns.delete(0, 'end'); self.e_turns.insert(0, str(params.get('turns', 1.0)))
         self.stop_on_error_var.set(params.get('stop_on_error', False))
         self.e_error_threshold.delete(0, 'end'); self.e_error_threshold.insert(0, str(params.get('error_threshold', 1.0)))
@@ -1550,8 +1856,15 @@ class IVTraceGUI:
         self.e_avg_delay.delete(0, 'end'); self.e_avg_delay.insert(0, str(params.get('averaging_delay', DEFAULT_AVERAGING_DELAY)))
         self.discard_first_var.set(params.get('discard_first', DEFAULT_DISCARD_FIRST))
         self.adaptive_cooling_var.set(params.get('adaptive_cooling', False))
+        self.smooth_ramp_var.set(params.get('smooth_ramp', False))
+        self.e_ramp_duration.delete(0, 'end'); self.e_ramp_duration.insert(0, str(params.get('ramp_duration', 1.0)))
+        self.custom_program_var.set(bool(params.get('custom_program')))
+        self.e_custom_program.delete("1.0", "end")
+        if params.get('custom_program'):
+            self.e_custom_program.insert("1.0", params['custom_program'])
 
         self._on_excitation_change()
+        self._on_custom_program_change()
         self._on_stop_on_error_change()
         self._on_branch_change()
         self._on_preset_change()
@@ -1575,17 +1888,47 @@ class IVTraceGUI:
                 return None
             return float(raw)
 
+        # Плавное нарастание (BETA) прячет поля delay/cool (см.
+        # _on_smooth_ramp_change) — с ними скрыт и смысл требовать их
+        # заполненными; вместо этого требуется время шага.
+        smooth_ramp = excitation_type == "current" and self.smooth_ramp_var.get()
+        # Свой сценарий (BETA) прячет X_start/X_stop/X_step (см.
+        # _on_custom_program_change) — вместо них требуется текст программы.
+        custom_program_active = self.custom_program_var.get()
+
         try:
             params = {
                 "excitation_type": excitation_type,
                 "output_type": self.output_var.get(),
-                "X_start": num(self.e_start, "Начало"),
-                "X_stop": num(self.e_stop, "Конец"),
-                "X_step": num(self.e_step, "Шаг"),
-                "delay": num(self.e_delay, "Задержка установки"),
-                "cooling_delay": num(self.e_cool, "Задержка охлаждения"),
                 "label": self.e_label.get().strip(),
             }
+            if custom_program_active:
+                custom_text = self.e_custom_program.get("1.0", "end").strip()
+                if not custom_text:
+                    raise ValueError("Поле «Свой сценарий» не заполнено.")
+                try:
+                    from sweep import parse_custom_program
+                    parse_custom_program(custom_text)
+                except ValueError as e:
+                    raise ValueError(f"Свой сценарий: {e}")
+                params["custom_program"] = custom_text
+                params["X_start"] = None
+                params["X_stop"] = None
+                params["X_step"] = None
+            else:
+                params["custom_program"] = None
+                params["X_start"] = num(self.e_start, "Начало")
+                params["X_stop"] = num(self.e_stop, "Конец")
+                params["X_step"] = num(self.e_step, "Шаг")
+            if smooth_ramp:
+                params["delay"] = 0.0
+                params["cooling_delay"] = 0.0
+                params["ramp_duration"] = num(self.e_ramp_duration, "Время шага")
+            else:
+                params["delay"] = num(self.e_delay, "Задержка установки")
+                params["cooling_delay"] = num(self.e_cool, "Задержка охлаждения")
+                params["ramp_duration"] = optional_num(self.e_ramp_duration) or 1.0
+            params["smooth_ramp"] = smooth_ramp
             if excitation_type == "current":
                 params["V_limit"] = num(self.e_vlimit, "Огр. напряжения")
                 params["I_limit"] = 0.0
@@ -1596,6 +1939,7 @@ class IVTraceGUI:
             # Новые параметры
             params["I_nom"] = optional_num(self.e_inom)
             params["ratio"] = optional_num(self.e_ratio)
+            params["zero_offset"] = optional_num(self.e_zero_offset) or 0.0
             params["turns"] = optional_num(self.e_turns) or 1.0
             params["stop_on_error"] = self.stop_on_error_var.get()
             params["error_threshold"] = optional_num(self.e_error_threshold) or 1.0
@@ -1636,22 +1980,30 @@ class IVTraceGUI:
         self.config_mgr.save(params)
         csv_path = make_csv_filename(self.data_dir, params["label"])
 
-        branch_text = {
-            Branch.BOTH.value: "Обе полярности через реле",
-            Branch.POSITIVE.value: "Только положительная полярность",
-            Branch.NEGATIVE.value: "Только отрицательная полярность",
-        }.get(params.get("branch", Branch.BOTH.value), "Обе полярности через реле")
-        confirm_text = (
-            f"Возбуждение: {params['excitation_type']}\n"
-            f"Диапазон: {params['X_start']}..{params['X_stop']} (шаг {params['X_step']})\n"
-            f"{branch_text}.\n\nЗапустить измерение?"
-        )
+        if params.get("custom_program"):
+            confirm_text = (
+                f"Возбуждение: {params['excitation_type']}\n"
+                f"Свой сценарий (BETA): {params['custom_program']}\n"
+                "\nЗапустить измерение?"
+            )
+        else:
+            branch_text = {
+                Branch.BOTH.value: "Обе полярности через реле",
+                Branch.POSITIVE.value: "Только положительная полярность",
+                Branch.NEGATIVE.value: "Только отрицательная полярность",
+                Branch.NO_RELAY.value: "Без реле (одна полярность, коммутация не используется)",
+            }.get(params.get("branch", Branch.BOTH.value), "Обе полярности через реле")
+            confirm_text = (
+                f"Возбуждение: {params['excitation_type']}\n"
+                f"Диапазон: {params['X_start']}..{params['X_stop']} (шаг {params['X_step']})\n"
+                f"{branch_text}.\n\nЗапустить измерение?"
+            )
         # Жёсткий запрет (>800 А) сюда не дойдёт вообще: он уже отсеян
         # в _gather_params -> validate_measure_params messagebox'ом с
         # ошибкой. Здесь только предупреждение о работе свыше паспортных
         # 400 А — оператор должен увидеть его непосредственно перед тем, как
         # подтверждает запуск, а не потом в логе.
-        if not params["suppress_notifications"]:
+        if not params["suppress_notifications"] and params.get("branch") != Branch.NO_RELAY.value:
             warning = relay_current_warning(current_sweep_max_abs(params, params["excitation_type"]))
             if warning:
                 confirm_text = f"⚠ {warning}\n\n{confirm_text}"
@@ -1690,17 +2042,22 @@ class IVTraceGUI:
         — подписана "≈", а не выдаётся за точный расчёт.
         """
         try:
-            plan = plan_sweep(
-                params['X_start'], params['X_stop'], params['X_step'],
-                branch=Branch(params.get('branch', Branch.BOTH.value)),
-                preset=DirectionPreset(params.get('preset', DirectionPreset.DIVERGING.value)),
-            )
+            if params.get('custom_program'):
+                plan = plan_custom_sweep(params['custom_program'])
+            else:
+                plan = plan_sweep(
+                    params['X_start'], params['X_stop'], params['X_step'],
+                    branch=Branch(params.get('branch', Branch.BOTH.value)),
+                    preset=DirectionPreset(params.get('preset', DirectionPreset.DIVERGING.value)),
+                )
             total = estimate_duration_seconds(
                 plan, delay=params['delay'], cooling_delay=params['cooling_delay'],
                 averaging_count=params.get('averaging_count', DEFAULT_AVERAGING_COUNT),
                 averaging_delay=params.get('averaging_delay', DEFAULT_AVERAGING_DELAY),
                 adaptive_cooling=params.get('adaptive_cooling', False),
                 adaptive_cooling_max_multiplier=params.get('adaptive_cooling_max_multiplier', 5.0),
+                smooth_ramp=params.get('smooth_ramp', False),
+                ramp_duration=params.get('ramp_duration') or 1.0,
             )
         except Exception:
             self.countdown_label.configure(text="")
@@ -1904,7 +2261,7 @@ class IVTraceGUI:
 
     def _do_estimate_ratio(self):
         """п.10 (BETA): фактический коэффициент по снятым точкам, отдельно от построения графика."""
-        from analysis import estimate_ratio_from_data
+        from analysis import estimate_ratio_from_data, metadata_zero_offset
 
         csv_path = self._resolve_plot_csv_path()
         if csv_path is None:
@@ -1913,7 +2270,7 @@ class IVTraceGUI:
             else pd.read_csv(csv_path, comment='#')
 
         try:
-            result = estimate_ratio_from_data(df)
+            result = estimate_ratio_from_data(df, zero_offset=metadata_zero_offset(csv_path) or 0.0)
         except ValueError as e:
             messagebox.showerror("Не удалось определить коэффициент", str(e))
             return
@@ -2192,6 +2549,9 @@ class IVTraceGUI:
                     self.manual_status_label.configure(text="Сессия не открыта.")
                     self._append_log(f"\n✖ Не удалось открыть ручной режим: {payload}\n")
                     messagebox.showerror("Ошибка ручного режима", payload)
+                elif kind == "blink_done":
+                    btn = self._blink_btn_dmm if payload == 'dmm' else self._blink_btn_src
+                    btn.configure(state="normal")
                 elif kind == "manual_closed":
                     self.manual_open_btn.configure(state="normal")
                     self.manual_close_btn.configure(state="disabled")

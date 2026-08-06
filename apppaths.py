@@ -164,3 +164,40 @@ def set_work_dir(path: Optional[Path]) -> None:
 def cache_dir() -> Path:
     """<рабочая папка>\\Cache (п.23, В-1)."""
     return work_dir() / "Cache"
+
+
+def clear_results_cache() -> list:
+    """
+    Удаляет накопленные результаты измерений (CSV/PNG/XLSX прямо в
+    work_dir(), включая *_inverted.csv — все они начинаются с "IVtrace_")
+    и файл параметров последнего запуска (ivtrace_config.json), плюс
+    целиком очищает <рабочая папка>\\Cache. Не трогает конфиги приборов
+    (instruments_dir()) и профили датчиков (sensor_config_dir()) — они
+    физически в других директориях (config_dir()), глоб по work_dir() их
+    не видит вовсе.
+
+    Возвращает список удалённых путей — для лога в UI.
+    """
+    removed = []
+    base = work_dir()
+    if base.is_dir():
+        for pattern in ("IVtrace_*.csv", "IVtrace_*.png", "IVtrace_*.xlsx"):
+            for p in sorted(base.glob(pattern)):
+                p.unlink()
+                removed.append(p)
+        last_run = base / "ivtrace_config.json"
+        if last_run.exists():
+            last_run.unlink()
+            removed.append(last_run)
+
+    cache = cache_dir()
+    if cache.is_dir():
+        for p in sorted(cache.rglob("*")):
+            if p.is_file():
+                p.unlink()
+                removed.append(p)
+        for p in sorted(cache.glob("**/*"), reverse=True):
+            if p.is_dir():
+                p.rmdir()
+
+    return removed

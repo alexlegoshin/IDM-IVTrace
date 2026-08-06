@@ -1,5 +1,6 @@
 {
     "model_name": "RIGOL DM3068",
+    "model_id": "rigol_dm3068",
     "keywords": ["RIGOL", "DM3068"],
     "timeout": 5000,
     "encoding": "utf-8",
@@ -10,5 +11,7 @@
     ],
     "measure_command": "MEAS:CURR:DC?",
     "manual_range": false,
-    "ranges": [10.0]
+    "ranges": [10.0],
+    "identify_command": "SYST:BEEP:STAT ON;SYST:BEEP",
+    "identify_notes": "identify_command (п.11, «Мигнуть») — синтаксис 'SYSTem:BEEPer' (одиночный пик) подтверждён по официальному Rigol Programming Guide for DM3058/DM3058E ('The command issues a single beep immediately... the beeper must be opened before using this command'), НЕ по гайду для самого DM3068 — не нашли отдельного programming guide для DM3068 с этой секцией. Команда идёт парой с 'SYSTem:BEEPer:STATe ON' (открыть пищалку), т.к. документация прямо предупреждает, что иначе 'SYSTem:BEEPer' будет недействительна. На реальном DM3068 не проверялось; у этой модели уже подтверждён минимум один реальный разрыв с ожидаемым SCPI (подсистема SENS: не работает вовсе, см. notes выше) — доверять этой команде до проверки на живом приборе стоит настороженно."
 }

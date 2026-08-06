@@ -26,9 +26,9 @@ from measurement import (
     DEFAULT_AVERAGING_COUNT, DEFAULT_AVERAGING_DELAY, DEFAULT_DISCARD_FIRST,
     DEFAULT_ADAPTIVE_COOLING_MAX_MULTIPLIER,
 )
-from sweep import Branch, DirectionPreset
+from sweep import Branch, DirectionPreset, plan_custom_sweep
 from safety import emergency_shutdown
-from calibration import CalibrationStatus, check_calibration
+from calibration import CalibrationStatus, resolve_calibration_info
 
 
 LogFn = Callable[[str], None]
@@ -119,22 +119,21 @@ def _log_calibration_warnings(instrument_configs, log: LogFn) -> None:
     в порядке (статус OK) — во всех остальных случаях оператор должен
     узнать об этом сразу, а не долистывать до шапки CSV после измерения:
 
-      - UNKNOWN — в конфиге нет даты поверки вовсе. Сейчас так для всех
-        приборов в репозитории: реальные даты не выдуманы, их должен
-        внести оператор из подлинных свидетельств (см. calibration.py) —
-        и до тех пор "нет данных" само по себе стоит проговорить, а не
+      - UNKNOWN — прибор не заведён в реестре (instrument_registry.json,
+        см. calibration.py) или в его записи нет даты поверки. Реальные
+        даты не выдуманы, их должен внести оператор из подлинных
+        свидетельств — до тех пор "нет данных" стоит проговорить, а не
         молча пропускать;
-      - DUE_SOON/OVERDUE — громко, с ⚠.
-
-    Не блокирует измерение ни при каком статусе — это решение оператора
-    (доверять ли результату как метрологически точному), а не то, что
-    программа вправе принять за него.
+      - DUE_SOON/OVERDUE — громко, с ⚠;
+      - AMBIGUOUS — в реестре несколько приборов этой модели, по *IDN? не
+        различить, какой подключён — тоже громко: оператор должен знать,
+        что поверка НЕ проверена автоматически.
     """
     for cfg in instrument_configs:
-        info = check_calibration(cfg)
+        info = resolve_calibration_info(cfg)
         if info.status == CalibrationStatus.UNKNOWN:
             log(f"ℹ {info.message}")
-        elif info.status in (CalibrationStatus.DUE_SOON, CalibrationStatus.OVERDUE):
+        elif info.status in (CalibrationStatus.DUE_SOON, CalibrationStatus.OVERDUE, CalibrationStatus.AMBIGUOUS):
             log(f"⚠ {info.message}")
 
 
@@ -146,19 +145,25 @@ def write_results_csv(csv_path: Path, df: pd.DataFrame, params: dict,
     Пишет CSV с шапкой метаданных (# ...) и данными измерения.
 
     instrument_configs — конфиги использованных приборов (dmm.config,
-    src.config), по одному на прибор; для каждого пишется модель и, если в
-    конфиге есть дата поверки, её статус (см. calibration.py, п. 3). S/N
-    сюда пока не попадает — *IDN? прибора в текущем коде опрашивается
-    транзитно при автообнаружении и никуда не сохраняется, а формат ответа
-    (порядок полей) у каждого вендора свой; вытаскивать из него серийный
-    номер надёжно — отдельная небольшая задача, не смешана с этой правкой.
+    src.config), по одному на прибор; для каждого пишется модель и статус
+    поверки, разрешённый через реестр физических приборов (см.
+    calibration.resolve_calibration_info, п. 3/6/7). S/N сюда пока не
+    попадает — *IDN? прибора в текущем коде опрашивается транзитно при
+    автообнаружении и никуда не сохраняется, а формат ответа (порядок
+    полей) у каждого вендора свой; вытаскивать из него серийный номер
+    надёжно — отдельная небольшая задача, не смешана с этой правкой. Это же
+    ограничение — причина статуса AMBIGUOUS, когда в реестре несколько
+    приборов одной модели.
     """
     with open(csv_path, 'w', encoding='utf-8') as f:
         f.write(f"# Датчик: {params['label']}\n")
         for cfg in (instrument_configs or []):
-            info = check_calibration(cfg)
+            info = resolve_calibration_info(cfg)
             if info.status == CalibrationStatus.UNKNOWN:
-                f.write(f"# Прибор: {info.model_name} (дата поверки не указана в конфиге)\n")
+                f.write(f"# Прибор: {info.model_name} (прибор не заведён в реестре поверки)\n")
+            elif info.status == CalibrationStatus.AMBIGUOUS:
+                f.write(f"# Прибор: {info.model_name} "
+                        f"(в реестре несколько приборов этой модели — поверка не определена однозначно)\n")
             else:
                 f.write(f"# Прибор: {info.model_name}\n")
                 f.write(f"#   поверка: {info.last_date.isoformat()}, "
@@ -166,8 +171,11 @@ def write_results_csv(csv_path: Path, df: pd.DataFrame, params: dict,
                         f"{' — ПРОСРОЧЕНА' if info.status == CalibrationStatus.OVERDUE else ''}\n")
         f.write(f"# Тип возбуждения: {excitation_type}\n")
         f.write(f"# Единица измерения возбуждения: {unit}\n")
-        f.write(f"# Диапазон заданного возбуждения: {params['X_start']}..{params['X_stop']} {unit}, "
-                f"шаг {params['X_step']} {unit}\n")
+        if params.get('custom_program'):
+            f.write(f"# Кастомная программа измерения: {params['custom_program']}\n")
+        else:
+            f.write(f"# Диапазон заданного возбуждения: {params['X_start']}..{params['X_stop']} {unit}, "
+                    f"шаг {params['X_step']} {unit}\n")
         output_type = params.get('output_type', 'current')
         f.write(f"# Тип выхода датчика: {output_type}\n")
         f.write(f"# Единица измерения выхода: {OUTPUT_UNITS[output_type]}\n")
@@ -181,29 +189,45 @@ def write_results_csv(csv_path: Path, df: pd.DataFrame, params: dict,
             f.write(f"# Номинальный первичный ток: {params['I_nom']} А\n")
         if params.get('ratio'):
             f.write(f"# Коэффициент преобразования 1:{params['ratio']}\n")
+        if params.get('zero_offset'):
+            f.write(f"# Смещение нуля: {params['zero_offset']} {OUTPUT_UNITS[output_type]} "
+                    f"(вычитается из Y_meas при расчёте погрешности — см. analysis.py)\n")
         if params.get('turns') and params['turns'] != 1.0 and excitation_type == 'current':
             f.write(f"# Число витков через датчик: {params['turns']} "
                     f"(реальный вход = X_set × витки, см. колонку X_real)\n")
-        branch = params.get('branch', Branch.BOTH.value)
-        if branch == Branch.BOTH.value:
-            f.write("# Обе полярности сняты автоматически через плату реле; точка X=0 — "
-                    "отдельно, без реле (см. колонку Branch)\n")
-            preset = params.get('preset', DirectionPreset.DIVERGING.value)
-            if preset != DirectionPreset.DIVERGING.value:
-                f.write(f"# Схема прохода: {preset}\n")
+        if params.get('custom_program'):
+            # branch/preset не участвуют в кастомной программе вовсе (см.
+            # sweep.plan_custom_sweep) — полярность каждой точки видна
+            # буквально в колонке Branch, отдельного пояснения не требует.
+            pass
         else:
-            f.write(f"# Снята только одна полярность ({branch}) через плату реле; точка X=0 — "
-                    "без источника (см. колонку Branch)\n")
+            branch = params.get('branch', Branch.BOTH.value)
+            if branch == Branch.BOTH.value:
+                f.write("# Обе полярности сняты автоматически через плату реле; точка X=0 — "
+                        "отдельно, без реле (см. колонку Branch)\n")
+                preset = params.get('preset', DirectionPreset.DIVERGING.value)
+                if preset != DirectionPreset.DIVERGING.value:
+                    f.write(f"# Схема прохода: {preset}\n")
+            elif branch == Branch.NO_RELAY.value:
+                f.write("# Снята одна полярность без платы реле (режим \"No Relay\") — "
+                        "коммутация не использовалась вовсе (см. колонку Branch)\n")
+            else:
+                f.write(f"# Снята только одна полярность ({branch}) через плату реле; точка X=0 — "
+                        "без источника (см. колонку Branch)\n")
         if params.get('stop_on_error', False):
             f.write(f"# Остановка при превышении погрешности: {params.get('error_threshold', 1.0)}%\n")
         if aborted_reason:
             f.write(f"# Измерение прервано досрочно: {aborted_reason}\n")
-        f.write(f"# Задержка установки: {params['delay']} с\n")
-        f.write(f"# Задержка охлаждения: {params['cooling_delay']} с\n")
-        if params.get('adaptive_cooling', False):
-            f.write(f"# Адаптивная задержка охлаждения (BETA, растёт с током до ×"
-                    f"{params.get('adaptive_cooling_max_multiplier', DEFAULT_ADAPTIVE_COOLING_MAX_MULTIPLIER):.1f} "
-                    f"на максимуме развёртки)\n")
+        if params.get('smooth_ramp', False):
+            f.write(f"# Плавное нарастание тока (BETA): время перехода между точками "
+                    f"{params.get('ramp_duration') or 1.0} с (delay/cooling_delay не применялись)\n")
+        else:
+            f.write(f"# Задержка установки: {params['delay']} с\n")
+            f.write(f"# Задержка охлаждения: {params['cooling_delay']} с\n")
+            if params.get('adaptive_cooling', False):
+                f.write(f"# Адаптивная задержка охлаждения (BETA, растёт с током до ×"
+                        f"{params.get('adaptive_cooling_max_multiplier', DEFAULT_ADAPTIVE_COOLING_MAX_MULTIPLIER):.1f} "
+                        f"на максимуме развёртки)\n")
         f.write(f"# Время измерения: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
         f.write(f"# Всего точек: {len(df)}\n")
         f.write("#\n")
@@ -251,7 +275,17 @@ def run_measurement_session(
         rm, excitation_type, dmm_addr, src_addr, source_cfg_dir, source_label, log, dmm_cfg_dir,
     )
 
-    if relay_port:
+    branch = Branch(params.get('branch', Branch.BOTH.value))
+    no_relay = (branch == Branch.NO_RELAY)
+
+    if no_relay:
+        # Режим "без реле" (feature "No Relay"): стенд физически без платы
+        # коммутации — не открываем порт и не ищем его вовсе, а не просто
+        # "не используем то, что нашли". sweep.plan_sweep() в этом режиме
+        # форсирует relay=None на каждой точке (см. sweep.py), поэтому
+        # measurement.run_measurement() безопасно принимает relay=None.
+        log("Реле не используется (режим \"No Relay\").")
+    elif relay_port:
         log(f"Плата реле: используется заданный порт {relay_port}")
     else:
         relay_port = discover_relay_port()
@@ -268,7 +302,7 @@ def run_measurement_session(
     src = handle.src = (CurrentSource(src_addr, src_cfg, rm=rm)
                         if excitation_type == 'current'
                         else VoltageSource(src_addr, src_cfg, rm=rm))
-    relay = handle.relay = RelayController(relay_port)
+    relay = handle.relay = None if no_relay else RelayController(relay_port)
 
     log("Приборы и реле инициализированы. Начинаю измерения...")
     suppress_notifications = params.get('suppress_notifications', False)
@@ -285,16 +319,25 @@ def run_measurement_session(
     # теряться не должны — как раз они обычно и объясняют, почему оператор
     # нажал «Стоп».
     results = []
+    # Планировщик кастомных программ (feature): при заданном custom_program
+    # X_start/X_stop/X_step/branch/preset не имеют смысла вовсе — план
+    # строится буквально из текста программы (см. sweep.plan_custom_sweep),
+    # run_measurement() принимает его через plan_override и не трогает
+    # эти четыре параметра (см. measurement.run_measurement, docstring).
+    custom_program = params.get('custom_program')
+    plan_override = plan_custom_sweep(custom_program) if custom_program else None
     try:
         run_measurement(
             dmm, src, relay, excitation_type,
-            X_start=params['X_start'], X_stop=params['X_stop'], X_step=params['X_step'],
+            X_start=params.get('X_start') or 0.0, X_stop=params.get('X_stop') or 0.0,
+            X_step=params.get('X_step') or 1.0,
             V_limit=params['V_limit'], I_limit=params.get('I_limit'),
             delay=params['delay'], cooling_delay=params['cooling_delay'],
             output_type=output_type,
-            branch=Branch(params.get('branch', Branch.BOTH.value)),
+            branch=branch,
             preset=DirectionPreset(params.get('preset', DirectionPreset.DIVERGING.value)),
             turns=params.get('turns') or 1.0,
+            zero_offset=params.get('zero_offset') or 0.0,
             averaging_count=params.get('averaging_count', DEFAULT_AVERAGING_COUNT),
             averaging_delay=params.get('averaging_delay', DEFAULT_AVERAGING_DELAY),
             discard_first=params.get('discard_first', DEFAULT_DISCARD_FIRST),
@@ -309,6 +352,9 @@ def run_measurement_session(
             log_callback=log,
             results_sink=results,
             suppress_notifications=suppress_notifications,
+            smooth_ramp=params.get('smooth_ramp', False),
+            ramp_duration=params.get('ramp_duration') or 1.0,
+            plan_override=plan_override,
         )
         # Возвращаемый список намеренно игнорируется: его содержимое
         # совпадает с накопителем, а накопитель переживает аварийный останов.
@@ -321,7 +367,10 @@ def run_measurement_session(
     finally:
         # По одному в try: аварийный останов мог уже закрыть часть сессий,
         # и падение на первой не должно оставить остальные открытыми.
+        # relay может быть None в режиме "No Relay" — там нет сессии для закрытия.
         for instrument in (dmm, src, relay):
+            if instrument is None:
+                continue
             try:
                 instrument.close()
             except Exception:

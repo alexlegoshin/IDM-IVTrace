@@ -5,7 +5,7 @@ import pytest
 
 from analysis import (
     load_and_analyze, find_latest_csv, _read_metadata,
-    load_and_analyze_from_params, metadata_i_nom_and_ratio,
+    load_and_analyze_from_params, metadata_i_nom_and_ratio, metadata_zero_offset,
     estimate_ratio_from_data, export_xlsx,
     save_dataframe_with_metadata, apply_invert_input,
 )
@@ -125,9 +125,97 @@ def test_load_and_analyze_detects_nonzero_error(tmp_path):
         ('forward', 10, 0.11),  # 10% выше ожидаемого
     ])
 
-    # I_nom=1000, X=100 -> I_sec_nom=10; expected=0.1; measured=0.11 -> |0.01|/10*100 = 0.1%
+    # I_nom=1000, X=100 -> I_sec_nom=10; expected=0.1; измерено=0.11 -> |0.01|/10*100 = 0.1%
     stats = load_and_analyze(csv_path, I_nom=1000.0, X=100.0, save_png=False, show=False)
     assert stats['max_error_percent'] == pytest.approx(0.1, abs=1e-9)
+
+
+# ----------------------------------------------------------------------
+# zero_offset (feature "offset нуля") — читается из шапки CSV либо
+# передаётся явным параметром (переопределяет шапку)
+# ----------------------------------------------------------------------
+
+def test_load_and_analyze_applies_zero_offset_from_csv_metadata(tmp_path):
+    csv_path = tmp_path / "IVtrace_offset_20260101_000000.csv"
+    # Смещение +0.01 сидит в КАЖДОМ показании, включая X=0 (физически так и
+    # проявляется реальный сдвиг нуля датчика — см. X=0 ниже: 0.01, а не 0):
+    # истинное значение при X=10 — 0.1, но сырое показание 0.11.
+    _write_csv(csv_path, extra_header_lines=[
+        "# Тип возбуждения: current",
+        "# Единица измерения возбуждения: A",
+        "# Смещение нуля: 0.01 А (вычитается из Y_meas при расчёте погрешности — см. analysis.py)",
+    ], rows=[
+        ('forward', 0, 0.01),
+        ('forward', 10, 0.11),
+    ])
+
+    stats = load_and_analyze(csv_path, I_nom=1000.0, X=100.0, save_png=False, show=False)
+    assert stats['max_error_percent'] == pytest.approx(0.0, abs=1e-9)
+
+
+def test_load_and_analyze_explicit_zero_offset_overrides_metadata(tmp_path):
+    csv_path = tmp_path / "IVtrace_offset2_20260101_000000.csv"
+    _write_csv(csv_path, extra_header_lines=[
+        "# Тип возбуждения: current",
+        "# Единица измерения возбуждения: A",
+        "# Смещение нуля: 0.01 А (вычитается из Y_meas при расчёте погрешности — см. analysis.py)",
+    ], rows=[
+        ('forward', 0, 0.01),
+        ('forward', 10, 0.11),
+    ])
+
+    # Явный zero_offset=0.0 должен ПЕРЕОПРЕДЕЛИТЬ метаданные файла (0.01) —
+    # возвращается прежняя (без поправки) ошибка: при X=0 (0.01-0)/10*100=0.1%,
+    # при X=10 (0.11-0.1)/10*100=0.1% — оба одинаковы по модулю.
+    stats = load_and_analyze(csv_path, I_nom=1000.0, X=100.0, save_png=False, show=False,
+                             zero_offset=0.0)
+    assert stats['max_error_percent'] == pytest.approx(0.1, abs=1e-9)
+
+
+def test_load_and_analyze_without_zero_offset_metadata_behaves_as_before(tmp_path):
+    csv_path = tmp_path / "IVtrace_nooffset_20260101_000000.csv"
+    _write_csv(csv_path, extra_header_lines=[
+        "# Тип возбуждения: current",
+        "# Единица измерения возбуждения: A",
+    ], rows=[
+        ('forward', 0, 0.0),
+        ('forward', 10, 0.11),
+    ])
+    stats = load_and_analyze(csv_path, I_nom=1000.0, X=100.0, save_png=False, show=False)
+    assert stats['max_error_percent'] == pytest.approx(0.1, abs=1e-9)
+
+
+def test_metadata_zero_offset_parses_leading_number_ignoring_unit_and_note(tmp_path):
+    csv_path = tmp_path / "IVtrace_meta_20260101_000000.csv"
+    _write_csv(csv_path, extra_header_lines=[
+        "# Смещение нуля: 0.5 А (вычитается из Y_meas при расчёте погрешности — см. analysis.py)",
+    ])
+    assert metadata_zero_offset(csv_path) == pytest.approx(0.5)
+
+
+def test_metadata_zero_offset_handles_negative_value(tmp_path):
+    csv_path = tmp_path / "IVtrace_meta_neg_20260101_000000.csv"
+    _write_csv(csv_path, extra_header_lines=[
+        "# Смещение нуля: -0.25 А (вычитается из Y_meas при расчёте погрешности — см. analysis.py)",
+    ])
+    assert metadata_zero_offset(csv_path) == pytest.approx(-0.25)
+
+
+def test_metadata_zero_offset_missing_returns_none(tmp_path):
+    csv_path = tmp_path / "IVtrace_meta_none_20260101_000000.csv"
+    _write_csv(csv_path)
+    assert metadata_zero_offset(csv_path) is None
+
+
+def test_estimate_ratio_from_data_applies_zero_offset(tmp_path):
+    # Y_meas = X_set/1000 + смещение 0.5 -> без поправки наклон искажён.
+    df = pd.DataFrame([
+        {'X_set': 100.0, 'Y_meas': 100.0 / 1000 + 0.5},
+        {'X_set': 200.0, 'Y_meas': 200.0 / 1000 + 0.5},
+        {'X_set': 300.0, 'Y_meas': 300.0 / 1000 + 0.5},
+    ])
+    result = estimate_ratio_from_data(df, zero_offset=0.5)
+    assert result['X_actual'] == pytest.approx(1000.0, rel=1e-6)
 
 
 def test_load_and_analyze_excludes_rejected_points_from_stats_but_keeps_them_in_dataframe(tmp_path):

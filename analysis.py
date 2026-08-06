@@ -44,7 +44,8 @@ def load_and_analyze(latest_csv: Path, I_nom: float, X: float, save_png: bool = 
                      show: bool = False, close_fig: bool = True,
                      show_error_labels: bool = False,
                      xlim: Optional[tuple] = None, y1lim: Optional[tuple] = None,
-                     y2lim: Optional[tuple] = None) -> dict:
+                     y2lim: Optional[tuple] = None,
+                     zero_offset: Optional[float] = None) -> dict:
     """
     Читает CSV с результатами измерения, считает приведённую погрешность
     относительно ожидаемого выходного тока датчика (коэффициент 1:X),
@@ -57,6 +58,10 @@ def load_and_analyze(latest_csv: Path, I_nom: float, X: float, save_png: bool = 
     xlim/y1lim/y2lim — необязательные (min, max) для оси X (общая для обоих
     графиков) и осей Y верхнего/нижнего графика (п.36); None — авто (matplotlib
     сам подберёт диапазон, как раньше).
+    zero_offset — известное смещение нуля датчика (feature); None (по
+    умолчанию) значит "взять из шапки CSV" (см. metadata_zero_offset) — явно
+    переданное значение ПЕРЕОПРЕДЕЛЯЕТ то, что записано в файле (нужно для
+    старых CSV без этой метаданной или для проверки другого значения).
 
     Возвращает словарь со статистикой и путями к файлам.
     """
@@ -105,6 +110,18 @@ def load_and_analyze(latest_csv: Path, I_nom: float, X: float, save_png: bool = 
     X_start = df[excitation_col].min()
     X_stop = df[excitation_col].max()
 
+    # Смещение нуля (feature): известный осознанный сдвиг нуля датчика,
+    # сохранённый в шапке при измерении (см. orchestrate.write_results_csv,
+    # measurement.run_measurement) — вычитается из СЫРОГО meas_col здесь же,
+    # той же поправкой, что применялась live во время измерения (см.
+    # measurement._measure_point_row), чтобы график и решения о браке не
+    # расходились. Столбец meas_col в df НЕ переписывается (сырые данные
+    # остаются сырыми) — поправка живёт только в производных Y_expected/
+    # Error_percent и в том, что рисуется на графике.
+    if zero_offset is None:
+        zero_offset = metadata_zero_offset(latest_csv) or 0.0
+    meas_corrected = df[meas_col] - zero_offset
+
     # ---------- Расчёт погрешности ----------
     # Погрешность всегда считается относительно выхода датчика (meas_col),
     # независимо от того, чем датчик возбуждался и что именно он выдаёт.
@@ -117,7 +134,7 @@ def load_and_analyze(latest_csv: Path, I_nom: float, X: float, save_png: bool = 
     # Все места ниже, где раньше подразумевалась неотрицательность
     # (сводный "максимум", подписи на графике), берут abs() явно, там, где
     # это действительно нужно, а не потому что оно "само так получалось".
-    df['Error_percent'] = (df[meas_col] - df['Y_expected']) / Y_sec_nom * 100
+    df['Error_percent'] = (meas_corrected - df['Y_expected']) / Y_sec_nom * 100
 
     # Точки не участвуют в сводной статистике погрешности по двум причинам:
     #  - Rejected — забракованы контрольными промерами (п.9, measurement.py),
@@ -159,7 +176,11 @@ def load_and_analyze(latest_csv: Path, I_nom: float, X: float, save_png: bool = 
     for branch_name, sub in df.groupby('Branch', sort=False):
         sub = sub.sort_values(excitation_col)
         style = branch_styles.get(branch_name, dict(color='gray', marker='.', label=f'{label} ({branch_name})'))
-        ax1.plot(sub[excitation_col], sub[meas_col], marker=style['marker'], linestyle='-',
+        # meas_corrected (см. выше) — тот же ряд, что и meas_col, за вычетом
+        # смещения нуля; на графике показываем скорректированное значение —
+        # иначе кривая была бы визуально сдвинута на константу, которую
+        # оператор и так знает и уже учёл.
+        ax1.plot(sub[excitation_col], meas_corrected.loc[sub.index], marker=style['marker'], linestyle='-',
                   color=style['color'], markersize=4, label=style['label'])
 
     df_sorted_for_expected = df.sort_values(excitation_col)
@@ -321,11 +342,30 @@ def metadata_i_nom_and_ratio(csv_path: Path) -> tuple:
     return I_nom, X
 
 
+def metadata_zero_offset(csv_path: Path) -> Optional[float]:
+    """
+    Достаёт смещение нуля датчика из шапки метаданных CSV (см.
+    orchestrate.write_results_csv, "# Смещение нуля"), если оно там было
+    сохранено. Строка несёт единицу измерения и поясняющий текст после
+    числа ("0.5 А (вычитается из Y_meas ...)") — берём только ведущее
+    число, тот же приём, что и в metadata_i_nom_and_ratio.
+    """
+    metadata = _read_metadata(Path(csv_path))
+    raw = metadata.get('Смещение нуля')
+    if not raw:
+        return None
+    match = re.match(r'(-?[\d.,]+)', raw.strip())
+    if not match:
+        return None
+    return float(match.group(1).replace(',', '.'))
+
+
 # ----------------------------------------------------------------------
 # п.10 (BETA) — определение фактического коэффициента преобразования
 # ----------------------------------------------------------------------
 
-def estimate_ratio_from_data(df: pd.DataFrame, excitation_col: str = 'X_set') -> dict:
+def estimate_ratio_from_data(df: pd.DataFrame, excitation_col: str = 'X_set',
+                             zero_offset: float = 0.0) -> dict:
     """
     BETA (см. PLAN_V2.md, В-4): определяет фактический коэффициент
     преобразования 1:X по уже снятым точкам методом наименьших квадратов —
@@ -336,6 +376,11 @@ def estimate_ratio_from_data(df: pd.DataFrame, excitation_col: str = 'X_set') ->
     процент расхождения между ними: для малых коэффициентов шаг 50 грубый
     (например, между 1:50 и 1:100 ничего нет), и оператор должен это видеть,
     а не получать округление молча.
+
+    zero_offset (feature) — известное смещение нуля датчика, вычитается из
+    Y_meas ДО подгонки прямой через ноль: без поправки смещение сместило бы
+    саму оценку наклона (прямая уже не через ноль на самом деле), см.
+    analysis.metadata_zero_offset для чтения значения из шапки CSV.
     """
     excluded_mask = pd.Series(False, index=df.index)
     if 'Rejected' in df.columns:
@@ -348,7 +393,7 @@ def estimate_ratio_from_data(df: pd.DataFrame, excitation_col: str = 'X_set') ->
     # I_meas_A — старые CSV, где выход всегда был только током.
     meas_col = 'Y_meas' if 'Y_meas' in df.columns else 'I_meas_A'
     x = accepted[excitation_col].to_numpy(dtype=float)
-    y = accepted[meas_col].to_numpy(dtype=float)
+    y = accepted[meas_col].to_numpy(dtype=float) - zero_offset
     denom = float(np.sum(x * x))
     if denom == 0.0:
         raise ValueError("Недостаточно данных для определения коэффициента: все точки на нуле возбуждения.")

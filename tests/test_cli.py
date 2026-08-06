@@ -55,10 +55,11 @@ def test_validate_rejects_negative_delays():
 def test_validate_requires_positive_vlimit_only_for_current():
     p = _good_current_params(); p['V_limit'] = 0
     assert any('напряжения' in e for e in validate_measure_params(p, 'current', current_source_limits={}))
-    # для напряжения V_limit не проверяется (X_stop=60 — в пределах рабочего потолка п.35)
+    # для напряжения V_limit не проверяется (X_stop=60 — в пределах рабочего потолка п.35),
+    # но I_limit проверяется симметрично V_limit у тока
     pv = {'X_start': 0.0, 'X_stop': 60.0, 'X_step': 4.0,
-          'delay': 1.0, 'cooling_delay': 0.5, 'V_limit': 0.0}
-    assert validate_measure_params(pv, 'voltage', current_source_limits={}) == []
+          'delay': 1.0, 'cooling_delay': 0.5, 'V_limit': 0.0, 'I_limit': 1.0}
+    assert validate_measure_params(pv, 'voltage', voltage_source_limits={}) == []
 
 
 # ----------------------------------------------------------------------
@@ -74,6 +75,86 @@ def test_validate_blocks_current_above_relay_hard_limit():
 def test_validate_allows_current_at_exactly_relay_hard_limit():
     p = _good_current_params(); p['X_stop'] = 800.0
     assert validate_measure_params(p, 'current', current_source_limits={}) == []
+
+
+def test_validate_skips_relay_hard_limit_for_no_relay_branch():
+    # Лимит реле — про физические контакты платы реле. В режиме "No Relay"
+    # (feature) платы физически нет в цепи вовсе — проверять её предел
+    # бессмысленно (см. cli.validate_measure_params).
+    p = _good_current_params(); p['X_stop'] = 800.1; p['branch'] = 'no_relay'
+    errors = validate_measure_params(p, 'current', current_source_limits={})
+    assert not any('800' in e for e in errors)
+
+
+# ----------------------------------------------------------------------
+# smooth_ramp (feature "плавное нарастание", BETA) — только ток, до 300 А
+# ----------------------------------------------------------------------
+
+def test_smooth_ramp_allowed_at_or_below_300a():
+    p = _good_current_params(); p['X_stop'] = 300.0
+    p['smooth_ramp'] = True; p['ramp_duration'] = 2.0
+    errors = validate_measure_params(p, 'current', current_source_limits={})
+    assert errors == []
+
+
+def test_smooth_ramp_blocked_above_300a():
+    p = _good_current_params(); p['X_stop'] = 300.1
+    p['smooth_ramp'] = True; p['ramp_duration'] = 2.0
+    errors = validate_measure_params(p, 'current', current_source_limits={})
+    assert any('300' in e for e in errors)
+
+
+def test_smooth_ramp_requires_positive_ramp_duration():
+    p = _good_current_params(); p['smooth_ramp'] = True; p['ramp_duration'] = 0.0
+    errors = validate_measure_params(p, 'current', current_source_limits={})
+    assert any('шаг' in e.lower() for e in errors)
+
+
+def test_smooth_ramp_ignored_when_not_set_even_above_300a():
+    # Без smooth_ramp=True 300+ А — это просто обычная (не-BETA) уставка,
+    # ограниченная только реле/паспортом источника, не потолком 300 А.
+    p = _good_current_params(); p['X_stop'] = 500.0
+    errors = validate_measure_params(p, 'current', current_source_limits={})
+    assert not any('300' in e for e in errors)
+
+
+def test_smooth_ramp_rejected_for_voltage_excitation():
+    pv = {'X_start': 0.0, 'X_stop': 10.0, 'X_step': 1.0,
+          'delay': 0.1, 'cooling_delay': 0.1, 'V_limit': 0.0, 'I_limit': 1.0,
+          'smooth_ramp': True, 'ramp_duration': 2.0}
+    errors = validate_measure_params(pv, 'voltage', voltage_source_limits={})
+    assert any('только для возбуждения током' in e for e in errors)
+
+
+# ----------------------------------------------------------------------
+# custom_program (feature "планировщик кастомных программ", BETA)
+# ----------------------------------------------------------------------
+
+def test_custom_program_valid_text_skips_x_start_stop_step_requirement():
+    p = {'custom_program': '-5, 40, -15, 5', 'delay': 0.1, 'cooling_delay': 0.1, 'V_limit': 5.0}
+    errors = validate_measure_params(p, 'current', current_source_limits={})
+    assert errors == []
+
+
+def test_custom_program_malformed_text_becomes_validation_error():
+    p = {'custom_program': 'garbage', 'delay': 0.1, 'cooling_delay': 0.1, 'V_limit': 5.0}
+    errors = validate_measure_params(p, 'current', current_source_limits={})
+    assert any('garbage' in e for e in errors)
+
+
+def test_custom_program_still_checked_against_relay_hard_limit():
+    p = {'custom_program': '900', 'delay': 0.1, 'cooling_delay': 0.1, 'V_limit': 5.0}
+    errors = validate_measure_params(p, 'current', current_source_limits={})
+    assert any('800' in e for e in errors)
+
+
+def test_custom_program_max_abs_used_for_relay_limit_not_literal_x_start_stop():
+    # X_start/X_stop заведомо огромные — не должны участвовать в проверке,
+    # раз задана кастомная программа (её собственный максимум — всего 5 А).
+    p = {'custom_program': '-5, 5', 'X_start': 999.0, 'X_stop': 999.0,
+         'delay': 0.1, 'cooling_delay': 0.1, 'V_limit': 5.0}
+    errors = validate_measure_params(p, 'current', current_source_limits={})
+    assert errors == []
 
 
 def test_validate_does_not_block_on_relay_limit_for_voltage_excitation():
@@ -343,6 +424,115 @@ def test_resolve_measure_params_branch_preset_turns_averaging_from_cli(tmp_path)
     assert params['discard_first'] is False
 
 
+def test_smooth_ramp_flags_flow_into_params_from_cli(tmp_path):
+    parser = build_parser()
+    args = _measure_args(parser, [
+        "--excitation", "current",
+        "--start", "0", "--stop", "10", "--step", "1",
+        "--vlimit", "5", "--label", "TestSensor", "--yes",
+        "--smooth-ramp", "--ramp-duration", "3.0",
+    ])
+    mgr = ConfigManager(tmp_path / "cfg.json")
+    params = resolve_measure_params(args, mgr)
+    assert params['smooth_ramp'] is True
+    assert params['ramp_duration'] == 3.0
+    assert params['delay'] == 0.0
+    assert params['cooling_delay'] == 0.0
+
+
+def test_custom_program_flows_into_params_from_cli(tmp_path):
+    parser = build_parser()
+    args = _measure_args(parser, [
+        "--excitation", "current",
+        "--custom-program", "-25, 40, -15, +5",
+        "--vlimit", "5", "--delay", "0.1", "--cool", "0.1",
+        "--label", "TestSensor", "--yes",
+    ])
+    mgr = ConfigManager(tmp_path / "cfg.json")
+    params = resolve_measure_params(args, mgr)
+    assert params['custom_program'] == "-25, 40, -15, +5"
+
+
+def test_custom_program_can_combine_with_smooth_ramp(tmp_path):
+    parser = build_parser()
+    args = _measure_args(parser, [
+        "--excitation", "current",
+        "--custom-program", "-25, 40, -15, +5",
+        "--vlimit", "5", "--label", "TestSensor", "--yes",
+        "--smooth-ramp", "--ramp-duration", "2.0",
+    ])
+    mgr = ConfigManager(tmp_path / "cfg.json")
+    params = resolve_measure_params(args, mgr)
+    assert params['custom_program'] == "-25, 40, -15, +5"
+    assert params['smooth_ramp'] is True
+    assert params['ramp_duration'] == 2.0
+
+
+def test_custom_program_defaults_to_none_when_not_given(tmp_path):
+    parser = build_parser()
+    args = _measure_args(parser, [
+        "--excitation", "current",
+        "--start", "0", "--stop", "10", "--step", "1",
+        "--vlimit", "5", "--delay", "0.1", "--cool", "0.1",
+        "--label", "TestSensor", "--yes",
+    ])
+    mgr = ConfigManager(tmp_path / "cfg.json")
+    params = resolve_measure_params(args, mgr)
+    assert params['custom_program'] is None
+
+
+def test_smooth_ramp_defaults_to_false(tmp_path):
+    parser = build_parser()
+    args = _measure_args(parser, [
+        "--excitation", "current",
+        "--start", "0", "--stop", "10", "--step", "1",
+        "--vlimit", "5", "--delay", "0.1", "--cool", "0.1",
+        "--label", "TestSensor", "--yes",
+    ])
+    mgr = ConfigManager(tmp_path / "cfg.json")
+    params = resolve_measure_params(args, mgr)
+    assert params['smooth_ramp'] is False
+
+
+def test_zero_offset_flows_into_params_from_cli(tmp_path):
+    parser = build_parser()
+    args = _measure_args(parser, [
+        "--excitation", "current",
+        "--start", "0", "--stop", "10", "--step", "1",
+        "--vlimit", "5", "--delay", "0.1", "--cool", "0.1",
+        "--label", "TestSensor", "--yes", "--zero-offset", "0.5",
+    ])
+    mgr = ConfigManager(tmp_path / "cfg.json")
+    params = resolve_measure_params(args, mgr)
+    assert params['zero_offset'] == 0.5
+
+
+def test_zero_offset_defaults_to_zero_when_not_given(tmp_path):
+    parser = build_parser()
+    args = _measure_args(parser, [
+        "--excitation", "current",
+        "--start", "0", "--stop", "10", "--step", "1",
+        "--vlimit", "5", "--delay", "0.1", "--cool", "0.1",
+        "--label", "TestSensor", "--yes",
+    ])
+    mgr = ConfigManager(tmp_path / "cfg.json")
+    params = resolve_measure_params(args, mgr)
+    assert params['zero_offset'] == 0.0
+
+
+def test_branch_accepts_no_relay_choice(tmp_path):
+    parser = build_parser()
+    args = _measure_args(parser, [
+        "--excitation", "current",
+        "--start", "0", "--stop", "10", "--step", "1",
+        "--vlimit", "5", "--delay", "0.1", "--cool", "0.1",
+        "--label", "TestSensor", "--yes", "--branch", "no_relay",
+    ])
+    mgr = ConfigManager(tmp_path / "cfg.json")
+    params = resolve_measure_params(args, mgr)
+    assert params['branch'] == 'no_relay'
+
+
 def test_resolve_measure_params_step_zero_raises_value_error(tmp_path):
     parser = build_parser()
     args = _measure_args(parser, [
@@ -420,6 +610,7 @@ def test_resolve_measure_params_voltage_excitation_ignores_vlimit(tmp_path):
     args = _measure_args(parser, [
         "--excitation", "voltage",
         "--start", "0", "--stop", "50", "--step", "4",
+        "--ilimit", "1",
         "--delay", "1", "--cool", "0.5",
         "--label", "VSensor", "--yes",
     ])
@@ -635,18 +826,36 @@ def test_calibration_list_parser():
 def test_calibration_set_parser():
     parser = build_parser()
     args = parser.parse_args([
-        "calibration", "set", "akip2101.json", "--date", "2026-01-01", "--interval-months", "12",
+        "calibration", "set", "akip2101", "--serial", "SN1",
+        "--date", "2026-01-01", "--interval-months", "12",
     ])
     assert args.calibration_command == "set"
-    assert args.config_file == "akip2101.json"
+    assert args.model_id == "akip2101"
+    assert args.serial == "SN1"
     assert args.date == "2026-01-01"
     assert args.interval_months == 12
+
+
+def test_calibration_set_serial_defaults_to_empty():
+    parser = build_parser()
+    args = parser.parse_args([
+        "calibration", "set", "akip2101", "--date", "2026-01-01", "--interval-months", "12",
+    ])
+    assert args.serial == ""
 
 
 def test_calibration_set_requires_date_and_interval():
     parser = build_parser()
     with pytest.raises(SystemExit):
-        parser.parse_args(["calibration", "set", "akip2101.json"])
+        parser.parse_args(["calibration", "set", "akip2101"])
+
+
+def test_calibration_delete_parser():
+    parser = build_parser()
+    args = parser.parse_args(["calibration", "delete", "akip2101", "--serial", "SN1"])
+    assert args.calibration_command == "delete"
+    assert args.model_id == "akip2101"
+    assert args.serial == "SN1"
 
 
 def test_config_show_parser():

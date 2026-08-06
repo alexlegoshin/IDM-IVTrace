@@ -44,6 +44,13 @@ MAX_MEASUREMENT_ATTEMPTS = 3
 # может вырасти относительно заданной cooling_delay при adaptive_cooling=True.
 DEFAULT_ADAPTIVE_COOLING_MAX_MULTIPLIER = 5.0
 
+# Между шагами плавного нарастания (feature, BETA) — не спамим источник частыми командами
+# (баг-репорт: "не надо слать тысячи команд"). Если на переход отведено
+# меньше этого порога секунд, промежуточных шагов не будет вовсе — один
+# прямой переход, источник сглаживает его сам за счёт собственной
+# конструкции (slew rate).
+SMOOTH_RAMP_MIN_DURATION_FOR_STEPS_S = 2.0
+
 
 def _adaptive_cooling_delay(base_delay: float, magnitude: float, max_magnitude: float,
                              max_multiplier: float = DEFAULT_ADAPTIVE_COOLING_MAX_MULTIPLIER) -> float:
@@ -66,6 +73,48 @@ def _adaptive_cooling_delay(base_delay: float, magnitude: float, max_magnitude: 
         return base_delay
     fraction = min(1.0, magnitude / max_magnitude) ** 2
     return base_delay * (1.0 + fraction * (max_multiplier - 1.0))
+
+
+def _ease_in_out(p: float, k: float = 5.0) -> float:
+    """
+    Сглаживание перехода 0->1 (feature "плавное нарастание", BETA): первая
+    половина — экспоненциальный набор, вторая — та же кривая, зеркально
+    перевёрнутая, для плавного выхода на цель (как попросил заказчик:
+    "сначала экспонента набор, затем экспонента перевёрнутая"). k — крутизна
+    (больше — резче старт/финиш при той же общей длительности).
+    """
+    if p <= 0.0:
+        return 0.0
+    if p >= 1.0:
+        return 1.0
+    scale = 0.5 / (1.0 - math.exp(-k * 0.5))
+    if p <= 0.5:
+        return scale * (1.0 - math.exp(-k * p))
+    return 1.0 - scale * (1.0 - math.exp(-k * (1.0 - p)))
+
+
+def _ramp_steps(start: float, target: float, duration: float) -> List[Tuple[float, float]]:
+    """
+    Возвращает [(значение_уставки, пауза_ПОСЛЕ_записи), ...] для плавного
+    перехода start->target за duration секунд.
+
+    Баг-репорт (прямое указание заказчика): не спамить источник частыми
+    командами — примерно ОДНА команда на секунду перехода, не больше. Если
+    duration меньше SMOOTH_RAMP_MIN_DURATION_FOR_STEPS_S — промежуточных
+    шагов просто не может быть достаточно, чтобы это имело смысл: один
+    прямой переход без выключения выхода, источник сам сглаживает его
+    физически за счёт собственной конструкции (slew rate).
+    """
+    if duration < SMOOTH_RAMP_MIN_DURATION_FOR_STEPS_S or start == target:
+        return [(target, 0.0)]
+    n = max(2, round(duration))
+    dt = duration / n
+    steps = []
+    for i in range(1, n + 1):
+        frac = _ease_in_out(i / n)
+        value = start + (target - start) * frac
+        steps.append((value, dt))
+    return steps
 
 
 def _log(message: str, log_callback: Optional[Callable[[str], None]]) -> None:
@@ -204,6 +253,7 @@ def _measure_point_row(dmm: DMM, src: Union[CurrentSource, VoltageSource],
                         max_magnitude: float = 0.0,
                         adaptive_cooling_max_multiplier: float = DEFAULT_ADAPTIVE_COOLING_MAX_MULTIPLIER,
                         suppress_notifications: bool = False,
+                        zero_offset: float = 0.0,
                         ) -> Tuple[Dict, Optional[str]]:
     """
     Измеряет одну ненулевую точку плана — с поправкой на витки (п.37),
@@ -268,13 +318,21 @@ def _measure_point_row(dmm: DMM, src: Union[CurrentSource, VoltageSource],
         if expected is None or math.isnan(i_avg):
             break  # нечего сверять с ожиданием — принимаем как есть, повторов нет
 
+        # Смещение нуля (feature) вычитается ДО проверок полярности/
+        # погрешности — обе завязаны на знак/величину показания, а
+        # известный осознанный сдвиг не должен читаться как перепутанная
+        # полярность или как реальное расхождение с ожиданием. Y_meas в
+        # результате остаётся СЫРЫМ (см. row ниже) — поправка не изменяет
+        # данные, только решения, принятые на их основе.
+        i_avg_corrected = i_avg - zero_offset
+
         # п.14: перепутанная полярность/ориентация датчика — знак показания
         # не совпадает со знаком уставки. На X=0 не распространяется (сюда
         # эта функция для него не вызывается вовсе, см. _measure_zero_row).
-        if i_avg != 0 and (i_avg > 0) != (point.x_set > 0):
+        if i_avg_corrected != 0 and (i_avg_corrected > 0) != (point.x_set > 0):
             polarity_mismatch = True
 
-        error_percent = abs(abs(i_avg) - expected) / expected * 100.0 if expected > 0 else None
+        error_percent = abs(abs(i_avg_corrected) - expected) / expected * 100.0 if expected > 0 else None
         if error_percent is None or error_percent <= error_threshold:
             break  # в допуске — точка принята
 
@@ -315,7 +373,106 @@ def _measure_point_row(dmm: DMM, src: Union[CurrentSource, VoltageSource],
     return row, aborted_reason
 
 
-def run_measurement(dmm: DMM, src: Union[CurrentSource, VoltageSource], relay: RelayController,
+def _measure_point_row_ramp(dmm: DMM, src: CurrentSource, output_type: str,
+                            point: SweepPoint, prev_magnitude: float, ramp_duration: float,
+                            ratio: Optional[float], turns: float, averaging: dict,
+                            stop_on_error: bool, error_threshold: float,
+                            is_first_of_run: bool,
+                            log_callback: Optional[Callable[[str], None]],
+                            zero_offset: float = 0.0,
+                            suppress_notifications: bool = False,
+                            ) -> Tuple[Dict, Optional[str]]:
+    """
+    Вариант _measure_point_row для плавного нарастания (feature, BETA,
+    только возбуждение ТОКОМ, см. run_measurement/smooth_ramp). Отличия от
+    обычной точки:
+
+      - вместо мгновенного скачка (set_current + delay) — последовательность
+        промежуточных уставок по _ramp_steps от prev_magnitude до
+        point.magnitude; источник НЕ выключается ни в начале, ни в конце
+        (output_on() вызывается один раз, output_off() здесь нет вовсе —
+        см. run_measurement, где выход гасится только на границе реле/в
+        конце всего измерения);
+      - задержка на охлаждение не применяется вообще — по прямому
+        требованию заказчика этот режим и охлаждение взаимно исключают
+        друг друга (в UI при включении режима поле охлаждения скрывается);
+      - контрольные повторы (п.9) НЕ повторяют само нарастание (это и есть
+        "не слать лишние команды на источник") — при превышении порога
+        погрешности переснимается только ЧТЕНИЕ, уставка уже стоит на
+        месте и её незачем трогать заново.
+
+    Возвращает (row, aborted_reason) — та же форма, что и у обычной точки.
+    """
+    unit = EXCITATION_UNITS['current']
+    output_unit = OUTPUT_UNITS[output_type]
+    real_input = point.x_set * turns
+    expected = (point.magnitude * turns / ratio) if (ratio and ratio > 0) else None
+
+    src.output_on()
+    for value, wait in _ramp_steps(prev_magnitude, point.magnitude, ramp_duration):
+        src.set_current(value)
+        if wait:
+            time.sleep(wait)
+
+    i_avg = math.nan
+    error_percent: Optional[float] = None
+    rejected = False
+    reject_reason = ''
+    polarity_mismatch = False
+    aborted_reason: Optional[str] = None
+
+    for attempt in range(1, MAX_MEASUREMENT_ATTEMPTS + 1):
+        readings = _read_averaged(dmm, **averaging)
+        i_avg = _average(readings)
+        if readings:
+            dmm.auto_range(i_avg, is_first=(is_first_of_run and attempt == 1))
+
+        if expected is None or math.isnan(i_avg):
+            break
+
+        i_avg_corrected = i_avg - zero_offset
+        if i_avg_corrected != 0 and (i_avg_corrected > 0) != (point.x_set > 0):
+            polarity_mismatch = True
+
+        error_percent = abs(abs(i_avg_corrected) - expected) / expected * 100.0 if expected > 0 else None
+        if error_percent is None or error_percent <= error_threshold:
+            break
+
+        if attempt == MAX_MEASUREMENT_ATTEMPTS:
+            rejected = True
+            reject_reason = (
+                f"погрешность {error_percent:.2f}% > {error_threshold}% "
+                f"({MAX_MEASUREMENT_ATTEMPTS} повторных отсчёта без повторного нарастания — режим BETA)"
+            )
+            if stop_on_error:
+                aborted_reason = (
+                    f"Погрешность {error_percent:.2f}% превысила порог {error_threshold}% "
+                    f"на X_уст = {point.x_set:+.4f} {unit} ({MAX_MEASUREMENT_ATTEMPTS} повторных отсчёта)"
+                )
+        # иначе — не последняя попытка, переснимаем ЧТЕНИЕ (см. докстринг)
+
+    msg = (f"  [BETA плавно] X_уст = {point.x_set:+.4f} {unit}  ->  Y_изм = {i_avg:.6f} {output_unit}")
+    if rejected:
+        msg += f"  [БРАК: {reject_reason}]"
+    if polarity_mismatch and not suppress_notifications:
+        msg += "  [ВНИМАНИЕ: похоже, перепутана полярность/ориентация датчика]"
+    _log(msg, log_callback)
+
+    row = {
+        'Timestamp': datetime.now().isoformat(),
+        'Branch': 'forward' if point.x_set >= 0 else 'reverse',
+        'X_set': point.x_set,
+        'X_real': real_input,
+        'Y_meas': i_avg,
+        'Y_unit': output_unit,
+        'Rejected': rejected,
+        'RejectReason': reject_reason,
+        'PolarityMismatch': polarity_mismatch,
+    }
+    return row, aborted_reason
+
+
+def run_measurement(dmm: DMM, src: Union[CurrentSource, VoltageSource], relay: Optional[RelayController],
                      excitation_type: str,
                      X_start: float, X_stop: float, X_step: float,
                      V_limit: float, delay: float, cooling_delay: float,
@@ -324,6 +481,7 @@ def run_measurement(dmm: DMM, src: Union[CurrentSource, VoltageSource], relay: R
                      branch: Branch = Branch.BOTH,
                      preset: DirectionPreset = DirectionPreset.DIVERGING,
                      turns: float = 1.0,
+                     zero_offset: float = 0.0,
                      averaging_count: int = DEFAULT_AVERAGING_COUNT,
                      averaging_delay: float = DEFAULT_AVERAGING_DELAY,
                      discard_first: bool = DEFAULT_DISCARD_FIRST,
@@ -336,12 +494,55 @@ def run_measurement(dmm: DMM, src: Union[CurrentSource, VoltageSource], relay: R
                      log_callback: Optional[Callable[[str], None]] = None,
                      results_sink: Optional[List[Dict]] = None,
                      suppress_notifications: bool = False,
+                     smooth_ramp: bool = False,
+                     ramp_duration: float = 1.0,
+                     plan_override: Optional[List[SweepPoint]] = None,
                      ) -> Tuple[List[Dict], Optional[str]]:
     """
     Полный цикл измерения амплитудной характеристики датчика: строит план
     (sweep.plan_sweep — вся комбинаторика знаков/направлений/пресетов там,
     см. п.8/17/18/19) и исполняет его точка за точкой, переключая реле
     только когда требуемое положение меняется между соседними точками.
+
+    plan_override (feature "планировщик кастомных программ") — если
+    передан, используется буквально ВМЕСТО plan_sweep(X_start, X_stop,
+    X_step, branch, preset) — эти четыре параметра тогда просто
+    игнорируются планировщиком (см. sweep.plan_custom_sweep). Сам
+    измерительный цикл не знает и не обязан знать, откуда план взялся —
+    он одинаково "тупо" исполняет любой список SweepPoint (см. докстринг
+    sweep.py).
+
+    zero_offset (feature "offset нуля") — известное смещение нуля датчика
+    (некоторые датчики осознанно смещены — выдают ненулевой сигнал при
+    X=0). Вычитается из КАЖДОГО ненулевого измерения ДО проверки полярности
+    и погрешности (см. _measure_point_row) — то есть влияет на живые
+    решения о браке/остановке по погрешности, а не только на пост-обработку
+    графика (см. analysis.py — там применяется та же поправка из метаданных
+    CSV, чтобы график и живые решения не расходились). В CSV пишется СЫРОЕ
+    показание (Y_meas, без поправки) — поправка не модифицирует данные, а
+    хранится отдельно (см. orchestrate.write_results_csv, "# Смещение нуля").
+    Точка X=0 (_measure_zero_row) поправку не получает — там измеряется
+    ровно то смещение, о котором идёт речь, вычитать его из самого себя
+    было бы не нужно и вводило бы в заблуждение (X=0 должен показывать
+    величину смещения как она есть).
+
+    relay — None допустим тогда и только тогда, когда branch=Branch.NO_RELAY
+    (стенд без платы реле, п. "No Relay"): sweep.plan_sweep() в этом режиме
+    форсирует relay=None на КАЖДОЙ точке плана, поэтому ветка переключения
+    реле (ниже) физически не выполняется и relay не разыменовывается. Для
+    любого другого branch relay обязателен.
+
+    smooth_ramp/ramp_duration (feature "плавное нарастание", BETA) — только
+    для excitation_type='current' и только до limits.SMOOTH_RAMP_MAX_CURRENT_A
+    включительно (enforced выше, в cli.validate_measure_params — эта
+    функция только исполняет). Заменяет обычный скачок set_current+delay на
+    плавный переход по _ramp_steps (см. _measure_point_row_ramp) —
+    источник остаётся включённым непрерывно между точками ОДНОЙ ветви,
+    delay/cooling_delay/adaptive_cooling в этом режиме не применяются вовсе
+    (взаимно исключают друг друга по прямому требованию заказчика). На
+    границе смены полярности выход всё равно гасится ПЕРЕД коммутацией
+    реле (переключать реле под током недопустимо) — следующая ветвь
+    начинает плавный набор с нуля, не с прошлого значения предыдущей ветви.
 
     turns (п.37) — число витков провода через окно датчика. Реальный вход
     датчика = |X_set| × turns; именно от него считается ожидаемый выход
@@ -404,7 +605,7 @@ def run_measurement(dmm: DMM, src: Union[CurrentSource, VoltageSource], relay: R
     else:
         raise ValueError(f"Неизвестный тип возбуждения: {excitation_type!r} (ожидается 'current' или 'voltage')")
 
-    plan = plan_sweep(X_start, X_stop, X_step, branch=branch, preset=preset)
+    plan = plan_override if plan_override is not None else plan_sweep(X_start, X_stop, X_step, branch=branch, preset=preset)
     averaging = dict(count=averaging_count, delay=averaging_delay, discard_first=discard_first)
     max_magnitude = max((p.magnitude for p in plan), default=0.0)
 
@@ -412,6 +613,12 @@ def run_measurement(dmm: DMM, src: Union[CurrentSource, VoltageSource], relay: R
     aborted_reason: Optional[str] = None
     current_relay_state: Optional[str] = None  # что реально сейчас установлено на плате
     run_started_fresh = True  # первая точка нового (после смены реле) прогона — под is_first в auto_range
+    # Плавное нарастание (BETA): что реально стоит на источнике ПРЯМО
+    # СЕЙЧАС, чтобы следующая точка знала, откуда набирать. 0.0 — источник
+    # выключен/на нуле (старт сессии, после нулевой точки, после смены
+    # полярности — во всех этих случаях набор идёт с нуля, не с прошлого
+    # значения предыдущей ветви).
+    ramp_from = 0.0
 
     try:
         for point in plan:
@@ -420,6 +627,13 @@ def run_measurement(dmm: DMM, src: Union[CurrentSource, VoltageSource], relay: R
                 break
 
             if point.relay != current_relay_state and point.relay is not None:
+                if smooth_ramp:
+                    # Переключать реле под током недопустимо — в обычном
+                    # режиме выход уже гарантированно выключен к этому
+                    # моменту (см. _measure_point_row), а в этом режиме
+                    # источник мог остаться включённым с прошлой точки.
+                    src.output_off()
+                    ramp_from = 0.0
                 if point.relay == 'forward':
                     _log("\nПереключаю реле: прямое направление (IFW)...", log_callback)
                     _log(f"  Ответ реле: {relay.forward()}", log_callback)
@@ -435,6 +649,18 @@ def run_measurement(dmm: DMM, src: Union[CurrentSource, VoltageSource], relay: R
 
             if point.is_zero:
                 row = _measure_zero_row(dmm, src, excitation_type, output_type, averaging, log_callback)
+                ramp_from = 0.0  # источник выключен на нулевой точке — следующая начинает с нуля
+            elif smooth_ramp and excitation_type == 'current':
+                row, point_aborted = _measure_point_row_ramp(
+                    dmm, src, output_type, point, ramp_from, ramp_duration,
+                    ratio, turns, averaging, stop_on_error, error_threshold,
+                    is_first_of_run=run_started_fresh, log_callback=log_callback,
+                    zero_offset=zero_offset, suppress_notifications=suppress_notifications,
+                )
+                run_started_fresh = False
+                ramp_from = point.magnitude
+                if point_aborted:
+                    aborted_reason = point_aborted
             else:
                 row, point_aborted = _measure_point_row(
                     dmm, src, excitation_type, output_type, point, delay, cooling_delay,
@@ -443,6 +669,7 @@ def run_measurement(dmm: DMM, src: Union[CurrentSource, VoltageSource], relay: R
                     adaptive_cooling=adaptive_cooling, max_magnitude=max_magnitude,
                     adaptive_cooling_max_multiplier=adaptive_cooling_max_multiplier,
                     suppress_notifications=suppress_notifications,
+                    zero_offset=zero_offset,
                 )
                 run_started_fresh = False
                 if point_aborted:
@@ -480,6 +707,8 @@ def estimate_duration_seconds(
     averaging_delay: float = DEFAULT_AVERAGING_DELAY,
     adaptive_cooling: bool = False,
     adaptive_cooling_max_multiplier: float = DEFAULT_ADAPTIVE_COOLING_MAX_MULTIPLIER,
+    smooth_ramp: bool = False,
+    ramp_duration: float = 1.0,
 ) -> float:
     """
     Грубая оценка длительности измерения (п.15 — только для обратного
@@ -493,6 +722,10 @@ def estimate_duration_seconds(
     приборов разное и заранее неизвестно) и повторные попытки при
     превышении погрешности (п.9 — по определению непредсказуемы заранее).
     Это оценка снизу, не гарантия точного времени.
+
+    smooth_ramp/ramp_duration (BETA) — delay и cooling_delay в этом режиме
+    не применяются вовсе (см. run_measurement/_measure_point_row_ramp) —
+    вместо них на каждую ненулевую точку считается ramp_duration.
     """
     max_magnitude = max((p.magnitude for p in plan), default=0.0)
     total = 0.0
@@ -500,7 +733,10 @@ def estimate_duration_seconds(
         # Усреднение идёт для любой точки, включая нулевую (см. _measure_zero_row).
         total += averaging_delay * max(0, averaging_count - 1)
         if point.is_zero:
-            continue  # нулевая точка не проходит через delay/cooling_delay
+            continue  # нулевая точка не проходит через delay/cooling_delay/ramp
+        if smooth_ramp:
+            total += ramp_duration
+            continue
         total += delay
         if adaptive_cooling:
             total += _adaptive_cooling_delay(cooling_delay, point.magnitude, max_magnitude,

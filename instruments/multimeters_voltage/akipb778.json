@@ -1,5 +1,6 @@
 {
     "model_name": "АКИП-B7-78/1 (Picotest M3500A)",
+    "model_id": "akipb778",
     "keywords": ["PICOTEST", "AKIP-B7-78", "V7-78", "PRIST", "M3500"],
     "timeout": 5000,
     "encoding": "utf-8",
@@ -13,5 +14,6 @@
     "disable_autorange_command": "SENS:VOLT:DC:RANG:AUTO OFF",
     "range_command": "SENS:VOLT:DC:RANG {range_val}",
     "ranges": [0.1, 1.0, 10.0, 100.0, 1000.0],
-    "notes": "Вольтметровый режим того же прибора, что и instruments/multimeters/akipb778.json (амперметровый). Команды и шкалы переведены из IDM-DTCal (instruments/multimeters/akipb778.json) — там ПРОВЕРЕНО ВЖИВУЮ 29.07.2026: USB-TMC, VID_164E (Picotest Corp.) PID_0DAD, MEAS:VOLT:DC? отвечает корректно без предварительной настройки функции/диапазона. ВАЖНО: шкалы DCV у этого прибора 0.1/1/10/100/1000 В (платформа Agilent 34401A), а НЕ 0.2/2/20/200/1000 как у Siglent/Rigol — в DTCal раньше стоял чужой массив, из-за чего запрос 20 В округлялся вверх до 100 В с потерей разрешения; здесь эта ошибка не повторена. manual_range по умолчанию выключен; disable_autorange_command — по аналогии с уже проверенным токовым режимом (см. akip2101.json выше про тот же приём), отдельно на реальном приборе не подтверждён. При manual_range: true measure_command нужно сменить на READ?."
+    "identify_command": "SYST:BEEP",
+    "notes": "identify_command (п.11, «Мигнуть») — 'SYSTem:BEEPer' подтверждён по официальному Keysight/Agilent 34401A Remote Interface Reference (Chapter 4, System-Related Commands): 'Issue a single beep immediately', без предусловий. Применена по совместимости платформы (см. ниже про 34401A), сама команда на реальном Picotest M3500A не проверялась. Вольтметровый режим того же прибора, что и instruments/multimeters/akipb778.json (амперметровый). Команды и шкалы переведены из IDM-DTCal (instruments/multimeters/akipb778.json) — там ПРОВЕРЕНО ВЖИВУЮ 29.07.2026: USB-TMC, VID_164E (Picotest Corp.) PID_0DAD, MEAS:VOLT:DC? отвечает корректно без предварительной настройки функции/диапазона. ВАЖНО: шкалы DCV у этого прибора 0.1/1/10/100/1000 В (платформа Agilent 34401A), а НЕ 0.2/2/20/200/1000 как у Siglent/Rigol — в DTCal раньше стоял чужой массив, из-за чего запрос 20 В округлялся вверх до 100 В с потерей разрешения; здесь эта ошибка не повторена. manual_range по умолчанию выключен; disable_autorange_command — по аналогии с уже проверенным токовым режимом (см. akip2101.json выше про тот же приём), отдельно на реальном приборе не подтверждён. При manual_range: true measure_command нужно сменить на READ?."
 }

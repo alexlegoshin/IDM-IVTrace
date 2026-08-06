@@ -2,7 +2,10 @@ import math
 
 import pytest
 
-from sweep import Branch, DirectionPreset, SweepPoint, _raw_pass, plan_sweep
+from sweep import (
+    Branch, DirectionPreset, SweepPoint, _raw_pass, plan_sweep,
+    parse_custom_program, plan_custom_sweep,
+)
 
 
 def xs(points):
@@ -317,3 +320,145 @@ def test_sweep_point_is_frozen():
     p = SweepPoint(x_set=1.0, magnitude=1.0, relay='forward', is_zero=False, is_endpoint=True)
     with pytest.raises(Exception):
         p.x_set = 2.0
+
+
+# ----------------------------------------------------------------------
+# Branch.NO_RELAY (feature "No Relay") — стенд физически без платы реле:
+# источник всегда однополярный (см. README), relay=None форсируется на
+# КАЖДОЙ точке, включая ненулевые/крайние — знак X_start/X_stop не имеет
+# смысла, берём модуль.
+# ----------------------------------------------------------------------
+
+def test_no_relay_forces_relay_none_on_every_point():
+    pts = plan_sweep(0, 10, 2, branch=Branch.NO_RELAY)
+    assert len(pts) > 1
+    assert all(p.relay is None for p in pts)
+
+
+def test_no_relay_ignores_sign_and_uses_magnitude():
+    # Отрицательный ввод -> тот же самый (по модулю) план, что и позитивный:
+    # без реле знак физически неразличим, обе формы значат одно и то же.
+    pos = plan_sweep(0, 10, 2, branch=Branch.NO_RELAY)
+    neg = plan_sweep(0, -10, 2, branch=Branch.NO_RELAY)
+    assert [p.x_set for p in pos] == [p.x_set for p in neg]
+
+
+def test_no_relay_endpoint_still_measured_exactly():
+    pts = plan_sweep(0, 7, 3, branch=Branch.NO_RELAY)
+    assert pts[-1].x_set == 7
+    assert pts[-1].is_endpoint
+    assert pts[-1].relay is None
+
+
+def test_no_relay_zero_point_marked_is_zero():
+    pts = plan_sweep(0, 10, 5, branch=Branch.NO_RELAY)
+    assert pts[0].x_set == 0
+    assert pts[0].is_zero
+
+
+def test_no_relay_single_point_when_start_equals_stop():
+    pts = plan_sweep(5, 5, 1, branch=Branch.NO_RELAY)
+    assert len(pts) == 1
+    assert pts[0].x_set == 5
+    assert pts[0].relay is None
+
+
+def test_no_relay_preset_is_ignored_entirely():
+    # NO_RELAY коротит всю логику пресетов/двуполярности — передать preset
+    # не должно ничего изменить и не должно бросать исключение.
+    pts = plan_sweep(0, 10, 5, branch=Branch.NO_RELAY, preset=DirectionPreset.FULL_CYCLE)
+    assert all(p.relay is None for p in pts)
+    assert [p.x_set for p in pts] == [0.0, 5.0, 10.0]
+
+
+# ----------------------------------------------------------------------
+# parse_custom_program / plan_custom_sweep (feature "планировщик кастомных
+# программ") — свободный порядок точек и диапазонов текстовой строкой
+# ----------------------------------------------------------------------
+
+def test_parse_custom_program_single_points_keep_literal_order():
+    assert parse_custom_program("-25, +40, -15, +5") == [-25.0, 40.0, -15.0, 5.0]
+
+
+def test_parse_custom_program_allows_repeated_points():
+    assert parse_custom_program("5, 5, 5") == [5.0, 5.0, 5.0]
+
+
+def test_parse_custom_program_range_expands_via_raw_pass():
+    assert parse_custom_program("0:40:10") == _raw_pass(0.0, 40.0, 10.0)
+
+
+def test_parse_custom_program_mixes_points_and_ranges_in_given_order():
+    result = parse_custom_program("-5, 0:40:10, -15")
+    assert result == [-5.0] + _raw_pass(0.0, 40.0, 10.0) + [-15.0]
+
+
+def test_parse_custom_program_descending_range():
+    assert parse_custom_program("40:0:10") == _raw_pass(40.0, 0.0, 10.0)
+
+
+def test_parse_custom_program_range_step_must_be_positive():
+    with pytest.raises(ValueError):
+        parse_custom_program("0:40:-10")
+    with pytest.raises(ValueError):
+        parse_custom_program("0:40:0")
+
+
+def test_parse_custom_program_rejects_malformed_range():
+    with pytest.raises(ValueError):
+        parse_custom_program("0:40")  # только 2 части, а не 3
+    with pytest.raises(ValueError):
+        parse_custom_program("a:b:c")
+
+
+def test_parse_custom_program_rejects_malformed_number():
+    with pytest.raises(ValueError):
+        parse_custom_program("not-a-number")
+
+
+def test_parse_custom_program_rejects_empty_string():
+    with pytest.raises(ValueError):
+        parse_custom_program("")
+    with pytest.raises(ValueError):
+        parse_custom_program("   ")
+
+
+def test_parse_custom_program_ignores_stray_commas_and_whitespace():
+    assert parse_custom_program(" -25 ,, +40 , ") == [-25.0, 40.0]
+
+
+def test_parse_custom_program_comma_is_reserved_as_token_separator_not_decimal():
+    # В отличие от остальных числовых полей CLI/GUI, здесь запятая уже
+    # занята как разделитель точек — "1,5" это ДВЕ точки (1 и 5), не 1.5.
+    # Десятичный разделитель в этом DSL — только точка.
+    assert parse_custom_program("1,5") == [1.0, 5.0]
+    assert parse_custom_program("1.5") == [1.5]
+
+
+def test_plan_custom_sweep_relay_follows_literal_sign_of_each_point():
+    plan = plan_custom_sweep("-25, +40, -15, +5")
+    assert [p.relay for p in plan] == ['reverse', 'forward', 'reverse', 'forward']
+    assert [p.x_set for p in plan] == [-25.0, 40.0, -15.0, 5.0]
+
+
+def test_plan_custom_sweep_zero_point_has_no_relay_and_is_marked_zero():
+    plan = plan_custom_sweep("10, 0, -10")
+    zero_point = plan[1]
+    assert zero_point.x_set == 0.0
+    assert zero_point.is_zero
+    assert zero_point.relay is None
+
+
+def test_plan_custom_sweep_is_endpoint_uses_global_max_magnitude():
+    plan = plan_custom_sweep("-25, +40, -15, +5")
+    assert [p.is_endpoint for p in plan] == [False, True, False, False]  # 40 — наибольший модуль
+
+
+def test_plan_custom_sweep_preserves_repeats_and_order_end_to_end():
+    plan = plan_custom_sweep("5, -5, 5")
+    assert [p.x_set for p in plan] == [5.0, -5.0, 5.0]
+
+
+def test_plan_custom_sweep_raises_on_invalid_text():
+    with pytest.raises(ValueError):
+        plan_custom_sweep("garbage")

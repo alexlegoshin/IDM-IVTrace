@@ -1,5 +1,6 @@
 {
     "model_name": "RIGOL DM3068",
+    "model_id": "rigol_dm3068",
     "keywords": ["RIGOL", "DM3068", "DM3058", "DM3064", "DM3054"],
     "timeout": 5000,
     "encoding": "utf-8",
@@ -13,5 +14,7 @@
     "manual_range": false,
     "range_command": ":MEASure:VOLTage:DC {index}",
     "ranges": [0.2, 2.0, 20.0, 200.0, 1000.0],
+    "identify_command": "SYST:BEEP:STAT ON;SYST:BEEP",
+    "identify_notes": "identify_command (п.11, «Мигнуть») — синтаксис 'SYSTem:BEEPer' подтверждён по официальному Rigol Programming Guide for DM3058/DM3058E (одиночный пик, требует 'SYSTem:BEEPer:STATe ON' заранее), НЕ по гайду для самого DM3068 — отдельного programming guide для DM3068 с этой секцией не нашли. На реальном DM3068 не проверялось.",
     "notes": "Вольтметровый режим — ПРОВЕРЕНО ВЖИВУЮ в стенде IDM-DNKMetr: USB0::0x1AB1::0x0C94::<serial>::INSTR, *IDN? и MEAS:VOLT:DC? отвечают корректно. Синтаксис сверен по Programming Guide for DM3000: ':FUNCtion:VOLTage:DC' включает режим DCV (без кавычек, в отличие от Siglent); ':MEASure:VOLTage:DC {0..4}' задаёт диапазон ИНДЕКСОМ шкалы (а не значением — здесь используется плейсхолдер {index}, поддержан в instruments.Multimeter.set_range) и ПРИ ЭТОМ САМ переводит прибор в ручной режим — отдельная команда отключения авто-диапазона не нужна, поэтому disable_autorange_command здесь намеренно отсутствует. Обратно в авто — ':MEASure AUTO' (в нашей схеме такого хука нет, manual_range трактуется как решение на весь сеанс, не переключаемое на лету). В отличие от ТОКОВОГО режима того же прибора (instruments/multimeters/rigol_dm3068.json, ':RANG:AUTO OFF на подсистему SENS: -113 Undefined header) — здесь, в режиме вольтметра, ручной диапазон РАБОТАЕТ, это другая подсистема ('MEASure', не 'SENSe'). manual_range по умолчанию всё равно false, как и везде в проекте — эта возможность лишь доступна как опция. При manual_range: true measure_command нужно сменить на READ? (MEAS:VOLTage:DC? самодостаточна и сбрасывает диапазон в AUTO при каждом вызове, как и везде в проекте)."
 }

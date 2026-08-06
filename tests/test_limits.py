@@ -4,9 +4,11 @@ from limits import (
     RELAY_MAX_CURRENT_A,
     RELAY_WARN_CURRENT_A,
     VOLTAGE_SOURCE_SAFE_CEILING_V,
+    SMOOTH_RAMP_MAX_CURRENT_A,
     relay_current_block_reason,
     relay_current_warning,
     voltage_ceiling_block_reason,
+    smooth_ramp_block_reason,
 )
 
 
@@ -92,3 +94,29 @@ def test_voltage_well_below_ceiling_is_allowed():
 
 def test_voltage_ceiling_none_input_is_not_a_violation():
     assert voltage_ceiling_block_reason(None) is None
+
+
+# ----------------------------------------------------------------------
+# smooth_ramp_block_reason (feature "плавное нарастание", BETA) — 300 А
+# ----------------------------------------------------------------------
+
+def test_smooth_ramp_constant_is_300():
+    assert SMOOTH_RAMP_MAX_CURRENT_A == 300.0
+
+
+def test_smooth_ramp_at_exactly_limit_is_allowed():
+    assert smooth_ramp_block_reason(300.0) is None
+
+
+def test_smooth_ramp_just_above_limit_is_blocked():
+    reason = smooth_ramp_block_reason(300.1)
+    assert reason is not None
+    assert '300' in reason
+
+
+def test_smooth_ramp_well_below_limit_is_allowed():
+    assert smooth_ramp_block_reason(50.0) is None
+
+
+def test_smooth_ramp_none_input_is_not_a_violation():
+    assert smooth_ramp_block_reason(None) is None

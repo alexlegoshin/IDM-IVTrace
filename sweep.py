@@ -39,7 +39,7 @@ X_set >= 0, 'negative' — X_set <= 0, 'both' (по умолчанию) — вс
 измеряется всегда точно, без сноса плавающей точкой (см. _raw_pass).
 """
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from typing import List, Optional
 
@@ -49,6 +49,7 @@ class Branch(str, Enum):
     POSITIVE = 'positive'
     NEGATIVE = 'negative'
     BOTH = 'both'
+    NO_RELAY = 'no_relay'  # реле физически нет — источник однополярный, коммутации не бывает вовсе
 
 
 class DirectionPreset(str, Enum):
@@ -191,6 +192,20 @@ def plan_sweep(X_start: float, X_stop: float, X_step: float,
     if math.isnan(X_start) or math.isnan(X_stop):
         raise ValueError("X_start/X_stop не могут быть NaN")
 
+    if branch == Branch.NO_RELAY:
+        # Без платы реле источник физически не может сменить полярность
+        # (см. README: "полярность на первичке меняет плата реле, источник
+        # всегда однополярный") — знак X_start/X_stop здесь не имеет
+        # смысла вовсе, берём модуль и идём одним проходом по величине.
+        # relay=None форсируется на КАЖДОЙ точке, включая ненулевые и
+        # крайние — в отличие от Branch.POSITIVE, где ветвь всё равно один
+        # раз коммутируется в 'forward'.
+        magnitude_start, magnitude_stop = abs(X_start), abs(X_stop)
+        values = _raw_pass(magnitude_start, magnitude_stop, X_step)
+        magnitude = max(magnitude_start, magnitude_stop)
+        points = _to_sweep_points(values, magnitude)
+        return [replace(p, relay=None) for p in points]
+
     spans_both_signs = (X_start < 0 < X_stop) or (X_stop < 0 < X_start)
 
     if spans_both_signs:
@@ -238,4 +253,84 @@ def plan_sweep(X_start: float, X_stop: float, X_step: float,
         # (удобно: можно ввести дружелюбный положительный диапазон и
         # получить отрицательную ветвь, не переписывая числа).
         values = [-p for p in base]
+    return _to_sweep_points(values, magnitude)
+
+
+# ----------------------------------------------------------------------
+# Планировщик кастомных программ (feature) — текстовый DSL вместо единого
+# X_start/X_stop/X_step + branch/preset. Полная свобода порядка/знака/
+# повторов точек — оператор пишет буквально то, что хочет измерить, в том
+# порядке, в котором хочет это измерить; никакой комбинаторики (branch,
+# пресеты) здесь нет вовсе, она для этого режима не имеет смысла.
+# ----------------------------------------------------------------------
+
+def parse_custom_program(text: str) -> List[float]:
+    """
+    Разбирает строку кастомной программы в список ЗНАКОВЫХ уставок,
+    буквально в том порядке, в котором они даны.
+
+    Токены — через запятую, каждый один из двух видов:
+      - одно число: "-25", "+40", "5", "0" — одна точка;
+      - диапазон "начало:конец:шаг" (шаг — положительная величина) —
+        разворачивается ЧЕРЕЗ _raw_pass, то есть с теми же гарантиями
+        точности конца прохода и вставки нуля на пересечении, что и у
+        обычной развёртки (см. модульный докстринг).
+
+    Повторы допускаются (например точка 0 дважды в разных местах строки) —
+    "полная свобода", как и попросил оператор; ни сортировки, ни
+    дедупликации не производится.
+
+    Десятичный разделитель — ТОЛЬКО точка ("2.5"), не запятая: запятая уже
+    занята как разделитель токенов ("1,5" — это ДВЕ точки, 1 и 5, а не
+    "1.5"), в отличие от остальных числовых полей CLI/GUI, где запятая
+    равнозначна точке.
+    """
+    text = (text or '').strip()
+    if not text:
+        raise ValueError("Программа не может быть пустой.")
+
+    values: List[float] = []
+    for raw_token in text.split(','):
+        token = raw_token.strip()
+        if not token:
+            continue
+        if ':' in token:
+            parts = token.split(':')
+            if len(parts) != 3:
+                raise ValueError(
+                    f"Некорректный диапазон {token!r} — ожидается 'начало:конец:шаг'."
+                )
+            try:
+                start, stop, step = (float(p.strip()) for p in parts)
+            except ValueError:
+                raise ValueError(
+                    f"Некорректный диапазон {token!r} — начало/конец/шаг должны быть числами."
+                )
+            if step <= 0:
+                raise ValueError(f"Шаг в диапазоне {token!r} должен быть положительным.")
+            values.extend(_raw_pass(start, stop, step))
+        else:
+            try:
+                values.append(float(token))
+            except ValueError:
+                raise ValueError(
+                    f"Не удалось разобрать {token!r} — ожидается число или диапазон "
+                    "'начало:конец:шаг'."
+                )
+
+    if not values:
+        raise ValueError("Программа не содержит ни одной точки.")
+    return values
+
+
+def plan_custom_sweep(text: str) -> List[SweepPoint]:
+    """
+    Строит план измерения из текста кастомной программы (см.
+    parse_custom_program). branch/preset здесь не участвуют вовсе —
+    полярность каждой точки определяется буквально её знаком (та же
+    relay-логика, что и везде, см. _to_sweep_points), в порядке, заданном
+    оператором.
+    """
+    values = parse_custom_program(text)
+    magnitude = max((abs(v) for v in values), default=0.0)
     return _to_sweep_points(values, magnitude)
