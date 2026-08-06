@@ -356,6 +356,35 @@ def test_resolve_measure_params_negative_vlimit_raises_value_error(tmp_path):
         resolve_measure_params(args, mgr)
 
 
+def test_resolve_measure_params_output_type_defaults_to_current(tmp_path):
+    # Ось А-1 (PLAN_V2.md): output_type независим от excitation_type и не
+    # переспрашивается интерактивно — тихий дефолт сохраняет поведение всех
+    # существующих сценариев, где флаг не передавался вовсе.
+    parser = build_parser()
+    args = _measure_args(parser, [
+        "--excitation", "current",
+        "--start", "0", "--stop", "10", "--step", "1",
+        "--vlimit", "5", "--delay", "0.1", "--cool", "0.1",
+        "--label", "TestSensor", "--yes",
+    ])
+    mgr = ConfigManager(tmp_path / "cfg.json")
+    params = resolve_measure_params(args, mgr)
+    assert params['output_type'] == 'current'
+
+
+def test_resolve_measure_params_output_type_from_cli_flag(tmp_path):
+    parser = build_parser()
+    args = _measure_args(parser, [
+        "--excitation", "current", "--output", "voltage",
+        "--start", "0", "--stop", "10", "--step", "1",
+        "--vlimit", "5", "--delay", "0.1", "--cool", "0.1",
+        "--label", "TestSensor", "--yes",
+    ])
+    mgr = ConfigManager(tmp_path / "cfg.json")
+    params = resolve_measure_params(args, mgr)
+    assert params['output_type'] == 'voltage'
+
+
 def test_resolve_measure_params_voltage_excitation_ignores_vlimit(tmp_path):
     parser = build_parser()
     args = _measure_args(parser, [

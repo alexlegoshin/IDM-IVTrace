@@ -1,7 +1,8 @@
 import pandas as pd
 
-from orchestrate import write_results_csv, _log_calibration_warnings
+from orchestrate import write_results_csv, _log_calibration_warnings, _resolve_instruments
 from analysis import _read_metadata, load_and_analyze
+from tests.conftest import FakeVisaResource, FakeResourceManager
 
 
 def _params():
@@ -59,6 +60,59 @@ def test_written_csv_is_analyzable(tmp_path):
     stats = load_and_analyze(csv_path, I_nom=1000.0, X=100.0, save_png=False, show=False)
     assert stats['label'] == 'OrchSensor'
     assert stats['points'] == 2
+
+
+# ----------------------------------------------------------------------
+# output_type в шапке CSV и выбор роли мультиметра (ось А-1, PLAN_V2.md)
+# ----------------------------------------------------------------------
+
+def test_default_output_type_is_current_when_absent_from_params(tmp_path):
+    # Старые вызовы/params без output_type вовсе — поведение как раньше.
+    csv_path = tmp_path / "IVtrace_out_default_20260101_000000.csv"
+    write_results_csv(csv_path, _one_row_df(), _params(), excitation_type='current', unit='A')
+    meta = _read_metadata(csv_path)
+    assert meta['Тип выхода датчика'] == 'current'
+    assert meta['Единица измерения выхода'] == 'A'
+
+
+def test_explicit_voltage_output_type_is_written_to_header(tmp_path):
+    csv_path = tmp_path / "IVtrace_out_voltage_20260101_000000.csv"
+    p = _params(); p['output_type'] = 'voltage'
+    write_results_csv(csv_path, _one_row_df(), p, excitation_type='current', unit='A')
+    meta = _read_metadata(csv_path)
+    assert meta['Тип выхода датчика'] == 'voltage'
+    assert meta['Единица измерения выхода'] == 'V'
+
+
+def test_resolve_instruments_uses_ammeter_role_dir_by_default(instruments_dir):
+    # instruments/multimeters_current/akip2101.json matches IDN 'AKIP-2101'
+    # так же, как и instruments/multimeters_voltage/akip2101.json — оба
+    # каталога знают про эту модель, поэтому единственный способ убедиться,
+    # что выбран правильный КАТАЛОГ (а не просто "какой-то конфиг нашёлся"),
+    # — сверить сам путь до найденного файла.
+    dmm_dir = instruments_dir / "multimeters_current"
+    src_dir = instruments_dir / "current_sources"
+    rm = FakeResourceManager({
+        "DMM": FakeVisaResource(idn="AKIP-2101"),
+        "SRC": FakeVisaResource(idn="ITECH IT-M3130"),
+    })
+    dmm_addr, dmm_cfg, src_addr, src_cfg = _resolve_instruments(
+        rm, 'current', "DMM", "SRC", src_dir, "источник тока", lambda msg: None, dmm_dir,
+    )
+    assert dmm_cfg.parent == dmm_dir
+
+
+def test_resolve_instruments_uses_voltmeter_role_dir_when_requested(instruments_dir):
+    dmm_dir = instruments_dir / "multimeters_voltage"
+    src_dir = instruments_dir / "current_sources"
+    rm = FakeResourceManager({
+        "DMM": FakeVisaResource(idn="AKIP-2101"),
+        "SRC": FakeVisaResource(idn="ITECH IT-M3130"),
+    })
+    dmm_addr, dmm_cfg, src_addr, src_cfg = _resolve_instruments(
+        rm, 'current', "DMM", "SRC", src_dir, "источник тока", lambda msg: None, dmm_dir,
+    )
+    assert dmm_cfg.parent == dmm_dir
 
 
 # ----------------------------------------------------------------------

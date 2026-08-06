@@ -55,6 +55,11 @@ def build_parser(default_data_dir: Path = Path("data")) -> argparse.ArgumentPars
         "--excitation", choices=["current", "voltage"], default=None,
         help="Тип возбуждения датчика: current (источник тока) или voltage (источник напряжения)",
     )
+    p_measure.add_argument(
+        "--output", choices=["current", "voltage"], default=None,
+        help="Что измеряет мультиметр на выходе датчика: current (по умолчанию, амперметр) "
+             "или voltage (вольтметр) — независимо от --excitation (ось А-1, PLAN_V2.md)",
+    )
     p_measure.add_argument("--start", type=float, help="Начальное значение возбуждения (обычно 0)")
     p_measure.add_argument("--stop", type=float, help="Конечное значение возбуждения")
     p_measure.add_argument("--step", type=float, help="Шаг возбуждения")
@@ -321,6 +326,12 @@ def resolve_measure_params(args, config_mgr: ConfigManager, sensor_config_mgr=No
     # Формируем словарь параметров: приоритет — аргументы командной строки, затем загруженный конфиг, затем сохранённый
     params = {
         'excitation_type': excitation_type,
+        # output_type (ось А-1) — не переспрашивается интерактивно и не
+        # наследуется от прошлого запуска, в отличие от excitation_type:
+        # тихий дефолт 'current' сохраняет прежнее поведение для всех, кто
+        # флаг не передавал (это подавляющее большинство существующих
+        # сценариев — датчик тока с выходом по току).
+        'output_type': args.output if args.output is not None else loaded.get('output_type', 'current'),
         'X_start': args.start if args.start is not None else loaded.get('X_start'),
         'X_stop': args.stop if args.stop is not None else loaded.get('X_stop'),
         'X_step': args.step if args.step is not None else loaded.get('X_step'),

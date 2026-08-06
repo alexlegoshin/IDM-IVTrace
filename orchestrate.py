@@ -14,7 +14,7 @@ from typing import Callable, Optional
 import pandas as pd
 
 from apppaths import (
-    multimeter_cfg_dir, current_source_cfg_dir, voltage_source_cfg_dir,
+    multimeter_cfg_dir, voltmeter_cfg_dir, current_source_cfg_dir, voltage_source_cfg_dir,
 )
 from instruments import (
     Multimeter, CurrentSource, VoltageSource,
@@ -22,7 +22,7 @@ from instruments import (
 )
 from relay import RelayController, discover_relay_port
 from measurement import (
-    run_measurement, EXCITATION_UNITS,
+    run_measurement, EXCITATION_UNITS, OUTPUT_UNITS,
     DEFAULT_AVERAGING_COUNT, DEFAULT_AVERAGING_DELAY, DEFAULT_DISCARD_FIRST,
     DEFAULT_ADAPTIVE_COOLING_MAX_MULTIPLIER,
 )
@@ -72,12 +72,18 @@ class SessionHandle:
 
 def _resolve_instruments(rm, excitation_type: str, dmm_addr: Optional[str],
                          src_addr: Optional[str], source_cfg_dir: Path,
-                         source_label: str, log: LogFn):
+                         source_label: str, log: LogFn, dmm_cfg_dir: Path):
     """
     Возвращает (dmm_addr, dmm_cfg, src_addr, src_cfg).
 
     Если оба адреса заданы вручную — опрашивает *IDN? по каждому, чтобы
     подобрать json-конфиг. Иначе запускает полное автообнаружение.
+
+    dmm_cfg_dir — каталог конфигов мультиметра в НУЖНОЙ роли: multimeters_current/
+    (амперметр) или multimeters_voltage/ (вольтметр) — выбирается вызывающей
+    стороной по output_type (ось А-1, PLAN_V2.md), а не жёстко ammeter-каталогом,
+    как было раньше (тогда вольтметровые конфиги, добавленные ещё в Ф1, не
+    участвовали в автообнаружении вовсе).
     """
     if dmm_addr and src_addr:
         log("Открываю приборы по заданным адресам, определяю модели по *IDN?...")
@@ -86,7 +92,7 @@ def _resolve_instruments(rm, excitation_type: str, dmm_addr: Optional[str],
         dmm_instr.encoding = 'utf-8'
         dmm_idn = dmm_instr.query('*IDN?').strip()
         dmm_instr.close()
-        dmm_cfg = find_config_for_idn(dmm_idn, multimeter_cfg_dir())
+        dmm_cfg = find_config_for_idn(dmm_idn, dmm_cfg_dir)
         if dmm_cfg is None:
             raise RuntimeError(f"Не удалось подобрать конфиг мультиметра для IDN: {dmm_idn}")
 
@@ -103,7 +109,7 @@ def _resolve_instruments(rm, excitation_type: str, dmm_addr: Optional[str],
     # Полное автообнаружение (discover_instruments печатает через print;
     # в GUI это перехватывается редиректом stdout — см. gui.py).
     return discover_instruments(
-        multimeter_cfg_dir(), source_cfg_dir, rm=rm, source_label=source_label,
+        dmm_cfg_dir, source_cfg_dir, rm=rm, source_label=source_label,
     )
 
 
@@ -162,6 +168,9 @@ def write_results_csv(csv_path: Path, df: pd.DataFrame, params: dict,
         f.write(f"# Единица измерения возбуждения: {unit}\n")
         f.write(f"# Диапазон заданного возбуждения: {params['X_start']}..{params['X_stop']} {unit}, "
                 f"шаг {params['X_step']} {unit}\n")
+        output_type = params.get('output_type', 'current')
+        f.write(f"# Тип выхода датчика: {output_type}\n")
+        f.write(f"# Единица измерения выхода: {OUTPUT_UNITS[output_type]}\n")
         if excitation_type == 'current':
             f.write(f"# Ограничение напряжения: {params['V_limit']} В\n")
         if params.get('I_nom'):
@@ -226,11 +235,16 @@ def run_measurement_session(
     """
     excitation_type = params['excitation_type']
     unit = EXCITATION_UNITS[excitation_type]
+    output_type = params.get('output_type', 'current')
     source_cfg_dir = current_source_cfg_dir() if excitation_type == 'current' else voltage_source_cfg_dir()
     source_label = "источник тока" if excitation_type == 'current' else "источник напряжения"
+    # Ось А-1 (PLAN_V2.md): роль мультиметра — по тому, ЧТО измеряет (выход
+    # датчика), а не по тому, чем датчик возбуждают — это два независимых
+    # выбора (см. measurement.run_measurement, output_type).
+    dmm_cfg_dir = multimeter_cfg_dir() if output_type == 'current' else voltmeter_cfg_dir()
 
     dmm_addr, dmm_cfg, src_addr, src_cfg = _resolve_instruments(
-        rm, excitation_type, dmm_addr, src_addr, source_cfg_dir, source_label, log,
+        rm, excitation_type, dmm_addr, src_addr, source_cfg_dir, source_label, log, dmm_cfg_dir,
     )
 
     if relay_port:
@@ -267,6 +281,7 @@ def run_measurement_session(
             dmm, src, relay, excitation_type,
             X_start=params['X_start'], X_stop=params['X_stop'], X_step=params['X_step'],
             V_limit=params['V_limit'], delay=params['delay'], cooling_delay=params['cooling_delay'],
+            output_type=output_type,
             branch=Branch(params.get('branch', Branch.BOTH.value)),
             preset=DirectionPreset(params.get('preset', DirectionPreset.DIVERGING.value)),
             turns=params.get('turns') or 1.0,

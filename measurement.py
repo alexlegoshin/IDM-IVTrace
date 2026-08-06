@@ -18,6 +18,17 @@ EXCITATION_UNITS = {
     'voltage': 'V',
 }
 
+# Единицы измерения ВЫХОДА датчика (ось А-1, PLAN_V2.md) — независимая от
+# возбуждения величина: датчик тока возбуждают током И измеряют его выход
+# как ток, но у датчика, скажем, тока с выходом по напряжению или у
+# датчика напряжения с токовым выходом эти два измерения разные. Мультиметр
+# как класс (instruments.Multimeter) уже умеет обе роли через конфиг —
+# этот словарь только подписывает колонку/график тем, что реально снято.
+OUTPUT_UNITS = {
+    'current': 'A',
+    'voltage': 'V',
+}
+
 # п.29: усреднение по умолчанию — 4 отсчёта, без задержки между ними,
 # первый отбрасывается (защита от случая, когда авто-диапазон ещё не
 # устаканился к первому чтению).
@@ -86,13 +97,13 @@ def _read_attempts(dmm: DMM, count: int, delay: float) -> Tuple[List[float], boo
         if i > 0 and delay > 0:
             time.sleep(delay)
         try:
-            v = dmm.measure_current()
+            v = dmm.measure()
         except pyvisa.errors.VisaIOError:
             if dmm.current_range_idx < len(dmm.ranges) - 1:
                 dmm.current_range_idx += 1
                 dmm.set_range(dmm.ranges[dmm.current_range_idx])
                 try:
-                    v = dmm.measure_current()
+                    v = dmm.measure()
                 except Exception:
                     continue
             else:
@@ -141,7 +152,7 @@ def _average(readings: List[float]) -> float:
 
 
 def _measure_zero_row(dmm: DMM, src: Union[CurrentSource, VoltageSource],
-                       excitation_type: str, averaging: dict,
+                       excitation_type: str, output_type: str, averaging: dict,
                        log_callback: Optional[Callable[[str], None]]) -> Dict:
     """
     Точка X=0: возбуждения нет, поэтому нет смысла ни включать выход
@@ -164,7 +175,8 @@ def _measure_zero_row(dmm: DMM, src: Union[CurrentSource, VoltageSource],
         dmm.auto_range(i_avg, is_first=True)
 
     unit = EXCITATION_UNITS[excitation_type]
-    _log(f"  [zero] X_уст = +0.0000 {unit}  ->  I_изм = {i_avg:.6f} А (без источника и реле)",
+    output_unit = OUTPUT_UNITS[output_type]
+    _log(f"  [zero] X_уст = +0.0000 {unit}  ->  Y_изм = {i_avg:.6f} {output_unit} (без источника и реле)",
          log_callback)
 
     return {
@@ -172,7 +184,8 @@ def _measure_zero_row(dmm: DMM, src: Union[CurrentSource, VoltageSource],
         'Branch': 'zero',
         'X_set': 0.0,
         'X_real': 0.0,
-        'I_meas_A': i_avg,
+        'Y_meas': i_avg,
+        'Y_unit': output_unit,
         'Rejected': False,
         'RejectReason': '',
         'PolarityMismatch': False,
@@ -180,7 +193,7 @@ def _measure_zero_row(dmm: DMM, src: Union[CurrentSource, VoltageSource],
 
 
 def _measure_point_row(dmm: DMM, src: Union[CurrentSource, VoltageSource],
-                        excitation_type: str, point: SweepPoint,
+                        excitation_type: str, output_type: str, point: SweepPoint,
                         delay: float, cooling_delay: float,
                         ratio: Optional[float], turns: float,
                         averaging: dict,
@@ -215,6 +228,7 @@ def _measure_point_row(dmm: DMM, src: Union[CurrentSource, VoltageSource],
     Возвращает (row, aborted_reason).
     """
     unit = EXCITATION_UNITS[excitation_type]
+    output_unit = OUTPUT_UNITS[output_type]
     # X_real — знаковая величина (для CSV/графика: "реальный вход датчика с
     # учётом витков и направления"), поэтому считается от X_set, а не от
     # magnitude. Ожидаемый ВЫХОД (expected), наоборот, — величина по модулю
@@ -276,7 +290,7 @@ def _measure_point_row(dmm: DMM, src: Union[CurrentSource, VoltageSource],
                 )
         # иначе — попытка не последняя, продолжаем цикл (контрольный промер, п.9)
 
-    msg = f"  [{'forward' if point.x_set >= 0 else 'reverse'}] X_уст = {point.x_set:+.4f} {unit}  ->  I_изм = {i_avg:.6f} А"
+    msg = f"  [{'forward' if point.x_set >= 0 else 'reverse'}] X_уст = {point.x_set:+.4f} {unit}  ->  Y_изм = {i_avg:.6f} {output_unit}"
     if rejected:
         msg += f"  [БРАК: {reject_reason}]"
     if polarity_mismatch:
@@ -288,7 +302,8 @@ def _measure_point_row(dmm: DMM, src: Union[CurrentSource, VoltageSource],
         'Branch': 'forward' if point.x_set >= 0 else 'reverse',
         'X_set': point.x_set,
         'X_real': real_input,
-        'I_meas_A': i_avg,
+        'Y_meas': i_avg,
+        'Y_unit': output_unit,
         'Rejected': rejected,
         'RejectReason': reject_reason,
         'PolarityMismatch': polarity_mismatch,
@@ -300,6 +315,7 @@ def run_measurement(dmm: DMM, src: Union[CurrentSource, VoltageSource], relay: R
                      excitation_type: str,
                      X_start: float, X_stop: float, X_step: float,
                      V_limit: float, delay: float, cooling_delay: float,
+                     output_type: str = 'current',
                      branch: Branch = Branch.BOTH,
                      preset: DirectionPreset = DirectionPreset.DIVERGING,
                      turns: float = 1.0,
@@ -340,8 +356,16 @@ def run_measurement(dmm: DMM, src: Union[CurrentSource, VoltageSource], relay: R
                       настройки источника, X_stop и есть максимальное
                       напряжение цикла).
 
-    Выход датчика (измеряемая величина) всегда ток — читается мультиметром
-    независимо от типа возбуждения.
+    output_type (ось А-1, PLAN_V2.md, независимая от excitation_type) —
+    что физически измеряет мультиметр на выходе датчика: 'current' (по
+    умолчанию, как раньше) или 'voltage'. Сам по себе этот параметр не
+    переключает прибор ни во что — какую роль (амперметр/вольтметр)
+    реально играет `dmm`, определено ЗАРАНЕЕ тем, с каким конфигом он был
+    открыт (см. orchestrate._resolve_instruments, выбирает каталог
+    multimeters_current/ или multimeters_voltage/ по этому же output_type).
+    Здесь он используется только для подписи колонки результата (`Y_unit`)
+    и текста в логе — измерительный цикл одинаково читает dmm.measure()
+    независимо от того, что именно эта величина означает.
 
     should_stop — необязательный колбэк без аргументов; если он возвращает
     True, цикл прерывается между точками. Используется GUI для кнопки
@@ -395,10 +419,10 @@ def run_measurement(dmm: DMM, src: Union[CurrentSource, VoltageSource], relay: R
                 run_started_fresh = True
 
             if point.is_zero:
-                row = _measure_zero_row(dmm, src, excitation_type, averaging, log_callback)
+                row = _measure_zero_row(dmm, src, excitation_type, output_type, averaging, log_callback)
             else:
                 row, point_aborted = _measure_point_row(
-                    dmm, src, excitation_type, point, delay, cooling_delay,
+                    dmm, src, excitation_type, output_type, point, delay, cooling_delay,
                     ratio, turns, averaging, stop_on_error, error_threshold,
                     is_first_of_run=run_started_fresh, log_callback=log_callback,
                     adaptive_cooling=adaptive_cooling, max_magnitude=max_magnitude,

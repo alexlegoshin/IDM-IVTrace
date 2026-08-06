@@ -3,7 +3,8 @@ import math
 import pytest
 
 from measurement import (
-    run_measurement, _read_attempts, _read_averaged, _adaptive_cooling_delay, EXCITATION_UNITS,
+    run_measurement, _read_attempts, _read_averaged, _adaptive_cooling_delay,
+    EXCITATION_UNITS, OUTPUT_UNITS,
 )
 from sweep import Branch, DirectionPreset
 
@@ -18,7 +19,7 @@ class FakeDMM:
         self.set_range_calls = []
         self.auto_range_calls = []
 
-    def measure_current(self) -> float:
+    def measure(self) -> float:
         item = self.readings.pop(0)
         if isinstance(item, BaseException):
             raise item
@@ -435,7 +436,7 @@ def test_nan_reading_does_not_trigger_rejection_or_retries():
         ratio=1000.0, stop_on_error=True, error_threshold=1.0,
     )
     assert aborted is None
-    assert math.isnan(results[0]['I_meas_A'])
+    assert math.isnan(results[0]['Y_meas'])
     assert results[0]['Rejected'] is False
 
 
@@ -575,6 +576,42 @@ def test_rejection_and_polarity_mismatch_are_logged():
 
 def test_excitation_units_mapping():
     assert EXCITATION_UNITS == {'current': 'A', 'voltage': 'V'}
+
+
+# ----------------------------------------------------------------------
+# output_type (ось А-1, PLAN_V2.md) — что измеряет мультиметр на выходе
+# датчика, независимо от excitation_type (чем датчик возбуждается)
+# ----------------------------------------------------------------------
+
+def test_output_units_mapping():
+    assert OUTPUT_UNITS == {'current': 'A', 'voltage': 'V'}
+
+
+def test_default_output_type_is_current_and_produces_y_meas_column():
+    dmm = FakeDMM(readings=[0.0, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5])
+    src, relay = FakeSource(), FakeRelay()
+    results, _ = _run(dmm, src, relay)
+    assert all('Y_meas' in row for row in results)
+    assert all(row['Y_unit'] == 'A' for row in results)
+    assert all('I_meas_A' not in row for row in results)
+
+
+def test_output_type_voltage_tags_rows_with_voltage_unit():
+    dmm = FakeDMM(readings=[0.0, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5])
+    src, relay = FakeSource(), FakeRelay()
+    results, _ = _run(dmm, src, relay, output_type='voltage')
+    assert all(row['Y_unit'] == 'V' for row in results)
+
+
+def test_output_type_does_not_change_which_dmm_method_is_called():
+    # Роль прибора (амперметр/вольтметр) определяется КОНФИГОМ, с которым он
+    # открыт (см. orchestrate._resolve_instruments), а не тем, какой метод
+    # у него дёрнули изнутри measurement.py — здесь всегда generic measure().
+    dmm = FakeDMM(readings=[0.0, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5])
+    src, relay = FakeSource(), FakeRelay()
+    _run(dmm, src, relay, output_type='voltage')
+    # FakeDMM.measure() успешно отдало все заготовленные значения — если бы
+    # код звал несуществующий dmm.measure_voltage(), тест упал бы с AttributeError.
 
 
 # ----------------------------------------------------------------------

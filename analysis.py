@@ -88,22 +88,36 @@ def load_and_analyze(latest_csv: Path, I_nom: float, X: float, save_png: bool = 
 
     excitation_label = 'ток' if excitation_type == 'current' else 'напряжение'
 
+    # Колонка выхода датчика (ось А-1, PLAN_V2.md) — Y_meas в новых файлах
+    # (может быть током ИЛИ напряжением, см. measurement.OUTPUT_UNITS),
+    # I_meas_A — старые CSV (до этого пункта плана), где выход всегда был
+    # только током.
+    if 'Y_meas' in df.columns:
+        meas_col = 'Y_meas'
+        output_unit = metadata.get('Единица измерения выхода', 'А')
+        output_type = metadata.get('Тип выхода датчика', 'current')
+    else:
+        meas_col = 'I_meas_A'
+        output_unit = 'А'
+        output_type = 'current'
+    output_label = 'ток' if output_type == 'current' else 'напряжение'
+
     X_start = df[excitation_col].min()
     X_stop = df[excitation_col].max()
 
     # ---------- Расчёт погрешности ----------
-    # Погрешность всегда считается относительно выходного тока датчика
-    # (I_meas_A), независимо от того, чем датчик возбуждался.
-    K = 1.0 / X                      # коэффициент передачи I_out / X_in
-    I_sec_nom = I_nom * K            # номинальный выходной ток при I_nom
+    # Погрешность всегда считается относительно выхода датчика (meas_col),
+    # независимо от того, чем датчик возбуждался и что именно он выдаёт.
+    K = 1.0 / X                      # коэффициент передачи Y_out / X_in
+    Y_sec_nom = I_nom * K            # номинальный выходной сигнал при I_nom
 
-    df['I_expected_A'] = df[excitation_col] * K
+    df['Y_expected'] = df[excitation_col] * K
     # Погрешность знаковая (п.31): по ней видно не только величину
     # расхождения, но и его направление (датчик завышает/занижает выход).
     # Все места ниже, где раньше подразумевалась неотрицательность
     # (сводный "максимум", подписи на графике), берут abs() явно, там, где
     # это действительно нужно, а не потому что оно "само так получалось".
-    df['Error_percent'] = (df['I_meas_A'] - df['I_expected_A']) / I_sec_nom * 100
+    df['Error_percent'] = (df[meas_col] - df['Y_expected']) / Y_sec_nom * 100
 
     # Точки не участвуют в сводной статистике погрешности по двум причинам:
     #  - Rejected — забракованы контрольными промерами (п.9, measurement.py),
@@ -135,7 +149,7 @@ def load_and_analyze(latest_csv: Path, I_nom: float, X: float, save_png: bool = 
 
     x_label = f"1:{int(X)}" if float(X).is_integer() else f"1:{X:.1f}"
 
-    # Верхний график: выходной ток. Forward и reverse рисуются отдельно —
+    # Верхний график: выход датчика. Forward и reverse рисуются отдельно —
     # это две разные ветви одного и того же прохода через 0, их нельзя
     # просто сортировать вместе по excitation_col без учёта знака.
     branch_styles = {
@@ -145,14 +159,14 @@ def load_and_analyze(latest_csv: Path, I_nom: float, X: float, save_png: bool = 
     for branch_name, sub in df.groupby('Branch', sort=False):
         sub = sub.sort_values(excitation_col)
         style = branch_styles.get(branch_name, dict(color='gray', marker='.', label=f'{label} ({branch_name})'))
-        ax1.plot(sub[excitation_col], sub['I_meas_A'], marker=style['marker'], linestyle='-',
+        ax1.plot(sub[excitation_col], sub[meas_col], marker=style['marker'], linestyle='-',
                   color=style['color'], markersize=4, label=style['label'])
 
     df_sorted_for_expected = df.sort_values(excitation_col)
-    ax1.plot(df_sorted_for_expected[excitation_col], df_sorted_for_expected['I_expected_A'], '--',
+    ax1.plot(df_sorted_for_expected[excitation_col], df_sorted_for_expected['Y_expected'], '--',
               color='orange', linewidth=1.5, label=f'Ожидаемый ({x_label})')
-    ax1.set_ylabel('Выходной ток датчика, А')
-    ax1.set_title(f'Амплитудная характеристика датчика тока (возбуждение — {excitation_label})\n'
+    ax1.set_ylabel(f'Выходной {output_label} датчика, {output_unit}')
+    ax1.set_title(f'Амплитудная характеристика датчика (возбуждение — {excitation_label})\n'
                   f'Диапазон {X_start}..{X_stop} {excitation_unit}')
     ax1.legend(loc='upper left')
     ax1.grid(True, which='major', linestyle='-', linewidth=0.6, alpha=0.7)
@@ -240,6 +254,8 @@ def load_and_analyze(latest_csv: Path, I_nom: float, X: float, save_png: bool = 
         'branches': branches_present,
         'excitation_type': excitation_type,
         'excitation_unit': excitation_unit,
+        'output_type': output_type,
+        'output_unit': output_unit,
         'X_start': X_start,
         'X_stop': X_stop,
         'I_nom': I_nom,
@@ -313,7 +329,7 @@ def estimate_ratio_from_data(df: pd.DataFrame, excitation_col: str = 'X_set') ->
     """
     BETA (см. PLAN_V2.md, В-4): определяет фактический коэффициент
     преобразования 1:X по уже снятым точкам методом наименьших квадратов —
-    прямая через ноль I_meas = X_set / X_actual, — и округляет его до
+    прямая через ноль Y_meas = X_set / X_actual, — и округляет его до
     ближайшего кратного 50, как того требует ТЗ.
 
     Рядом с округлённым значением всегда возвращается и фактическое, и
@@ -328,8 +344,11 @@ def estimate_ratio_from_data(df: pd.DataFrame, excitation_col: str = 'X_set') ->
         excluded_mask |= df['ManuallyExcluded'].fillna(False).astype(bool)
     accepted = df[~excluded_mask]
 
+    # Y_meas — выход датчика в новых файлах (ток ИЛИ напряжение, ось А-1);
+    # I_meas_A — старые CSV, где выход всегда был только током.
+    meas_col = 'Y_meas' if 'Y_meas' in df.columns else 'I_meas_A'
     x = accepted[excitation_col].to_numpy(dtype=float)
-    y = accepted['I_meas_A'].to_numpy(dtype=float)
+    y = accepted[meas_col].to_numpy(dtype=float)
     denom = float(np.sum(x * x))
     if denom == 0.0:
         raise ValueError("Недостаточно данных для определения коэффициента: все точки на нуле возбуждения.")

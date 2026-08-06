@@ -216,6 +216,18 @@ class IVTraceGUI:
         ttk.Radiobutton(exc, text="Напряжение (источник напряжения)", value="voltage",
                         variable=self.excitation_var, command=self._on_excitation_change).grid(row=1, column=0, sticky="w")
 
+        # --- output type (ось А-1, независимая от возбуждения: чем датчик
+        # возбуждают — не то же самое, что и то, что он выдаёт на выходе) ---
+        ttk.Separator(exc, orient="horizontal").grid(row=2, column=0, sticky="ew", pady=(8, 6))
+        out_row = ttk.Frame(exc)
+        out_row.grid(row=3, column=0, sticky="w")
+        ttk.Label(out_row, text="Выход датчика:").pack(side="left", padx=(0, 6))
+        self.output_var = tk.StringVar(value="current")
+        ttk.Combobox(
+            out_row, textvariable=self.output_var, state="readonly", width=10,
+            values=["current", "voltage"],
+        ).pack(side="left")
+
         # --- numeric params ---
         pf = ttk.Labelframe(left, text="Параметры измерения", padding=10)
         pf.grid(row=1, column=0, sticky="ew", pady=(10, 0))
@@ -461,6 +473,8 @@ class IVTraceGUI:
             return
         if saved.get("excitation_type") in ("current", "voltage"):
             self.excitation_var.set(saved["excitation_type"])
+        if saved.get("output_type") in ("current", "voltage"):
+            self.output_var.set(saved["output_type"])
         mapping = {
             "X_start": self.e_start, "X_stop": self.e_stop, "X_step": self.e_step,
             "V_limit": self.e_vlimit, "delay": self.e_delay, "cooling_delay": self.e_cool,
@@ -572,6 +586,7 @@ class IVTraceGUI:
 
         # Заполняем поля интерфейса
         self.excitation_var.set(params.get('excitation_type', 'current'))
+        self.output_var.set(params.get('output_type', 'current'))
         self.e_start.delete(0, 'end'); self.e_start.insert(0, str(params.get('X_start', '')))
         self.e_stop.delete(0, 'end'); self.e_stop.insert(0, str(params.get('X_stop', '')))
         self.e_step.delete(0, 'end'); self.e_step.insert(0, str(params.get('X_step', '')))
@@ -614,6 +629,7 @@ class IVTraceGUI:
         try:
             params = {
                 "excitation_type": excitation_type,
+                "output_type": self.output_var.get(),
                 "X_start": num(self.e_start, "Начало"),
                 "X_stop": num(self.e_stop, "Конец"),
                 "X_step": num(self.e_step, "Шаг"),
@@ -904,13 +920,23 @@ class IVTraceGUI:
         if df is None:
             return
         excitation_col = 'X_set' if 'X_set' in df.columns else 'I_set_A'
+        # Y_meas — новая колонка выхода датчика (ось А-1, ток ИЛИ напряжение,
+        # см. measurement.py); I_meas_A — старые CSV (до этого пункта плана),
+        # где выход всегда трактовался как ток.
+        if 'Y_meas' in df.columns:
+            meas_col = 'Y_meas'
+            meas_unit = df['Y_unit'].iloc[0] if 'Y_unit' in df.columns and len(df) else 'A'
+        else:
+            meas_col = 'I_meas_A'
+            meas_unit = 'A'
+        self.points_tree.heading('i_meas', text=f"Y изм., {meas_unit}")
         for idx, row in df.iterrows():
             rejected = bool(row['Rejected']) if 'Rejected' in df.columns and pd.notna(row.get('Rejected')) else False
             excluded = bool(row['ManuallyExcluded']) if 'ManuallyExcluded' in df.columns and pd.notna(row.get('ManuallyExcluded')) else False
             error = row.get('Error_percent')
             error_text = f"{error:+.4f}" if error is not None and pd.notna(error) else ""
             self.points_tree.insert("", "end", iid=str(idx), values=(
-                row.get(excitation_col, ''), row.get('I_meas_A', ''), error_text,
+                row.get(excitation_col, ''), row.get(meas_col, ''), error_text,
                 "да" if rejected else "", "да" if excluded else "",
             ))
 

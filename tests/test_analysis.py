@@ -28,6 +28,24 @@ def _write_csv(path, extra_header_lines=(), rows=None, excitation_col='X_set'):
             f.write(f"2026-01-01T00:00:00,{branch},{x},{i}\n")
 
 
+def _write_csv_y_meas(path, extra_header_lines=(), rows=None):
+    """Как _write_csv, но новой (ось А-1) колонкой Y_meas вместо I_meas_A."""
+    rows = rows if rows is not None else [
+        ('forward', 0, 0.0),
+        ('forward', 5, 0.005),
+        ('reverse', 0, 0.0),
+        ('reverse', -5, -0.0051),
+    ]
+    with open(path, 'w', encoding='utf-8') as f:
+        f.write("# Датчик: TestSensor\n")
+        for line in extra_header_lines:
+            f.write(line + "\n")
+        f.write("#\n")
+        f.write("Timestamp,Branch,X_set,Y_meas\n")
+        for branch, x, y in rows:
+            f.write(f"2026-01-01T00:00:00,{branch},{x},{y}\n")
+
+
 # ----------------------------------------------------------------------
 # find_latest_csv
 # ----------------------------------------------------------------------
@@ -439,3 +457,52 @@ def test_apply_invert_input_accepts_explicit_output_path(tmp_path):
     result = apply_invert_input(csv_path, output_path=custom_path)
     assert result == custom_path
     assert custom_path.exists()
+
+
+# ----------------------------------------------------------------------
+# Ось А-1 (PLAN_V2.md) — выход датчика: колонка Y_meas + метаданные
+# output_type/output_unit, независимо от типа возбуждения
+# ----------------------------------------------------------------------
+
+def test_load_and_analyze_reads_y_meas_column_when_present(tmp_path):
+    csv_path = tmp_path / "IVtrace_ymeas_20260101_000000.csv"
+    _write_csv_y_meas(csv_path, extra_header_lines=[
+        "# Тип возбуждения: current",
+        "# Единица измерения возбуждения: A",
+        "# Тип выхода датчика: voltage",
+        "# Единица измерения выхода: V",
+    ], rows=[('forward', 0, 0.0), ('forward', 10, 0.1)])
+
+    stats = load_and_analyze(csv_path, I_nom=1000.0, X=100.0, save_png=False, show=False)
+    assert stats['output_type'] == 'voltage'
+    assert stats['output_unit'] == 'V'
+    assert stats['max_error_percent'] == pytest.approx(0.0, abs=1e-9)
+    assert 'Y_meas' in stats['dataframe'].columns
+    assert 'Y_expected' in stats['dataframe'].columns
+
+
+def test_load_and_analyze_without_y_meas_defaults_output_type_to_current(tmp_path):
+    # Старые CSV (до этого пункта плана) не знают про output_type вовсе.
+    csv_path = tmp_path / "IVtrace_legacy_out_20260101_000000.csv"
+    _write_csv(csv_path)
+    stats = load_and_analyze(csv_path, I_nom=100.0, X=10.0, save_png=False, show=False)
+    assert stats['output_type'] == 'current'
+    assert stats['output_unit'] == 'А'
+
+
+def test_estimate_ratio_from_data_reads_y_meas_column_when_present():
+    df = pd.DataFrame({
+        'X_set': [0.0, 150.0, 1500.0],
+        'Y_meas': [0.0, 0.1, 1.0],
+    })
+    result = estimate_ratio_from_data(df)
+    assert result['X_actual'] == pytest.approx(1500.0, rel=1e-6)
+
+
+def test_estimate_ratio_from_data_still_reads_legacy_i_meas_a_column():
+    df = pd.DataFrame({
+        'X_set': [0.0, 150.0, 1500.0],
+        'I_meas_A': [0.0, 0.1, 1.0],
+    })
+    result = estimate_ratio_from_data(df)
+    assert result['X_actual'] == pytest.approx(1500.0, rel=1e-6)
