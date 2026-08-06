@@ -22,14 +22,15 @@ import traceback
 from pathlib import Path
 
 import tkinter as tk
-from tkinter import ttk, scrolledtext, messagebox
+from tkinter import ttk, scrolledtext, messagebox, simpledialog
 
 import pandas as pd
 
 from apppaths import (
-    default_data_dir, sensor_config_dir,
+    default_data_dir, sensor_config_dir, work_dir, set_work_dir,
     multimeter_cfg_dir, voltmeter_cfg_dir, current_source_cfg_dir, voltage_source_cfg_dir,
 )
+from calibration import list_instrument_configs, update_calibration_date, check_calibration, CalibrationStatus
 from config import ConfigManager, SensorConfigManager
 from cli import current_sweep_max_abs, make_csv_filename, validate_measure_params
 from discovery import DiscoveryService
@@ -38,8 +39,9 @@ from limits import relay_current_warning, relay_current_block_reason
 from measurement import (
     EXCITATION_UNITS,
     DEFAULT_AVERAGING_COUNT, DEFAULT_AVERAGING_DELAY, DEFAULT_DISCARD_FIRST,
+    estimate_duration_seconds,
 )
-from sweep import Branch, DirectionPreset
+from sweep import Branch, DirectionPreset, plan_sweep
 
 
 ACCENT = "#2563eb"
@@ -99,7 +101,9 @@ class IVTraceGUI:
     def __init__(self, root: tk.Tk, args):
         self.root = root
         self.args = args
-        self.data_dir = Path(getattr(args, "data_dir", None) or default_data_dir())
+        # work_dir() уважает переопределение из UI (п.23, apppaths.set_work_dir);
+        # явный --data-dir из командной строки всё равно приоритетнее.
+        self.data_dir = Path(getattr(args, "data_dir", None) or work_dir())
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.config_mgr = ConfigManager(self.data_dir / "ivtrace_config.json")
         # Конфигурационная папка, НЕ рабочая (self.data_dir) — см. п.39:
@@ -133,6 +137,14 @@ class IVTraceGUI:
         # время измерения, см. _measure_worker).
         self._manual_session = None
         self._manual_lock = threading.Lock()
+
+        # Обратный отсчёт (п.15, только GUI).
+        self._countdown_remaining = None
+        self._countdown_after_id = None
+        self._countdown_finish_text = ""
+
+        # Баннер предупреждения (п.16) — открывается только вручную.
+        self._warning_banner = None
 
         self._closing = False
         self._after_id = None
@@ -176,6 +188,13 @@ class IVTraceGUI:
         self.root.geometry("1020x680")
         self.root.minsize(920, 600)
         self.root.configure(bg=BG)
+        # п.24: развёрнуто на весь экран при запуске (НЕ fullscreen — заголовок
+        # окна и панель задач остаются на месте, это не то же самое, что
+        # -fullscreen). "zoomed" — стандартное для Windows состояние Tk-окна.
+        try:
+            self.root.state("zoomed")
+        except tk.TclError:
+            pass
 
         style = ttk.Style(self.root)
         try:
@@ -238,7 +257,13 @@ class IVTraceGUI:
         footer.columnconfigure(0, weight=1)
         self.footer_label = ttk.Label(footer, text="", style="Muted.TLabel")
         self.footer_label.grid(row=0, column=0, sticky="w")
-        ttk.Button(footer, text="Проверить снова", command=self._run_preflight).grid(row=0, column=1, sticky="e")
+
+        footer_btns = ttk.Frame(footer)
+        footer_btns.grid(row=0, column=1, sticky="e")
+        ttk.Button(footer_btns, text="Рабочая папка…", command=self._open_work_dir_dialog).pack(side="left", padx=(0, 6))
+        ttk.Button(footer_btns, text="Даты поверки…", command=self._open_calibration_editor).pack(side="left", padx=(0, 6))
+        ttk.Button(footer_btns, text="⚠ Баннер предупреждения", command=self._open_warning_banner).pack(side="left", padx=(0, 6))
+        ttk.Button(footer_btns, text="Проверить снова", command=self._run_preflight).pack(side="left")
 
     def _build_params(self, parent):
         left = ttk.Frame(parent)
@@ -250,7 +275,7 @@ class IVTraceGUI:
         exc.grid(row=0, column=0, sticky="ew")
         ttk.Radiobutton(exc, text="Ток (источник тока)", value="current",
                         variable=self.excitation_var, command=self._on_excitation_change).grid(row=0, column=0, sticky="w")
-        ttk.Radiobutton(exc, text="Напряжение (источник напряжения)", value="voltage",
+        ttk.Radiobutton(exc, text="Напряжение (источник напряжения) — BETA", value="voltage",
                         variable=self.excitation_var, command=self._on_excitation_change).grid(row=1, column=0, sticky="w")
 
         # --- output type (ось А-1, независимая от возбуждения: чем датчик
@@ -360,17 +385,20 @@ class IVTraceGUI:
         ttk.Label(opts, text="не проверено на реальном стенде",
                   foreground="gray").grid(row=9, column=0, columnspan=2, sticky="w")
 
-        # --- sensor configuration ---
+        # --- sensor configuration (п.39-UI: выпадающий список профилей
+        # вместо текстового поля, кнопки Сохранить/Загрузить/Переименовать/Удалить) ---
         cfg = ttk.Labelframe(left, text="Конфигурация датчика", padding=10)
         cfg.grid(row=4, column=0, sticky="ew", pady=(10, 0))
         cfg.columnconfigure(1, weight=1)
-        ttk.Label(cfg, text="Имя конфига").grid(row=0, column=0, sticky="w", pady=3)
-        self.e_config_name = ttk.Entry(cfg)
+        ttk.Label(cfg, text="Профиль").grid(row=0, column=0, sticky="w", pady=3)
+        self.e_config_name = ttk.Combobox(cfg, state="normal")
         self.e_config_name.grid(row=0, column=1, sticky="ew", pady=3, padx=(8, 0))
         btn_frame = ttk.Frame(cfg)
         btn_frame.grid(row=1, column=0, columnspan=2, sticky="ew", pady=3)
-        ttk.Button(btn_frame, text="Сохранить конфиг", command=self._save_config).pack(side="left", padx=(0, 6))
-        ttk.Button(btn_frame, text="Загрузить конфиг", command=self._load_config).pack(side="left")
+        ttk.Button(btn_frame, text="Сохранить", command=self._save_config).pack(side="left", padx=(0, 6))
+        ttk.Button(btn_frame, text="Загрузить", command=self._load_config).pack(side="left", padx=(0, 6))
+        ttk.Button(btn_frame, text="Переименовать", command=self._rename_config).pack(side="left", padx=(0, 6))
+        ttk.Button(btn_frame, text="Удалить", command=self._delete_config).pack(side="left")
 
         # --- action buttons ---
         actions = ttk.Frame(left)
@@ -384,9 +412,16 @@ class IVTraceGUI:
                                    command=self._request_stop, state="disabled")
         self.stop_btn.grid(row=0, column=1, sticky="ew", padx=(6, 0))
 
+        # --- countdown (п.15) — виден только пока идёт измерение ---
+        self.countdown_label = ttk.Label(left, style="Muted.TLabel", text="")
+        self.countdown_label.grid(row=6, column=0, sticky="w", pady=(6, 0))
+
         ttk.Checkbutton(left, text="Игнорировать самотесты (не рекомендуется)",
                         variable=self.skip_selftest_var,
-                        command=self._run_preflight).grid(row=6, column=0, sticky="w", pady=(8, 0))
+                        command=self._run_preflight).grid(row=7, column=0, sticky="w", pady=(8, 0))
+        self.suppress_warnings_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(left, text="Отключить все предупреждения и уведомления (не рекомендуется)",
+                        variable=self.suppress_warnings_var).grid(row=8, column=0, sticky="w", pady=(2, 0))
 
         self._on_excitation_change()
 
@@ -628,6 +663,12 @@ class IVTraceGUI:
             lbl.configure(text=unit)
         # Огр. напряжения актуально только для источника тока.
         self.e_vlimit.configure(state="normal" if is_current else "disabled")
+        self._refresh_profile_list()
+
+    def _refresh_profile_list(self):
+        """п.39-UI: список профилей датчиков в выпадающем списке зависит от текущего типа возбуждения."""
+        names = self.sensor_config_mgr.list_sensor_configs(excitation_type=self.excitation_var.get())
+        self.e_config_name['values'] = names
 
     def _append_log(self, text):
         self.log.configure(state="normal")
@@ -839,9 +880,10 @@ class IVTraceGUI:
             if block:
                 messagebox.showerror("Недопустимая уставка", block)
                 return
-            warning = relay_current_warning(abs(value))
-            if warning and not messagebox.askyesno("Подтверждение", f"⚠ {warning}\n\nПродолжить?"):
-                return
+            if not self.suppress_warnings_var.get():
+                warning = relay_current_warning(abs(value))
+                if warning and not messagebox.askyesno("Подтверждение", f"⚠ {warning}\n\nПродолжить?"):
+                    return
 
         threading.Thread(target=session.apply_setpoint, args=(value,), daemon=True).start()
 
@@ -851,6 +893,166 @@ class IVTraceGUI:
         if session is None:
             return
         threading.Thread(target=session.stop, daemon=True).start()
+
+    # ---------------------------------------------------------- warning banner
+    def _open_warning_banner(self):
+        """
+        п.16: почти на весь экран, мигающий восклицательный знак, большая
+        кнопка «СТОП» прямо на баннере — иначе баннер перекрывает единственный
+        способ остановить измерение, и режим безопасности превращается в
+        свою противоположность. Только по ручной активации (эта кнопка).
+        """
+        if self._warning_banner is not None and self._warning_banner.winfo_exists():
+            self._warning_banner.lift()
+            return
+
+        banner = tk.Toplevel(self.root)
+        banner.title("ВНИМАНИЕ")
+        banner.configure(bg="#ffffff")
+        screen_w = self.root.winfo_screenwidth()
+        screen_h = self.root.winfo_screenheight()
+        w, h = int(screen_w * 0.9), int(screen_h * 0.9)
+        banner.geometry(f"{w}x{h}+{(screen_w - w) // 2}+{(screen_h - h) // 2}")
+        try:
+            banner.attributes("-topmost", True)
+        except tk.TclError:
+            pass
+
+        mark = tk.Label(banner, text="⚠", font=("Segoe UI", 140, "bold"), fg="#dc2626", bg="#ffffff")
+        mark.pack(pady=(30, 10))
+        tk.Label(banner, text="ВНИМАНИЕ! Идут измерения!\nПриближаться к измерительному стенду ОПАСНО!",
+                font=("Segoe UI Semibold", 26), fg="#dc2626", bg="#ffffff", justify="center").pack(pady=10)
+        tk.Button(banner, text="■  СТОП", font=("Segoe UI Semibold", 32), bg="#dc2626", fg="white",
+                 activebackground="#b91c1c", activeforeground="white",
+                 command=self._request_stop, height=2, width=14).pack(pady=40)
+        ttk.Button(banner, text="Закрыть баннер (измерение НЕ останавливает)",
+                  command=lambda: self._close_warning_banner(banner)).pack(pady=(0, 10))
+        banner.protocol("WM_DELETE_WINDOW", lambda: self._close_warning_banner(banner))
+
+        self._warning_banner = banner
+        self._warning_blink_on = True
+        self._blink_warning_banner(mark)
+
+    def _blink_warning_banner(self, mark):
+        if self._warning_banner is None or not self._warning_banner.winfo_exists():
+            return
+        self._warning_blink_on = not self._warning_blink_on
+        mark.configure(fg="#dc2626" if self._warning_blink_on else "#ffffff")
+        self._warning_banner.after(500, lambda: self._blink_warning_banner(mark))
+
+    def _close_warning_banner(self, banner):
+        banner.destroy()
+        self._warning_banner = None
+
+    # -------------------------------------------------------------- work dir
+    def _open_work_dir_dialog(self):
+        """п.23: рабочая папка настраивается из UI, персистентно (apppaths.work_dir)."""
+        from tkinter import filedialog
+        chosen = filedialog.askdirectory(initialdir=str(self.data_dir), title="Выбрать рабочую папку")
+        if not chosen:
+            return
+        new_dir = Path(chosen)
+        set_work_dir(new_dir)
+        self.data_dir = new_dir
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        self.config_mgr = ConfigManager(self.data_dir / "ivtrace_config.json")
+        self._append_log(f"Рабочая папка изменена: {new_dir}\n")
+        messagebox.showinfo(
+            "Рабочая папка",
+            f"Рабочая папка установлена: {new_dir}\n\n"
+            "Действует для новых измерений и построения графика по умолчанию.",
+        )
+
+    # -------------------------------------------------------- calibration editor
+    def _open_calibration_editor(self):
+        """
+        п.3-UI: редактор дат поверки приборов — до этого пункта плана
+        единственным способом внести реальную дату поверки было вручную
+        редактировать JSON. Список собирается из всех каталогов конфигов
+        (мультиметр в обеих ролях + оба типа источника), а не только тех,
+        что реально сейчас подключены — оператор может готовить даты заранее.
+        """
+        win = tk.Toplevel(self.root)
+        win.title("Даты поверки приборов")
+        win.geometry("760x460")
+        win.columnconfigure(0, weight=1)
+        win.rowconfigure(0, weight=1)
+
+        columns = ("file", "model", "status", "date", "interval")
+        tree = ttk.Treeview(win, columns=columns, show="headings", selectmode="browse")
+        for col, text, width in (
+            ("file", "Файл", 160), ("model", "Модель", 200), ("status", "Статус", 90),
+            ("date", "Поверка", 100), ("interval", "Интервал, мес.", 110),
+        ):
+            tree.heading(col, text=text)
+            tree.column(col, width=width, anchor="w")
+        tree.grid(row=0, column=0, columnspan=4, sticky="nsew", padx=10, pady=(10, 6))
+        scroll = ttk.Scrollbar(win, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=scroll.set)
+        scroll.grid(row=0, column=4, sticky="ns", pady=(10, 6))
+
+        config_dirs = [multimeter_cfg_dir(), voltmeter_cfg_dir(), current_source_cfg_dir(), voltage_source_cfg_dir()]
+        paths_by_iid = {}
+
+        def refresh():
+            for item in tree.get_children():
+                tree.delete(item)
+            paths_by_iid.clear()
+            import json
+            for path in list_instrument_configs(config_dirs):
+                try:
+                    cfg = json.loads(path.read_text(encoding='utf-8'))
+                except (ValueError, OSError):
+                    continue
+                info = check_calibration(cfg)
+                iid = str(path)
+                paths_by_iid[iid] = path
+                tree.insert("", "end", iid=iid, values=(
+                    path.name, info.model_name, info.status.value,
+                    cfg.get('calibration_date', ''), cfg.get('calibration_interval_months', ''),
+                ))
+
+        refresh()
+
+        form = ttk.Frame(win, padding=(10, 0, 10, 10))
+        form.grid(row=1, column=0, columnspan=5, sticky="ew")
+        ttk.Label(form, text="Дата поверки (ГГГГ-ММ-ДД)").grid(row=0, column=0, sticky="w")
+        e_date = ttk.Entry(form, width=14)
+        e_date.grid(row=0, column=1, padx=(6, 14))
+        ttk.Label(form, text="Интервал, мес.").grid(row=0, column=2, sticky="w")
+        e_interval = ttk.Entry(form, width=8)
+        e_interval.grid(row=0, column=3, padx=(6, 14))
+
+        def on_select(_event=None):
+            sel = tree.selection()
+            if not sel:
+                return
+            values = tree.item(sel[0])['values']
+            e_date.delete(0, 'end'); e_date.insert(0, values[3] if values[3] != '' else '')
+            e_interval.delete(0, 'end'); e_interval.insert(0, values[4] if values[4] != '' else '')
+
+        tree.bind("<<TreeviewSelect>>", on_select)
+
+        def save():
+            sel = tree.selection()
+            if not sel:
+                messagebox.showinfo("Даты поверки", "Выберите прибор в списке.", parent=win)
+                return
+            path = paths_by_iid[sel[0]]
+            try:
+                interval = int(e_interval.get().strip())
+            except ValueError:
+                messagebox.showerror("Ошибка", "Интервал должен быть целым числом месяцев.", parent=win)
+                return
+            try:
+                update_calibration_date(path, e_date.get().strip(), interval)
+            except ValueError as e:
+                messagebox.showerror("Ошибка", str(e), parent=win)
+                return
+            refresh()
+            self._append_log(f"Дата поверки обновлена: {path.name}\n")
+
+        ttk.Button(form, text="Сохранить", command=save).grid(row=0, column=4)
 
     # -------------------------------------------------------------- sensor config
     def _save_config(self):
@@ -884,8 +1086,46 @@ class IVTraceGUI:
         except ValueError as e:
             messagebox.showerror("Недопустимое имя", str(e))
             return
+        self._refresh_profile_list()
         self._append_log(f"Конфиг датчика сохранён: {path}\n")
         messagebox.showinfo("Успех", f"Конфиг сохранён как '{name}'.")
+
+    def _rename_config(self):
+        old_name = self.e_config_name.get().strip()
+        if not old_name:
+            messagebox.showwarning("Профиль", "Выберите профиль для переименования.")
+            return
+        new_name = simpledialog.askstring("Переименовать профиль", f"Новое имя для '{old_name}':",
+                                          parent=self.root)
+        if not new_name:
+            return
+        try:
+            ok = self.sensor_config_mgr.rename_sensor_config(
+                old_name, new_name, excitation_type=self.excitation_var.get())
+        except ValueError as e:
+            messagebox.showerror("Недопустимое имя", str(e))
+            return
+        if not ok:
+            messagebox.showerror("Ошибка", f"Профиль '{old_name}' не найден.")
+            return
+        self._refresh_profile_list()
+        self.e_config_name.set(new_name)
+        self._append_log(f"Профиль датчика переименован: {old_name} -> {new_name}\n")
+
+    def _delete_config(self):
+        name = self.e_config_name.get().strip()
+        if not name:
+            messagebox.showwarning("Профиль", "Выберите профиль для удаления.")
+            return
+        if not messagebox.askyesno("Удалить профиль", f"Удалить профиль '{name}'? Это необратимо."):
+            return
+        ok = self.sensor_config_mgr.delete_sensor_config(name, excitation_type=self.excitation_var.get())
+        if not ok:
+            messagebox.showerror("Ошибка", f"Профиль '{name}' не найден.")
+            return
+        self._refresh_profile_list()
+        self.e_config_name.set('')
+        self._append_log(f"Профиль датчика удалён: {name}\n")
 
     def _load_config(self):
         name = self.e_config_name.get().strip()
@@ -970,6 +1210,7 @@ class IVTraceGUI:
             params["averaging_delay"] = optional_num(self.e_avg_delay) or 0.0
             params["discard_first"] = self.discard_first_var.get()
             params["adaptive_cooling"] = self.adaptive_cooling_var.get()
+            params["suppress_notifications"] = self.suppress_warnings_var.get()
 
             # I_nom — только метаданные датчика для шапки CSV, для измерения
             # он не нужен. А вот без коэффициента преобразования нечем считать
@@ -1015,9 +1256,10 @@ class IVTraceGUI:
         # ошибкой. Здесь только предупреждение о работе свыше паспортных
         # 400 А — оператор должен увидеть его непосредственно перед тем, как
         # подтверждает запуск, а не потом в логе.
-        warning = relay_current_warning(current_sweep_max_abs(params, params["excitation_type"]))
-        if warning:
-            confirm_text = f"⚠ {warning}\n\n{confirm_text}"
+        if not params["suppress_notifications"]:
+            warning = relay_current_warning(current_sweep_max_abs(params, params["excitation_type"]))
+            if warning:
+                confirm_text = f"⚠ {warning}\n\n{confirm_text}"
 
         if not messagebox.askyesno("Запуск измерения", confirm_text):
             return
@@ -1037,8 +1279,64 @@ class IVTraceGUI:
         # Служба обнаружения (п.25) не должна спорить с измерением за те же
         # VISA-ресурсы/serial-порт реле — возобновляется в _measure_worker.finally.
         self.discovery.pause()
+        self._start_countdown(params)
         self.worker = threading.Thread(target=self._measure_worker, args=(params, csv_path, addr), daemon=True)
         self.worker.start()
+
+    # ------------------------------------------------------------------ countdown
+    def _start_countdown(self, params):
+        """
+        п.15 (только GUI, см. PLAN_V2.md — CLI сознательно не трогаем, п.34).
+
+        Оценка — по estimate_duration_seconds() на том же плане, что и
+        реальный измерительный цикл (sweep.plan_sweep с теми же
+        параметрами). Явно приблизительная (без VISA-задержек и повторов
+        при превышении погрешности, см. докстринг estimate_duration_seconds)
+        — подписана "≈", а не выдаётся за точный расчёт.
+        """
+        try:
+            plan = plan_sweep(
+                params['X_start'], params['X_stop'], params['X_step'],
+                branch=Branch(params.get('branch', Branch.BOTH.value)),
+                preset=DirectionPreset(params.get('preset', DirectionPreset.DIVERGING.value)),
+            )
+            total = estimate_duration_seconds(
+                plan, delay=params['delay'], cooling_delay=params['cooling_delay'],
+                averaging_count=params.get('averaging_count', DEFAULT_AVERAGING_COUNT),
+                averaging_delay=params.get('averaging_delay', DEFAULT_AVERAGING_DELAY),
+                adaptive_cooling=params.get('adaptive_cooling', False),
+                adaptive_cooling_max_multiplier=params.get('adaptive_cooling_max_multiplier', 5.0),
+            )
+        except Exception:
+            self.countdown_label.configure(text="")
+            return
+
+        import datetime as _dt
+        self._countdown_remaining = int(round(total))
+        finish_at = (_dt.datetime.now() + _dt.timedelta(seconds=total)).strftime("%H:%M:%S")
+        self._countdown_finish_text = finish_at
+        self._tick_countdown()
+
+    def _tick_countdown(self):
+        if self._countdown_remaining is None:
+            return
+        mm, ss = divmod(max(0, self._countdown_remaining), 60)
+        self.countdown_label.configure(
+            text=f"Осталось (оценочно): ≈{mm:02d}:{ss:02d}  ·  окончание ≈{self._countdown_finish_text}")
+        if self._countdown_remaining <= 0:
+            return
+        self._countdown_remaining -= 1
+        self._countdown_after_id = self.root.after(1000, self._tick_countdown)
+
+    def _stop_countdown(self):
+        self._countdown_remaining = None
+        if self._countdown_after_id is not None:
+            try:
+                self.root.after_cancel(self._countdown_after_id)
+            except Exception:
+                pass
+            self._countdown_after_id = None
+        self.countdown_label.configure(text="")
 
     def _measure_worker(self, params, csv_path, addr):
         from visa_backend import make_resource_manager
@@ -1084,6 +1382,7 @@ class IVTraceGUI:
         """
         self.stop_btn.configure(state="disabled")
         self._append_log("\n… СТОП: обесточиваю стенд…\n")
+        self._stop_countdown()
 
         handle = self._session.get()
         if handle is not None:
@@ -1434,6 +1733,16 @@ class IVTraceGUI:
                 self.root.after_cancel(self._discovery_after_id)
             except Exception:
                 pass
+        if self._countdown_after_id is not None:
+            try:
+                self.root.after_cancel(self._countdown_after_id)
+            except Exception:
+                pass
+        if self._warning_banner is not None:
+            try:
+                self._warning_banner.destroy()
+            except Exception:
+                pass
         if self._current_fig is not None:
             try:
                 import matplotlib.pyplot as plt
@@ -1463,11 +1772,13 @@ class IVTraceGUI:
                     self._append_log(f"\n✔ Измерение завершено. Данные: {payload}\n")
                     self._set_running(False)
                     self._set_status("Измерение завершено", "ok")
+                    self._stop_countdown()
                     self._auto_plot_after_measurement(Path(payload))
                 elif kind == "error":
                     self._append_log(f"\n✖ Ошибка: {payload}\n")
                     self._set_running(False)
                     self._set_status("Ошибка измерения", "error")
+                    self._stop_countdown()
                     messagebox.showerror("Ошибка измерения", payload)
                 elif kind == "manual_opened":
                     with self._manual_lock:
