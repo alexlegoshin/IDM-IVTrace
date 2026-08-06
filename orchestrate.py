@@ -269,7 +269,12 @@ def run_measurement_session(
     relay = handle.relay = RelayController(relay_port)
 
     log("Приборы и реле инициализированы. Начинаю измерения...")
-    _log_calibration_warnings([dmm.config, src.config], log)
+    suppress_notifications = params.get('suppress_notifications', False)
+    # п.38: галочка "отключить все предупреждения" гасит и уведомления о
+    # поверке — но не саму проверку (см. calibration.py — она не блокирует
+    # измерение ни при каком статусе, значит нечего и блокировать здесь).
+    if not suppress_notifications:
+        _log_calibration_warnings([dmm.config, src.config], log)
 
     aborted_reason = None
     # Накопитель точек живёт снаружи вызова: аварийный останов обесточивает
@@ -300,6 +305,7 @@ def run_measurement_session(
             error_threshold=params.get('error_threshold', 1.0),
             log_callback=log,
             results_sink=results,
+            suppress_notifications=suppress_notifications,
         )
         # Возвращаемый список намеренно игнорируется: его содержимое
         # совпадает с накопителем, а накопитель переживает аварийный останов.

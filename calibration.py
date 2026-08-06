@@ -16,8 +16,10 @@ JSON-конфиге прибора — "calibration_date" (ISO YYYY-MM-DD) и
 п. 3.
 """
 import calendar
+import json
 from dataclasses import dataclass
 from datetime import date
+from pathlib import Path
 from enum import Enum
 from typing import Optional
 
@@ -97,3 +99,45 @@ def check_calibration(config: dict, today: Optional[date] = None) -> Calibration
         last_date=last_date, next_date=next_date, days_remaining=days_remaining,
         message=message,
     )
+
+
+def list_instrument_configs(config_dirs) -> list:
+    """
+    Все json-конфиги приборов из перечисленных каталогов (см. apppaths:
+    multimeter_cfg_dir/voltmeter_cfg_dir/current_source_cfg_dir/
+    voltage_source_cfg_dir) — источник строк для редактора поверки (п.3-UI).
+    """
+    found = []
+    for d in config_dirs:
+        found.extend(sorted(Path(d).glob('*.json')))
+    return found
+
+
+def update_calibration_date(config_path: Path, calibration_date: str, calibration_interval_months: int) -> None:
+    """
+    Записывает дату поверки/интервал обратно в JSON-конфиг прибора (п.3-UI) —
+    до этого пункта плана единственным способом внести реальную дату поверки
+    было вручную редактировать JSON-файл.
+
+    calibration_date — ISO YYYY-MM-DD, формат проверяется через
+    date.fromisoformat (лучше явная ошибка в UI, чем тихо записанная
+    нечитаемая строка). Остальные поля конфига не трогаются.
+
+    Пишет ПРЯМО в тот файл, что и так уже читает автообнаружение
+    (instruments_dir()) — годится, пока приложение запускается из
+    исходников. Если/когда появится инсталлятор с урезанными правами на
+    каталог ресурсов (Ф6, см. apppaths.resource_base — "read-only ресурсы"
+    для собранного exe), сюда потребуется слой переопределений поверх
+    read-only конфигов, аналогичный SensorConfigManager; сейчас это не
+    сделано, потому что инсталлятора ещё не существует и решать это
+    заранее — гадать.
+    """
+    date.fromisoformat(calibration_date)  # бросает ValueError на некорректном формате
+    if calibration_interval_months <= 0:
+        raise ValueError("Межповерочный интервал должен быть положительным числом месяцев.")
+
+    config_path = Path(config_path)
+    data = json.loads(config_path.read_text(encoding='utf-8'))
+    data['calibration_date'] = calibration_date
+    data['calibration_interval_months'] = calibration_interval_months
+    config_path.write_text(json.dumps(data, indent=4, ensure_ascii=False) + "\n", encoding='utf-8')

@@ -203,6 +203,7 @@ def _measure_point_row(dmm: DMM, src: Union[CurrentSource, VoltageSource],
                         adaptive_cooling: bool = False,
                         max_magnitude: float = 0.0,
                         adaptive_cooling_max_multiplier: float = DEFAULT_ADAPTIVE_COOLING_MAX_MULTIPLIER,
+                        suppress_notifications: bool = False,
                         ) -> Tuple[Dict, Optional[str]]:
     """
     Измеряет одну ненулевую точку плана — с поправкой на витки (п.37),
@@ -293,7 +294,10 @@ def _measure_point_row(dmm: DMM, src: Union[CurrentSource, VoltageSource],
     msg = f"  [{'forward' if point.x_set >= 0 else 'reverse'}] X_уст = {point.x_set:+.4f} {unit}  ->  Y_изм = {i_avg:.6f} {output_unit}"
     if rejected:
         msg += f"  [БРАК: {reject_reason}]"
-    if polarity_mismatch:
+    # suppress_notifications (п.38) гасит только уведомление в логе — сам
+    # факт polarity_mismatch всё равно попадает в PolarityMismatch ниже
+    # (сырые данные), галочка "отключить предупреждения" про них не решает.
+    if polarity_mismatch and not suppress_notifications:
         msg += "  [ВНИМАНИЕ: похоже, перепутана полярность/ориентация датчика]"
     _log(msg, log_callback)
 
@@ -330,6 +334,7 @@ def run_measurement(dmm: DMM, src: Union[CurrentSource, VoltageSource], relay: R
                      error_threshold: float = 1.0,
                      log_callback: Optional[Callable[[str], None]] = None,
                      results_sink: Optional[List[Dict]] = None,
+                     suppress_notifications: bool = False,
                      ) -> Tuple[List[Dict], Optional[str]]:
     """
     Полный цикл измерения амплитудной характеристики датчика: строит план
@@ -376,6 +381,13 @@ def run_measurement(dmm: DMM, src: Union[CurrentSource, VoltageSource], relay: R
     снятые точки пережили аварийный останов: он обесточивает стенд из
     другого потока и закрывает сессии, после чего цикл падает, не успев
     ничего вернуть.
+
+    suppress_notifications (п.38, галочка "отключить все предупреждения") —
+    гасит только необязательный текст в логе (сейчас — предупреждение о
+    перепутанной полярности, п.14); сами данные (PolarityMismatch, Rejected)
+    записываются как обычно. Жёсткий запрет 800 А, аварийный останов и
+    отсечка по погрешности этим флагом НЕ управляются — они не уведомления,
+    а функции безопасности/измерения (см. PLAN_V2.md, п.38).
 
     Возвращает (results, aborted_reason): aborted_reason — текст причины
     досрочной остановки по погрешности (после MAX_MEASUREMENT_ATTEMPTS
@@ -427,6 +439,7 @@ def run_measurement(dmm: DMM, src: Union[CurrentSource, VoltageSource], relay: R
                     is_first_of_run=run_started_fresh, log_callback=log_callback,
                     adaptive_cooling=adaptive_cooling, max_magnitude=max_magnitude,
                     adaptive_cooling_max_multiplier=adaptive_cooling_max_multiplier,
+                    suppress_notifications=suppress_notifications,
                 )
                 run_started_fresh = False
                 if point_aborted:
@@ -455,3 +468,40 @@ def run_measurement(dmm: DMM, src: Union[CurrentSource, VoltageSource], relay: R
                 pass
 
     return results, aborted_reason
+
+
+def estimate_duration_seconds(
+    plan: List[SweepPoint],
+    delay: float, cooling_delay: float,
+    averaging_count: int = DEFAULT_AVERAGING_COUNT,
+    averaging_delay: float = DEFAULT_AVERAGING_DELAY,
+    adaptive_cooling: bool = False,
+    adaptive_cooling_max_multiplier: float = DEFAULT_ADAPTIVE_COOLING_MAX_MULTIPLIER,
+) -> float:
+    """
+    Грубая оценка длительности измерения (п.15 — только для обратного
+    отсчёта в GUI, никогда не используется в самом измерительном цикле).
+
+    Считает по уже построенному плану (sweep.plan_sweep) те же паузы, что
+    реально ждёт run_measurement() между действиями: delay после установки
+    возбуждения, паузы усреднения (averaging_delay между отсчётами) и
+    cooling_delay/адаптивную задержку после точки. НЕ учитывает: время
+    самого VISA-обмена (запись уставки, чтение показаний — у разных
+    приборов разное и заранее неизвестно) и повторные попытки при
+    превышении погрешности (п.9 — по определению непредсказуемы заранее).
+    Это оценка снизу, не гарантия точного времени.
+    """
+    max_magnitude = max((p.magnitude for p in plan), default=0.0)
+    total = 0.0
+    for point in plan:
+        # Усреднение идёт для любой точки, включая нулевую (см. _measure_zero_row).
+        total += averaging_delay * max(0, averaging_count - 1)
+        if point.is_zero:
+            continue  # нулевая точка не проходит через delay/cooling_delay
+        total += delay
+        if adaptive_cooling:
+            total += _adaptive_cooling_delay(cooling_delay, point.magnitude, max_magnitude,
+                                             adaptive_cooling_max_multiplier)
+        else:
+            total += cooling_delay
+    return total

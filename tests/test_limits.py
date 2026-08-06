@@ -3,8 +3,10 @@ import pytest
 from limits import (
     RELAY_MAX_CURRENT_A,
     RELAY_WARN_CURRENT_A,
+    VOLTAGE_SOURCE_SAFE_CEILING_V,
     relay_current_block_reason,
     relay_current_warning,
+    voltage_ceiling_block_reason,
 )
 
 
@@ -63,3 +65,30 @@ def test_source_can_physically_exceed_the_relay_limit():
     # АКИП-1162-10-1020 способен на 1020 А — больше, чем держит реле.
     # Ограничивающий фактор для тока — реле, а не источник.
     assert relay_current_block_reason(1020.0) is not None
+
+
+# ----------------------------------------------------------------------
+# voltage_ceiling_block_reason (п.35) — рабочий потолок 60 В, независимый
+# от паспортного предела конкретного источника напряжения
+# ----------------------------------------------------------------------
+
+def test_voltage_ceiling_constant_is_60():
+    assert VOLTAGE_SOURCE_SAFE_CEILING_V == 60.0
+
+
+def test_voltage_at_exactly_ceiling_is_allowed():
+    assert voltage_ceiling_block_reason(60.0) is None
+
+
+def test_voltage_just_above_ceiling_is_blocked():
+    reason = voltage_ceiling_block_reason(60.1)
+    assert reason is not None
+    assert '60' in reason
+
+
+def test_voltage_well_below_ceiling_is_allowed():
+    assert voltage_ceiling_block_reason(30.0) is None
+
+
+def test_voltage_ceiling_none_input_is_not_a_violation():
+    assert voltage_ceiling_block_reason(None) is None

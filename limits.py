@@ -76,6 +76,32 @@ def relay_current_warning(max_abs_current_a: Optional[float]) -> Optional[str]:
     return None
 
 
+VOLTAGE_SOURCE_SAFE_CEILING_V = 60.0
+
+VOLTAGE_CEILING_NOTICE = (
+    "Паспортный предел GPP-4323 — 64 В, но практика IDM-DNKMetr ограничивает "
+    f"реальную работу {VOLTAGE_SOURCE_SAFE_CEILING_V:.0f} В — запас перед паспортным потолком."
+)
+
+
+def voltage_ceiling_block_reason(max_abs_voltage: Optional[float]) -> Optional[str]:
+    """
+    Рабочий потолок возбуждения напряжением (п.35) — НЕ то же самое, что
+    паспортный предел конкретного источника (см. strictest_voltage_source_limits):
+    паспорт GPP-4323 — 64 В, но практика IDM-DNKMetr ограничивает реальную
+    работу 60 В. Проверяется независимо от того, какой именно источник
+    напряжения сконфигурирован — это отдельный, более строгий предел.
+    """
+    if max_abs_voltage is None:
+        return None
+    if max_abs_voltage > VOLTAGE_SOURCE_SAFE_CEILING_V:
+        return (
+            f"Уставка напряжения {max_abs_voltage:.1f} В превышает рабочий предел "
+            f"{VOLTAGE_SOURCE_SAFE_CEILING_V:.0f} В. {VOLTAGE_CEILING_NOTICE}"
+        )
+    return None
+
+
 def _strictest_source_limits(config_dir: Path, fields: Tuple[str, ...]) -> Dict[str, Optional[float]]:
     """
     Минимум по каждому полю из `fields` среди всех *.json в config_dir.

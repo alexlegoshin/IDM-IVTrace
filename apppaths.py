@@ -10,9 +10,11 @@
 Пользовательские данные (CSV/PNG/конфиг) при этом всегда пишутся рядом с
 исполняемым файлом/скриптом (см. default_data_dir), а не внутрь _internal.
 """
+import json
 import os
 import sys
 from pathlib import Path
+from typing import Optional
 
 # Версия приложения — используется, например, в метаданных сохранённых
 # профилей датчиков (см. config.SensorConfigManager, п.39), чтобы было
@@ -102,3 +104,63 @@ def config_dir() -> Path:
 def sensor_config_dir() -> Path:
     """Корень профилей датчиков (см. config.SensorConfigManager, п.39) — подпапки current/voltage внутри."""
     return config_dir() / "sensors"
+
+
+# ----------------------------------------------------------------------
+# Рабочая папка (п.23) — настраивается из UI, хранится отдельно от самих
+# CSV/PNG/XLSX: сама настройка — это конфигурация приложения (в config_dir),
+# а не результат измерения.
+# ----------------------------------------------------------------------
+
+def _app_settings_path() -> Path:
+    return config_dir() / "app_settings.json"
+
+
+def load_app_settings() -> dict:
+    path = _app_settings_path()
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding='utf-8'))
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def save_app_settings(settings: dict) -> None:
+    path = _app_settings_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(settings, indent=4, ensure_ascii=False), encoding='utf-8')
+
+
+def work_dir() -> Path:
+    """
+    Рабочая папка результатов измерений (п.23) — оператор может
+    переопределить её из UI (см. set_work_dir); без переопределения —
+    default_data_dir() (совместимость с уже привычным поведением при
+    запуске из исходников/portable exe — там это папка рядом со скриптом).
+
+    В-1 предполагает для установленного приложения дефолт
+    %USERPROFILE%\\Documents\\IVTrace, но инсталлятор (Ф6) ещё не сделан —
+    менять сегодняшний дефолт преждевременно, пока некому его выставить
+    автоматически при установке. Настраиваемость (сама суть п.23) уже
+    работает независимо от того, какой дефолт стоит "из коробки".
+    """
+    override = load_app_settings().get('work_dir')
+    if override:
+        return Path(override)
+    return default_data_dir()
+
+
+def set_work_dir(path: Optional[Path]) -> None:
+    """path=None сбрасывает переопределение (снова default_data_dir())."""
+    settings = load_app_settings()
+    if path is None:
+        settings.pop('work_dir', None)
+    else:
+        settings['work_dir'] = str(Path(path))
+    save_app_settings(settings)
+
+
+def cache_dir() -> Path:
+    """<рабочая папка>\\Cache (п.23, В-1)."""
+    return work_dir() / "Cache"

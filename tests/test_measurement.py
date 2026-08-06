@@ -4,9 +4,9 @@ import pytest
 
 from measurement import (
     run_measurement, _read_attempts, _read_averaged, _adaptive_cooling_delay,
-    EXCITATION_UNITS, OUTPUT_UNITS,
+    EXCITATION_UNITS, OUTPUT_UNITS, estimate_duration_seconds,
 )
-from sweep import Branch, DirectionPreset
+from sweep import Branch, DirectionPreset, plan_sweep
 
 
 class FakeDMM:
@@ -678,3 +678,80 @@ def test_run_measurement_scales_cooling_delay_when_adaptive_enabled(monkeypatch)
     assert any(s == pytest.approx(5.0) for s in sleeps)
     # Точка X=1 — половина максимума -> задержка меньше потолка, но больше базовой.
     assert any(1.0 < s < 5.0 for s in sleeps)
+
+
+# ----------------------------------------------------------------------
+# suppress_notifications (п.38) — гасит только текст уведомления, не данные
+# ----------------------------------------------------------------------
+
+def test_suppress_notifications_hides_polarity_warning_text():
+    # X_start=X_stop=1 -> развёртка не проходит через ноль, единственная
+    # точка -> ровно 4 отсчёта на averaging_count по умолчанию (см. соседние
+    # тесты полярности выше по файлу).
+    dmm = FakeDMM(readings=[-1.0, -1.0, -1.0, -1.0])
+    src, relay = FakeSource(), FakeRelay()
+    logs = []
+    _run(dmm, src, relay, X_start=1, X_stop=1, X_step=1, branch=Branch.POSITIVE,
+        ratio=1.0, error_threshold=1000.0, log_callback=logs.append, suppress_notifications=True)
+    assert not any('ВНИМАНИЕ' in line for line in logs)
+
+
+def test_without_suppress_notifications_polarity_warning_text_is_logged():
+    dmm = FakeDMM(readings=[-1.0, -1.0, -1.0, -1.0])
+    src, relay = FakeSource(), FakeRelay()
+    logs = []
+    _run(dmm, src, relay, X_start=1, X_stop=1, X_step=1, branch=Branch.POSITIVE,
+        ratio=1.0, error_threshold=1000.0, log_callback=logs.append, suppress_notifications=False)
+    assert any('ВНИМАНИЕ' in line for line in logs)
+
+
+def test_suppress_notifications_does_not_affect_polarity_mismatch_data():
+    # Галочка гасит только текст в логе — сама разметка PolarityMismatch в
+    # сырых данных остаётся (см. docstring run_measurement, п.38).
+    dmm = FakeDMM(readings=[-1.0, -1.0, -1.0, -1.0])
+    src, relay = FakeSource(), FakeRelay()
+    results, _ = _run(dmm, src, relay, X_start=1, X_stop=1, X_step=1, branch=Branch.POSITIVE,
+                      ratio=1.0, error_threshold=1000.0, suppress_notifications=True)
+    assert results[0]['PolarityMismatch'] is True
+
+
+# ----------------------------------------------------------------------
+# estimate_duration_seconds (п.15 — только для countdown в GUI)
+# ----------------------------------------------------------------------
+
+def test_estimate_duration_zero_for_empty_plan():
+    assert estimate_duration_seconds([], delay=1.0, cooling_delay=1.0) == 0.0
+
+
+def test_estimate_duration_excludes_delay_and_cooling_for_zero_point_only():
+    plan = plan_sweep(0, 0, 1, branch=Branch.POSITIVE)  # единственная точка — ноль
+    total = estimate_duration_seconds(plan, delay=2.0, cooling_delay=3.0,
+                                      averaging_count=1, averaging_delay=0.0)
+    assert total == pytest.approx(0.0)
+
+
+def test_estimate_duration_counts_delay_and_cooling_for_nonzero_points():
+    plan = plan_sweep(0, 2, 1, branch=Branch.POSITIVE)  # 0, 1, 2 -> ноль + 2 ненулевые
+    total = estimate_duration_seconds(plan, delay=1.0, cooling_delay=0.5,
+                                      averaging_count=1, averaging_delay=0.0)
+    assert total == pytest.approx(2 * (1.0 + 0.5))
+
+
+def test_estimate_duration_includes_averaging_pauses_for_every_point_including_zero():
+    plan = plan_sweep(0, 1, 1, branch=Branch.POSITIVE)  # 0 и 1 -> 2 точки
+    total = estimate_duration_seconds(plan, delay=0.0, cooling_delay=0.0,
+                                      averaging_count=4, averaging_delay=0.1)
+    # (4-1)*0.1 на КАЖДУЮ точку, включая нулевую.
+    assert total == pytest.approx(2 * 3 * 0.1)
+
+
+def test_estimate_duration_scales_with_adaptive_cooling():
+    plan = plan_sweep(0, 2, 1, branch=Branch.POSITIVE)  # 0, 1, 2
+    flat = estimate_duration_seconds(plan, delay=0.0, cooling_delay=1.0,
+                                     averaging_count=1, averaging_delay=0.0,
+                                     adaptive_cooling=False)
+    adaptive = estimate_duration_seconds(plan, delay=0.0, cooling_delay=1.0,
+                                         averaging_count=1, averaging_delay=0.0,
+                                         adaptive_cooling=True, adaptive_cooling_max_multiplier=5.0)
+    # Точка X=2 при адаптивном охлаждении получает cooling_delay*5, а не *1.
+    assert adaptive > flat

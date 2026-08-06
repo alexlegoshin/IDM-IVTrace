@@ -55,8 +55,8 @@ def test_validate_rejects_negative_delays():
 def test_validate_requires_positive_vlimit_only_for_current():
     p = _good_current_params(); p['V_limit'] = 0
     assert any('напряжения' in e for e in validate_measure_params(p, 'current', current_source_limits={}))
-    # для напряжения V_limit не проверяется
-    pv = {'X_start': 0.0, 'X_stop': 64.0, 'X_step': 4.0,
+    # для напряжения V_limit не проверяется (X_stop=60 — в пределах рабочего потолка п.35)
+    pv = {'X_start': 0.0, 'X_stop': 60.0, 'X_step': 4.0,
           'delay': 1.0, 'cooling_delay': 0.5, 'V_limit': 0.0}
     assert validate_measure_params(pv, 'voltage', current_source_limits={}) == []
 
@@ -79,11 +79,13 @@ def test_validate_allows_current_at_exactly_relay_hard_limit():
 def test_validate_does_not_block_on_relay_limit_for_voltage_excitation():
     # Лимит реле — про ток. Возбуждение напряжением им не ограничивается.
     # voltage_source_limits={} изолирует тест от отдельной, но тоже вполне
-    # реальной проверки паспортного напряжения источника (см. тесты ниже) —
-    # 900 В здесь превысил бы и её, что было бы уже про другую причину.
+    # реальной проверки паспортного напряжения источника, а 900 В неизбежно
+    # заденет и рабочий потолок 60 В (п.35) — тест проверяет ИМЕННО
+    # отсутствие ошибки про реле, а не полное отсутствие ошибок вообще.
     pv = {'X_start': 0.0, 'X_stop': 900.0, 'X_step': 4.0,
           'delay': 1.0, 'cooling_delay': 0.5, 'V_limit': 0.0}
-    assert validate_measure_params(pv, 'voltage', current_source_limits={}, voltage_source_limits={}) == []
+    errors = validate_measure_params(pv, 'voltage', current_source_limits={}, voltage_source_limits={})
+    assert not any('реле' in e for e in errors)
 
 
 def test_validate_ignores_relay_warning_threshold_it_is_not_an_error():
@@ -146,19 +148,47 @@ def test_validate_rejects_x_stop_above_voltage_source_max_voltage():
 
 
 def test_validate_allows_x_stop_at_exactly_voltage_source_max_voltage():
-    p = _voltage_params(X_stop=64.0)
+    # max_voltage источника ниже рабочего потолка 60 В (п.35) — иначе даже
+    # "ровно на паспортном пределе" уже упёрлось бы в ceiling, что было бы
+    # уже про другую причину отказа.
+    p = _voltage_params(X_stop=50.0)
     errors = validate_measure_params(
-        p, 'voltage', voltage_source_limits={'max_voltage': 64.0},
+        p, 'voltage', voltage_source_limits={'max_voltage': 50.0},
     )
     assert errors == []
 
 
 def test_validate_missing_voltage_source_limit_field_is_not_checked():
-    p = _voltage_params(X_stop=10_000.0)
+    p = _voltage_params(X_stop=55.0)
     errors = validate_measure_params(
         p, 'voltage', voltage_source_limits={'max_voltage': None},
     )
     assert errors == []
+
+
+# ----------------------------------------------------------------------
+# validate_measure_params — рабочий потолок 60 В (п.35, независимо от
+# паспортного предела конкретного источника)
+# ----------------------------------------------------------------------
+
+def test_validate_blocks_voltage_above_60v_working_ceiling():
+    p = _voltage_params(X_stop=61.0)
+    errors = validate_measure_params(p, 'voltage', voltage_source_limits={'max_voltage': 64.0})
+    assert any('60' in e for e in errors)
+
+
+def test_validate_allows_voltage_at_exactly_60v_ceiling():
+    p = _voltage_params(X_stop=60.0)
+    errors = validate_measure_params(p, 'voltage', voltage_source_limits={'max_voltage': 64.0})
+    assert errors == []
+
+
+def test_validate_60v_ceiling_applies_even_if_source_paspportny_limit_is_higher():
+    # Паспорт источника (гипотетически) допускает 100 В — рабочий потолок
+    # 60 В всё равно строже и блокирует независимо от паспорта источника.
+    p = _voltage_params(X_stop=70.0)
+    errors = validate_measure_params(p, 'voltage', voltage_source_limits={'max_voltage': 100.0})
+    assert any('60' in e for e in errors)
 
 
 def test_validate_voltage_source_limit_not_checked_for_current_excitation():
@@ -389,7 +419,7 @@ def test_resolve_measure_params_voltage_excitation_ignores_vlimit(tmp_path):
     parser = build_parser()
     args = _measure_args(parser, [
         "--excitation", "voltage",
-        "--start", "0", "--stop", "64", "--step", "4",
+        "--start", "0", "--stop", "50", "--step", "4",
         "--delay", "1", "--cool", "0.5",
         "--label", "VSensor", "--yes",
     ])
@@ -397,7 +427,7 @@ def test_resolve_measure_params_voltage_excitation_ignores_vlimit(tmp_path):
 
     params = resolve_measure_params(args, mgr)
     assert params['excitation_type'] == 'voltage'
-    assert params['X_stop'] == 64
+    assert params['X_stop'] == 50
 
 
 # ----------------------------------------------------------------------
@@ -441,6 +471,59 @@ def test_analyze_parser_flags_default_to_false():
     assert args.labels is False
     assert args.xlsx is False
     assert args.estimate_ratio is False
+
+
+# ----------------------------------------------------------------------
+# --suppress-warnings (п.38) — верхнеуровневый флаг, попадает в params
+# ----------------------------------------------------------------------
+
+def test_suppress_warnings_flag_defaults_to_false(tmp_path):
+    parser = build_parser()
+    args = _measure_args(parser, [
+        "--excitation", "current", "--start", "0", "--stop", "10", "--step", "1",
+        "--vlimit", "5", "--delay", "0.1", "--cool", "0.1", "--label", "T", "--yes",
+    ])
+    mgr = ConfigManager(tmp_path / "cfg.json")
+    params = resolve_measure_params(args, mgr)
+    assert params['suppress_notifications'] is False
+
+
+def test_suppress_warnings_flag_carries_into_params(tmp_path):
+    parser = build_parser()
+    args = parser.parse_args([
+        "--suppress-warnings", "measure",
+        "--excitation", "current", "--start", "0", "--stop", "10", "--step", "1",
+        "--vlimit", "5", "--delay", "0.1", "--cool", "0.1", "--label", "T", "--yes",
+    ])
+    mgr = ConfigManager(tmp_path / "cfg.json")
+    params = resolve_measure_params(args, mgr)
+    assert params['suppress_notifications'] is True
+
+
+def test_suppress_warnings_hides_relay_current_warning_print(tmp_path, capsys):
+    parser = build_parser()
+    args = parser.parse_args([
+        "--suppress-warnings", "measure",
+        "--excitation", "current", "--start", "0", "--stop", "500", "--step", "50",
+        "--vlimit", "5", "--delay", "0.1", "--cool", "0.1", "--label", "T", "--yes",
+    ])
+    mgr = ConfigManager(tmp_path / "cfg.json")
+    resolve_measure_params(args, mgr)
+    captured = capsys.readouterr()
+    assert "⚠" not in captured.out
+
+
+def test_without_suppress_warnings_relay_current_warning_is_printed(tmp_path, capsys):
+    parser = build_parser()
+    args = parser.parse_args([
+        "measure",
+        "--excitation", "current", "--start", "0", "--stop", "500", "--step", "50",
+        "--vlimit", "5", "--delay", "0.1", "--cool", "0.1", "--label", "T", "--yes",
+    ])
+    mgr = ConfigManager(tmp_path / "cfg.json")
+    resolve_measure_params(args, mgr)
+    captured = capsys.readouterr()
+    assert "⚠" in captured.out
 
 
 # ----------------------------------------------------------------------

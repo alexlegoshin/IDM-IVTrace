@@ -1,6 +1,12 @@
+import json
 from datetime import date
 
-from calibration import CalibrationStatus, WARNING_WINDOW_DAYS, check_calibration
+import pytest
+
+from calibration import (
+    CalibrationStatus, WARNING_WINDOW_DAYS, check_calibration,
+    list_instrument_configs, update_calibration_date,
+)
 
 
 def _cfg(**overrides):
@@ -132,3 +138,78 @@ def test_model_name_appears_in_message():
 def test_missing_model_name_falls_back_to_generic_label():
     info = check_calibration({})
     assert info.model_name == 'прибор'
+
+
+# ----------------------------------------------------------------------
+# list_instrument_configs (п.3-UI)
+# ----------------------------------------------------------------------
+
+def test_list_instrument_configs_collects_json_from_all_dirs(tmp_path):
+    dir_a = tmp_path / "a"; dir_a.mkdir()
+    dir_b = tmp_path / "b"; dir_b.mkdir()
+    (dir_a / "one.json").write_text("{}", encoding='utf-8')
+    (dir_b / "two.json").write_text("{}", encoding='utf-8')
+    (dir_b / "not_json.txt").write_text("x", encoding='utf-8')
+
+    found = list_instrument_configs([dir_a, dir_b])
+    names = sorted(p.name for p in found)
+    assert names == ["one.json", "two.json"]
+
+
+def test_list_instrument_configs_empty_dirs_returns_empty_list(tmp_path):
+    empty = tmp_path / "empty"; empty.mkdir()
+    assert list_instrument_configs([empty]) == []
+
+
+# ----------------------------------------------------------------------
+# update_calibration_date (п.3-UI)
+# ----------------------------------------------------------------------
+
+def test_update_calibration_date_writes_fields_and_preserves_others(tmp_path):
+    cfg_path = tmp_path / "instr.json"
+    cfg_path.write_text(json.dumps({'model_name': 'X', 'keywords': ['X']}, ensure_ascii=False), encoding='utf-8')
+
+    update_calibration_date(cfg_path, '2026-01-15', 12)
+
+    data = json.loads(cfg_path.read_text(encoding='utf-8'))
+    assert data['calibration_date'] == '2026-01-15'
+    assert data['calibration_interval_months'] == 12
+    assert data['model_name'] == 'X'
+    assert data['keywords'] == ['X']
+
+
+def test_update_calibration_date_result_is_readable_by_check_calibration(tmp_path):
+    cfg_path = tmp_path / "instr.json"
+    cfg_path.write_text(json.dumps({'model_name': 'X'}), encoding='utf-8')
+    update_calibration_date(cfg_path, '2026-01-01', 12)
+
+    data = json.loads(cfg_path.read_text(encoding='utf-8'))
+    info = check_calibration(data, today=date(2026, 6, 1))
+    assert info.status == CalibrationStatus.OK
+
+
+def test_update_calibration_date_rejects_malformed_date(tmp_path):
+    cfg_path = tmp_path / "instr.json"
+    cfg_path.write_text(json.dumps({'model_name': 'X'}), encoding='utf-8')
+    with pytest.raises(ValueError):
+        update_calibration_date(cfg_path, 'not-a-date', 12)
+
+
+def test_update_calibration_date_rejects_nonpositive_interval(tmp_path):
+    cfg_path = tmp_path / "instr.json"
+    cfg_path.write_text(json.dumps({'model_name': 'X'}), encoding='utf-8')
+    with pytest.raises(ValueError):
+        update_calibration_date(cfg_path, '2026-01-01', 0)
+
+
+def test_update_calibration_date_overwrites_previous_value(tmp_path):
+    cfg_path = tmp_path / "instr.json"
+    cfg_path.write_text(json.dumps({
+        'model_name': 'X', 'calibration_date': '2020-01-01', 'calibration_interval_months': 6,
+    }), encoding='utf-8')
+
+    update_calibration_date(cfg_path, '2026-03-01', 24)
+
+    data = json.loads(cfg_path.read_text(encoding='utf-8'))
+    assert data['calibration_date'] == '2026-03-01'
+    assert data['calibration_interval_months'] == 24

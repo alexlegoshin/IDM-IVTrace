@@ -10,6 +10,7 @@ from limits import (
     relay_current_warning,
     strictest_current_source_limits,
     strictest_voltage_source_limits,
+    voltage_ceiling_block_reason,
 )
 from measurement import (
     DEFAULT_AVERAGING_COUNT, DEFAULT_AVERAGING_DELAY, DEFAULT_DISCARD_FIRST,
@@ -31,6 +32,12 @@ def build_parser(default_data_dir: Path = Path("data")) -> argparse.ArgumentPars
     parser.add_argument(
         "--skip-selftest", action="store_true",
         help="Пропустить предполётные самотесты (НЕ рекомендуется: тесты защищают оборудование от повреждения при поломке кода)",
+    )
+    parser.add_argument(
+        "--suppress-warnings", action="store_true",
+        help="Отключить необязательные предупреждения и уведомления (НЕ рекомендуется): "
+             "поверка приборов, перепутанная полярность, превышение 400 А. "
+             "Жёсткий запрет 800 А, аварийный останов и отсечку по погрешности НЕ отключает (п.38).",
     )
     subparsers = parser.add_subparsers(dest="command", required=False)
 
@@ -71,7 +78,8 @@ def build_parser(default_data_dir: Path = Path("data")) -> argparse.ArgumentPars
     )
     p_measure.add_argument(
         "--excitation", choices=["current", "voltage"], default=None,
-        help="Тип возбуждения датчика: current (источник тока) или voltage (источник напряжения)",
+        help="Тип возбуждения датчика: current (источник тока) или voltage (источник напряжения, "
+             "BETA — рабочий предел 60 В, см. --output)",
     )
     p_measure.add_argument(
         "--output", choices=["current", "voltage"], default=None,
@@ -279,6 +287,11 @@ def validate_measure_params(params: dict, excitation_type: str,
                 f"Уставка напряжения {max_abs_v} В превышает паспортный предел источника "
                 f"({max_v} В) — физически недостижимо."
             )
+        # Рабочий потолок 60 В (п.35) — отдельно от паспортного предела
+        # конкретного источника, см. limits.voltage_ceiling_block_reason.
+        ceiling_block = voltage_ceiling_block_reason(max_abs_v)
+        if ceiling_block:
+            errors.append(ceiling_block)
 
     return errors
 
@@ -351,6 +364,10 @@ def resolve_measure_params(args, config_mgr: ConfigManager, sensor_config_mgr=No
         # флаг не передавал (это подавляющее большинство существующих
         # сценариев — датчик тока с выходом по току).
         'output_type': args.output if args.output is not None else loaded.get('output_type', 'current'),
+        # п.38: не сохраняется/не наследуется от прошлого запуска — это
+        # свойство ТЕКУЩЕГО запуска CLI (флаг верхнего уровня), а не режима
+        # измерения датчика.
+        'suppress_notifications': getattr(args, 'suppress_warnings', False),
         'X_start': args.start if args.start is not None else loaded.get('X_start'),
         'X_stop': args.stop if args.stop is not None else loaded.get('X_stop'),
         'X_step': args.step if args.step is not None else loaded.get('X_step'),
@@ -467,11 +484,13 @@ def resolve_measure_params(args, config_mgr: ConfigManager, sensor_config_mgr=No
         raise ValueError("Некорректные параметры измерения:\n  " + "\n  ".join(errors))
 
     # Предупреждение (не запрет) о работе свыше паспортного тока реле.
-    # Печатается безусловно, даже под --yes: это техника безопасности, а не
-    # вопрос, на который можно молча ответить "да" за оператора.
-    warning = relay_current_warning(current_sweep_max_abs(params, excitation_type))
-    if warning:
-        print(f"\n⚠ {warning}\n")
+    # Печатается даже под --yes: это техника безопасности, а не вопрос, на
+    # который можно молча ответить "да" за оператора. Единственное, что его
+    # гасит, — явный --suppress-warnings (п.38), а не обычный --yes.
+    if not params['suppress_notifications']:
+        warning = relay_current_warning(current_sweep_max_abs(params, excitation_type))
+        if warning:
+            print(f"\n⚠ {warning}\n")
 
     # Сохраняем конфиг датчика, если указано
     if args.save_config and sensor_config_mgr:

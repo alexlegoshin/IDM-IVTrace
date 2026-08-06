@@ -158,6 +158,31 @@ class SensorConfigManager:
             names.update(p.stem for p in d.glob('*.json'))
         return sorted(names)
 
+    def rename_sensor_config(self, old_name: str, new_name: str,
+                             excitation_type: Optional[str] = None) -> bool:
+        """
+        Переименовывает профиль (п.39-UI). Содержимое (включая _meta с
+        исходным saved_at/comment) переносится как есть — переименование не
+        то же самое, что новое сохранение, дата создания профиля не должна
+        подменяться датой переименования.
+
+        Возвращает False, если исходного профиля не нашлось (нечего
+        переименовывать) — как и delete_sensor_config, не бросает исключение
+        на отсутствующем файле.
+        """
+        params = self.load_sensor_config(old_name, excitation_type=excitation_type)
+        if params is None:
+            return False
+        actual_excitation = excitation_type or params.get('excitation_type')
+
+        filename = self._safe_filename(new_name)
+        path = self._subdir(actual_excitation) / filename
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(params, f, indent=4, ensure_ascii=False)
+
+        self.delete_sensor_config(old_name, excitation_type=actual_excitation)
+        return True
+
     def delete_sensor_config(self, name: str, excitation_type: Optional[str] = None) -> bool:
         """Удаляет профиль. Без excitation_type удаляет из обеих подпапок (на случай совпадения имён)."""
         try:

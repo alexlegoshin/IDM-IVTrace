@@ -223,3 +223,43 @@ def test_unknown_excitation_type_raises_value_error(tmp_path):
     mgr = SensorConfigManager(tmp_path / "sensors")
     with pytest.raises(ValueError):
         mgr.save_sensor_config("X", _params(), excitation_type='bogus')
+
+
+# ----------------------------------------------------------------------
+# SensorConfigManager — переименование (п.39-UI)
+# ----------------------------------------------------------------------
+
+def test_rename_moves_content_to_new_name(tmp_path):
+    mgr = SensorConfigManager(tmp_path / "sensors")
+    mgr.save_sensor_config("Старое", _params('current'))
+
+    assert mgr.rename_sensor_config("Старое", "Новое", excitation_type='current') is True
+    assert mgr.load_sensor_config("Старое", excitation_type='current') is None
+    loaded = mgr.load_sensor_config("Новое", excitation_type='current')
+    assert loaded is not None
+    assert loaded['ratio'] == 2000.0
+
+
+def test_rename_preserves_original_meta_saved_at(tmp_path):
+    mgr = SensorConfigManager(tmp_path / "sensors")
+    mgr.save_sensor_config("Старое", _params('current'), comment="исходный комментарий")
+    original = mgr.load_sensor_config("Старое", excitation_type='current')
+
+    mgr.rename_sensor_config("Старое", "Новое", excitation_type='current')
+
+    renamed = mgr.load_sensor_config("Новое", excitation_type='current')
+    assert renamed['_meta']['saved_at'] == original['_meta']['saved_at']
+    assert renamed['_meta']['comment'] == "исходный комментарий"
+
+
+def test_rename_missing_source_returns_false(tmp_path):
+    mgr = SensorConfigManager(tmp_path / "sensors")
+    assert mgr.rename_sensor_config("НетТакого", "Новое") is False
+
+
+def test_rename_without_explicit_excitation_type_infers_from_content(tmp_path):
+    mgr = SensorConfigManager(tmp_path / "sensors")
+    mgr.save_sensor_config("Старое", _params('voltage'))
+
+    assert mgr.rename_sensor_config("Старое", "Новое") is True
+    assert mgr.load_sensor_config("Новое", excitation_type='voltage') is not None
