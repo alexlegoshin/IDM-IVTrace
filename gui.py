@@ -718,7 +718,8 @@ class IVTraceGUI:
         meta = ttk.Labelframe(body, text="Метаданные датчика", padding=10)
         meta.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 8))
         meta.columnconfigure(1, weight=1)
-        ttk.Label(meta, text="I ном., А").grid(row=0, column=0, sticky="w", pady=3)
+        self.l_inom = ttk.Label(meta, text="I ном., А")
+        self.l_inom.grid(row=0, column=0, sticky="w", pady=3)
         self.e_inom = ttk.Entry(meta, width=14)
         self.e_inom.grid(row=0, column=1, sticky="ew", pady=3, padx=(8, 0))
         ttk.Label(meta, text="Коэфф. 1:X").grid(row=1, column=0, sticky="w", pady=3)
@@ -902,7 +903,8 @@ class IVTraceGUI:
         # -- параметры анализа --
         an = ttk.Labelframe(plot_tab, text="Параметры анализа", padding=8)
         an.grid(row=1, column=0, sticky="ew", pady=(0, 6))
-        ttk.Label(an, text="I ном., А").grid(row=0, column=0, sticky="w")
+        self.l_plot_inom = ttk.Label(an, text="I ном., А")
+        self.l_plot_inom.grid(row=0, column=0, sticky="w")
         self.plot_e_inom = ttk.Entry(an, width=10)
         self.plot_e_inom.grid(row=0, column=1, padx=(6, 14))
         ttk.Label(an, text="Коэфф. 1:X").grid(row=0, column=2, sticky="w")
@@ -1078,6 +1080,9 @@ class IVTraceGUI:
         unit = "А" if is_current else "В"
         for lbl in (self.u_start, self.u_stop, self.u_step):
             lbl.configure(text=unit)
+        # Баг-репорт: раньше подпись номинала всегда была "I ном., А", даже
+        # при возбуждении напряжением — не соответствовало смыслу поля.
+        self.l_inom.configure(text="I ном., А" if is_current else "U ном., В")
         # п.33: показываем только то, что реально будет использовано —
         # огр. напряжения и витки не имеют смысла при возбуждении
         # напряжением (там вместо огр. напряжения — симметричное огр. тока),
@@ -2118,12 +2123,16 @@ class IVTraceGUI:
                 params["adaptive_cooling_max_delay"] = optional_num(self.e_cool_max) or DEFAULT_ADAPTIVE_COOLING_MAX_DELAY
             params["suppress_notifications"] = self.suppress_warnings_var.get()
 
-            # I_nom — только метаданные датчика для шапки CSV, для измерения
-            # он не нужен. А вот без коэффициента преобразования нечем считать
-            # ожидаемый выход датчика, поэтому отсечка по погрешности без него
-            # работать не может.
+            # Без коэффициента преобразования нечем считать ожидаемый выход
+            # датчика, поэтому отсечка по погрешности без него работать не
+            # может. I_nom нужен наравне с ratio (баг-репорт): без номинала
+            # отсечка живьём считала бы обычную относительную погрешность
+            # вместо приведённой, которую показывает итоговый отчёт/график —
+            # они расходились, особенно на малых уставках.
             if params["stop_on_error"] and params["ratio"] is None:
                 raise ValueError("Для отсечки по погрешности необходимо указать коэффициент преобразования.")
+            if params["stop_on_error"] and params["I_nom"] is None:
+                raise ValueError("Для отсечки по погрешности необходимо указать номинальный первичный ток/напряжение.")
 
         except ValueError as e:
             messagebox.showerror("Проверьте параметры", str(e))
@@ -2372,7 +2381,8 @@ class IVTraceGUI:
         # Предзаполняем I ном./коэффициент тем, с чем файл снимался, если это
         # сохранено в его собственной шапке — иначе оператор увидит в полях
         # значения от предыдущего файла, что не имеет смысла для нового.
-        I_nom, X = metadata_i_nom_and_ratio(path)
+        I_nom, X, excitation_type = metadata_i_nom_and_ratio(path)
+        self.l_plot_inom.configure(text="U ном., В" if excitation_type == 'voltage' else "I ном., А")
         self.plot_e_inom.delete(0, "end")
         if I_nom is not None:
             self.plot_e_inom.insert(0, str(I_nom))
@@ -2527,7 +2537,8 @@ class IVTraceGUI:
         if messagebox.askyesno("Готово", f"Файл создан: {output_path.name}\nОткрыть его для анализа?"):
             self.plot_csv_path = output_path
             self.plot_file_label.configure(text=output_path.name)
-            I_nom, X = metadata_i_nom_and_ratio(output_path)
+            I_nom, X, excitation_type = metadata_i_nom_and_ratio(output_path)
+            self.l_plot_inom.configure(text="U ном., В" if excitation_type == 'voltage' else "I ном., А")
             self.plot_e_inom.delete(0, "end")
             if I_nom is not None:
                 self.plot_e_inom.insert(0, str(I_nom))

@@ -79,10 +79,22 @@ def load_and_analyze(latest_csv: Path, I_nom: float, X: float, save_png: bool = 
     if not has_branch_col:
         df['Branch'] = metadata.get('ветвь', 'forward')
 
-    # Колонка возбуждения называется X_set (новые файлы, могут быть током
-    # или напряжением — единица берётся из метаданных) либо I_set_A
-    # (старые файлы до появления выбора типа возбуждения — всегда ток).
-    if 'X_set' in df.columns:
+    # Колонка возбуждения: X_real — реальный вход датчика с учётом витков
+    # (X_set * turns, см. measurement.py) — есть во всех новых файлах, где
+    # есть и X_set, и совпадает с X_set при turns=1 (подавляющее большинство
+    # измерений). X_set — сама уставка на источнике, без витков; используется
+    # только как отходной путь для файлов совсем без X_real. I_set_A —
+    # старые файлы до появления выбора типа возбуждения (всегда ток, витков
+    # как понятия ещё не было).
+    # Баг-репорт: раньше здесь всегда бралась X_set — при turns != 1
+    # ожидаемый выход (Y_expected) и приведённая погрешность на графике
+    # считались от уставки на проводе, а не от реального входа датчика,
+    # хотя колонка X_real для этого специально и заводилась в measurement.py.
+    if 'X_real' in df.columns:
+        excitation_col = 'X_real'
+        excitation_unit = metadata.get('Единица измерения возбуждения', 'А')
+        excitation_type = metadata.get('Тип возбуждения', 'current')
+    elif 'X_set' in df.columns:
         excitation_col = 'X_set'
         excitation_unit = metadata.get('Единица измерения возбуждения', 'А')
         excitation_type = metadata.get('Тип возбуждения', 'current')
@@ -125,8 +137,19 @@ def load_and_analyze(latest_csv: Path, I_nom: float, X: float, save_png: bool = 
     # ---------- Расчёт погрешности ----------
     # Погрешность всегда считается относительно выхода датчика (meas_col),
     # независимо от того, чем датчик возбуждался и что именно он выдаёт.
+    #
+    # Приведённая погрешность по ГОСТ 8.401-80 (формула 3, п.2.3): γ = Δ/X_N,
+    # где X_N — нормирующее значение. Здесь X_N = Y_sec_nom — номинальный
+    # выходной сигнал датчика при номинальном первичном токе/напряжении
+    # (I_nom), что соответствует п.2.3.5 стандарта ("для СИ с установленным
+    # номинальным значением измеряемой величины нормирующее значение
+    # принимается равным этому номинальному значению"). Такой выбор X_N (а
+    # не, скажем, показания в конкретной точке) — единственный, при котором
+    # погрешность не взрывается вблизи нуля возбуждения (см. измерение.py,
+    # y_sec_nom — та же формула используется и в живой отсечке по
+    # погрешности, чтобы отчёт и решения во время измерения не расходились).
     K = 1.0 / X                      # коэффициент передачи Y_out / X_in
-    Y_sec_nom = I_nom * K            # номинальный выходной сигнал при I_nom
+    Y_sec_nom = I_nom * K            # номинальный выходной сигнал при I_nom (X_N по ГОСТ 8.401-80)
 
     df['Y_expected'] = df[excitation_col] * K
     # Погрешность знаковая (п.31): по ней видно не только величину
@@ -223,7 +246,7 @@ def load_and_analyze(latest_csv: Path, I_nom: float, X: float, save_png: bool = 
     ax2.plot(df[excitation_col], df['Error_percent'], 'x', color='firebrick', markersize=6, alpha=0.7)
     ax2.axhline(y=0, color='gray', linewidth=0.5)
     ax2.set_xlabel(f'Заданное возбуждение ({excitation_label}), {excitation_unit}')
-    ax2.set_ylabel('Погрешность, %')
+    ax2.set_ylabel('Приведённая погрешность (ГОСТ 8.401-80), %')
     ax2.legend(loc='upper right')
     ax2.grid(True, which='major', linestyle='-', linewidth=0.6, alpha=0.7)
     ax2.grid(True, which='minor', linestyle=':', linewidth=0.4, alpha=0.5)
@@ -314,18 +337,23 @@ def load_and_analyze_from_params(csv_path: Path, params: dict, **kwargs) -> Opti
 
 def metadata_i_nom_and_ratio(csv_path: Path) -> tuple:
     """
-    Достаёт I_nom и коэффициент 1:X из шапки метаданных CSV (см.
-    orchestrate.write_results_csv), если они там были сохранены.
+    Достаёт I_nom, коэффициент 1:X и тип возбуждения из шапки метаданных
+    CSV (см. orchestrate.write_results_csv), если они там были сохранены.
 
     Нужно для п.20 (график из произвольного файла): при открытии старого
     CSV разумно предзаполнить поля анализа тем, с чем он снимался, а не
     оставлять то, что было в них до этого от другого файла/сессии.
-    Возвращает (I_nom, X), любое из значений может быть None.
+    Возвращает (I_nom, X, excitation_type); I_nom/X — любое может быть None,
+    excitation_type — 'current' или 'voltage' (по умолчанию 'current', как
+    и везде, где явно не сказано иное в старых файлах).
     """
     metadata = _read_metadata(Path(csv_path))
     I_nom = None
     X = None
-    raw_inom = metadata.get('Номинальный первичный ток')
+    # Ключ зависит от типа возбуждения (баг-репорт: раньше подпись "первичный
+    # ток... А" писалась всегда, даже для датчиков с возбуждением
+    # напряжением — см. orchestrate.write_results_csv).
+    raw_inom = metadata.get('Номинальный первичный ток') or metadata.get('Номинальное первичное напряжение')
     if raw_inom:
         match = re.match(r'([\d.,]+)', raw_inom)
         if match:
@@ -339,7 +367,8 @@ def metadata_i_nom_and_ratio(csv_path: Path) -> tuple:
         match = re.match(r'([\d.,]+)', raw_ratio.strip())
         if match:
             X = float(match.group(1).replace(',', '.'))
-    return I_nom, X
+    excitation_type = metadata.get('Тип возбуждения', 'current')
+    return I_nom, X, excitation_type
 
 
 def metadata_zero_offset(csv_path: Path) -> Optional[float]:
@@ -364,12 +393,12 @@ def metadata_zero_offset(csv_path: Path) -> Optional[float]:
 # п.10 (BETA) — определение фактического коэффициента преобразования
 # ----------------------------------------------------------------------
 
-def estimate_ratio_from_data(df: pd.DataFrame, excitation_col: str = 'X_set',
+def estimate_ratio_from_data(df: pd.DataFrame, excitation_col: Optional[str] = None,
                              zero_offset: float = 0.0) -> dict:
     """
     BETA (см. PLAN_V2.md, В-4): определяет фактический коэффициент
     преобразования 1:X по уже снятым точкам методом наименьших квадратов —
-    прямая через ноль Y_meas = X_set / X_actual, — и округляет его до
+    прямая через ноль Y_meas = X_real / X_actual, — и округляет его до
     ближайшего кратного 50, как того требует ТЗ.
 
     Рядом с округлённым значением всегда возвращается и фактическое, и
@@ -377,11 +406,25 @@ def estimate_ratio_from_data(df: pd.DataFrame, excitation_col: str = 'X_set',
     (например, между 1:50 и 1:100 ничего нет), и оператор должен это видеть,
     а не получать округление молча.
 
+    excitation_col — None (по умолчанию) значит "определить по колонкам df":
+    X_real (реальный вход датчика с учётом витков, см. turns в
+    measurement.py), если есть, иначе X_set, иначе I_set_A для совсем
+    старых файлов. Баг-репорт: раньше здесь всегда бралась X_set — при
+    turns != 1 оценённый коэффициент получался в turns раз мимо настоящего.
+
     zero_offset (feature) — известное смещение нуля датчика, вычитается из
     Y_meas ДО подгонки прямой через ноль: без поправки смещение сместило бы
     саму оценку наклона (прямая уже не через ноль на самом деле), см.
     analysis.metadata_zero_offset для чтения значения из шапки CSV.
     """
+    if excitation_col is None:
+        if 'X_real' in df.columns:
+            excitation_col = 'X_real'
+        elif 'X_set' in df.columns:
+            excitation_col = 'X_set'
+        else:
+            excitation_col = 'I_set_A'
+
     excluded_mask = pd.Series(False, index=df.index)
     if 'Rejected' in df.columns:
         excluded_mask |= df['Rejected'].fillna(False).astype(bool)

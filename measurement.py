@@ -260,6 +260,7 @@ def _measure_point_row(dmm: DMM, src: Union[CurrentSource, VoltageSource],
                         adaptive_cooling_max_delay: float = DEFAULT_ADAPTIVE_COOLING_MAX_DELAY,
                         suppress_notifications: bool = False,
                         zero_offset: float = 0.0,
+                        y_sec_nom: Optional[float] = None,
                         ) -> Tuple[Dict, Optional[str]]:
     """
     Измеряет одну ненулевую точку плана — с поправкой на витки (п.37),
@@ -281,6 +282,17 @@ def _measure_point_row(dmm: DMM, src: Union[CurrentSource, VoltageSource],
 
     Без ratio (expected не определить) проверки и повторы не работают —
     измерение просто снимается один раз, как раньше.
+
+    y_sec_nom — номинальный выходной сигнал датчика (I_nom * turns / ratio),
+    та же величина, что Y_sec_nom в analysis.py (X_N по ГОСТ 8.401-80,
+    п.2.3.5 — нормирующее значение, равное номинальному). Если задан,
+    error_percent считается ПРИВЕДЁННОЙ погрешностью по ГОСТ 8.401-80
+    (формула 3): отклонение / y_sec_nom — тем же способом, что и в итоговом
+    отчёте/графике (баг-репорт: раньше здесь всегда была обычная
+    относительная погрешность отклонение/expected, которая на малых
+    уставках зашкаливает даже у исправного датчика, и не совпадала с тем,
+    что показывает график). Без y_sec_nom (I_nom не задан) — старое
+    поведение, относительная погрешность, как и раньше.
 
     Возвращает (row, aborted_reason).
     """
@@ -338,7 +350,11 @@ def _measure_point_row(dmm: DMM, src: Union[CurrentSource, VoltageSource],
         if i_avg_corrected != 0 and (i_avg_corrected > 0) != (point.x_set > 0):
             polarity_mismatch = True
 
-        error_percent = abs(abs(i_avg_corrected) - expected) / expected * 100.0 if expected > 0 else None
+        # Приведённая погрешность (к y_sec_nom), если он известен — та же
+        # формула, что и в отчёте/графике (analysis.py); иначе — старая
+        # относительная (к expected в этой конкретной точке), см. докстринг.
+        denom = y_sec_nom if y_sec_nom else expected
+        error_percent = abs(abs(i_avg_corrected) - expected) / denom * 100.0 if denom else None
         if error_percent is None or error_percent <= error_threshold:
             break  # в допуске — точка принята
 
@@ -387,6 +403,7 @@ def _measure_point_row_ramp(dmm: DMM, src: CurrentSource, output_type: str,
                             log_callback: Optional[Callable[[str], None]],
                             zero_offset: float = 0.0,
                             suppress_notifications: bool = False,
+                            y_sec_nom: Optional[float] = None,
                             ) -> Tuple[Dict, Optional[str]]:
     """
     Вариант _measure_point_row для плавного нарастания (feature, BETA,
@@ -440,7 +457,10 @@ def _measure_point_row_ramp(dmm: DMM, src: CurrentSource, output_type: str,
         if i_avg_corrected != 0 and (i_avg_corrected > 0) != (point.x_set > 0):
             polarity_mismatch = True
 
-        error_percent = abs(abs(i_avg_corrected) - expected) / expected * 100.0 if expected > 0 else None
+        # Приведённая погрешность (к y_sec_nom), если он известен — см.
+        # докстринг _measure_point_row; иначе старая относительная (к expected).
+        denom = y_sec_nom if y_sec_nom else expected
+        error_percent = abs(abs(i_avg_corrected) - expected) / denom * 100.0 if denom else None
         if error_percent is None or error_percent <= error_threshold:
             break
 
@@ -496,6 +516,7 @@ def run_measurement(dmm: DMM, src: Union[CurrentSource, VoltageSource], relay: O
                      adaptive_cooling_max_delay: float = DEFAULT_ADAPTIVE_COOLING_MAX_DELAY,
                      should_stop: Optional[Callable[[], bool]] = None,
                      ratio: Optional[float] = None,
+                     I_nom: Optional[float] = None,
                      stop_on_error: bool = False,
                      error_threshold: float = 1.0,
                      log_callback: Optional[Callable[[str], None]] = None,
@@ -556,6 +577,16 @@ def run_measurement(dmm: DMM, src: Union[CurrentSource, VoltageSource], relay: O
     (ratio) и колонка X_real в результате. Через реле и провод при этом
     течёт |X_set| — НЕ X_set×turns (см. limits.py и docstring plan_sweep) —
     turns здесь не используется ни для чего, кроме этого пересчёта.
+
+    I_nom — номинальный первичный ток/напряжение датчика. Вместе с ratio
+    задаёт y_sec_nom = I_nom * turns / ratio (см. _measure_point_row) — ту же
+    "полную шкалу", относительно которой analysis.py считает приведённую
+    погрешность для отчёта. Если I_nom задан (наряду с ratio) — отсечка по
+    погрешности (error_threshold, retries, stop_on_error) работает по
+    приведённой погрешности, как и отчёт; если нет — по старой, чисто
+    относительной (баг-репорт: раньше I_nom тут не участвовал вовсе, и живая
+    отсечка всегда была относительной — расходилась с приведённой из отчёта и
+    неправдоподобно росла на малых уставках даже у исправного датчика).
 
     adaptive_cooling (п.27, BETA) — задержка охлаждения между точками
     растёт квадратично с током (джоулево тепло ∝ I²) вместо фиксированной
@@ -619,6 +650,7 @@ def run_measurement(dmm: DMM, src: Union[CurrentSource, VoltageSource], relay: O
     plan = plan_override if plan_override is not None else plan_sweep(X_start, X_stop, X_step, branch=branch, preset=preset)
     averaging = dict(count=averaging_count, delay=averaging_delay, discard_first=discard_first)
     max_magnitude = max((p.magnitude for p in plan), default=0.0)
+    y_sec_nom = (I_nom * turns / ratio) if (I_nom and ratio and ratio > 0) else None
 
     results: List[Dict] = []
     aborted_reason: Optional[str] = None
@@ -667,6 +699,7 @@ def run_measurement(dmm: DMM, src: Union[CurrentSource, VoltageSource], relay: O
                     ratio, turns, averaging, stop_on_error, error_threshold,
                     is_first_of_run=run_started_fresh, log_callback=log_callback,
                     zero_offset=zero_offset, suppress_notifications=suppress_notifications,
+                    y_sec_nom=y_sec_nom,
                 )
                 run_started_fresh = False
                 ramp_from = point.magnitude
@@ -682,6 +715,7 @@ def run_measurement(dmm: DMM, src: Union[CurrentSource, VoltageSource], relay: O
                     adaptive_cooling_max_delay=adaptive_cooling_max_delay,
                     suppress_notifications=suppress_notifications,
                     zero_offset=zero_offset,
+                    y_sec_nom=y_sec_nom,
                 )
                 run_started_fresh = False
                 if point_aborted:

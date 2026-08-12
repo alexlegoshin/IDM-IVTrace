@@ -202,7 +202,8 @@ def build_parser(default_data_dir: Path = Path("data")) -> argparse.ArgumentPars
     # --- Новые параметры ---
     p_measure.add_argument(
         "--inom", type=float, default=None,
-        help="Номинальный первичный ток датчика, А",
+        help="Номинальный первичный ток (А) или напряжение (В) датчика — "
+             "в зависимости от типа возбуждения",
     )
     p_measure.add_argument(
         "--ratio", type=float, default=None,
@@ -277,7 +278,9 @@ def build_parser(default_data_dir: Path = Path("data")) -> argparse.ArgumentPars
     # ---------------- analyze ----------------
     p_analyze = subparsers.add_parser("analyze", help="Построить график и рассчитать погрешность по указанному (или последнему) CSV")
     p_analyze.add_argument("--file", type=Path, default=None, help="Путь к конкретному CSV (по умолчанию — последний в data-dir; п.20)")
-    p_analyze.add_argument("--inom", type=float, default=None, help="Номинальный первичный ток датчика, А")
+    p_analyze.add_argument("--inom", type=float, default=None,
+                           help="Номинальный первичный ток (А) или напряжение (В) датчика — "
+                                "в зависимости от типа возбуждения (см. шапку CSV)")
     p_analyze.add_argument("--ratio", type=float, default=None, help="Коэффициент преобразования 1:X (передать X)")
     p_analyze.add_argument("--zero-offset", type=float, default=None,
                            help="Смещение нуля датчика — переопределяет значение из шапки CSV, если оно там есть")
@@ -686,13 +689,22 @@ def resolve_measure_params(args, config_mgr: ConfigManager, sensor_config_mgr=No
     # проводится как обычно, они лишь попадают в шапку CSV. Спрашивать их
     # безусловно нельзя: measure тогда лезет в input() при любом запуске и
     # виснет на stdin в скриптах, CI и под --yes. Единственный случай, когда
-    # ratio действительно необходим — включённая отсечка по погрешности
-    # (по нему считается ожидаемый выход датчика).
+    # они действительно необходимы — включённая отсечка по погрешности: по
+    # ratio считается ожидаемый выход датчика, по I_nom (баг-репорт) —
+    # приведённая погрешность (та же, что в отчёте/графике) вместо чисто
+    # относительной, которая на малых уставках зашкаливает даже у исправного
+    # датчика.
     if params['stop_on_error'] and params['ratio'] is None:
         params['ratio'] = _prompt_float(
             "Коэффициент преобразования 1:X (нужен для отсечки по погрешности; передайте X): ",
             validator=lambda v: v > 0,
             error_msg="Коэффициент должен быть положительным числом.",
+        )
+    if params['stop_on_error'] and params['I_nom'] is None:
+        params['I_nom'] = _prompt_float(
+            "Номинальный первичный ток/напряжение датчика (нужен для отсечки по погрешности): ",
+            validator=lambda v: v > 0,
+            error_msg="Номинал должен быть положительным числом.",
         )
 
     # --- label ---

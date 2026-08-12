@@ -130,6 +130,43 @@ def test_load_and_analyze_detects_nonzero_error(tmp_path):
     assert stats['max_error_percent'] == pytest.approx(0.1, abs=1e-9)
 
 
+def test_load_and_analyze_uses_x_real_not_x_set_when_turns_applied(tmp_path):
+    # Баг-репорт: раньше Y_expected/Error_percent считались от голой
+    # уставки X_set, игнорируя число витков. turns=10 -> при X_set=1
+    # реальный вход датчика X_real=10. Датчик 1:100, I_nom=1000 ->
+    # Y_sec_nom=10, ожидаемый выход при X_real=10 равен 0.1 А — ровно то,
+    # что измерено, погрешность должна быть нулевой. Со старым багом
+    # (счёт от X_set=1) график решил бы, что ожидание — 0.01 А, и приписал
+    # бы исправному датчику несуществующую ~1%-ную погрешность.
+    csv_path = tmp_path / "IVtrace_turns_20260101_000000.csv"
+    with open(csv_path, 'w', encoding='utf-8') as f:
+        f.write("# Датчик: TestSensor\n")
+        f.write("# Тип возбуждения: current\n")
+        f.write("# Единица измерения возбуждения: A\n")
+        f.write("# Число витков через датчик: 10 (реальный вход = X_set × витки, см. колонку X_real)\n")
+        f.write("#\n")
+        f.write("Timestamp,Branch,X_set,X_real,I_meas_A\n")
+        f.write("2026-01-01T00:00:00,forward,0,0,0.0\n")
+        f.write("2026-01-01T00:00:00,forward,1,10,0.1\n")
+
+    stats = load_and_analyze(csv_path, I_nom=1000.0, X=100.0, save_png=False, show=False)
+    assert stats['max_error_percent'] == pytest.approx(0.0, abs=1e-9)
+
+
+def test_load_and_analyze_falls_back_to_x_set_without_x_real_column(tmp_path):
+    # Старые CSV без X_real (до появления turns) — поведение как раньше.
+    csv_path = tmp_path / "IVtrace_noturns_20260101_000000.csv"
+    _write_csv(csv_path, extra_header_lines=[
+        "# Тип возбуждения: current",
+        "# Единица измерения возбуждения: A",
+    ], rows=[
+        ('forward', 0, 0.0),
+        ('forward', 10, 0.1),
+    ])
+    stats = load_and_analyze(csv_path, I_nom=1000.0, X=100.0, save_png=False, show=False)
+    assert stats['max_error_percent'] == pytest.approx(0.0, abs=1e-9)
+
+
 # ----------------------------------------------------------------------
 # zero_offset (feature "offset нуля") — читается из шапки CSV либо
 # передаётся явным параметром (переопределяет шапку)
@@ -400,22 +437,55 @@ def test_metadata_i_nom_and_ratio_parses_written_header(tmp_path):
         "# Номинальный первичный ток: 150.0 А",
         "# Коэффициент преобразования 1:1500.0",
     ])
-    I_nom, X = metadata_i_nom_and_ratio(csv_path)
+    I_nom, X, excitation_type = metadata_i_nom_and_ratio(csv_path)
     assert I_nom == 150.0
     assert X == 1500.0
+    assert excitation_type == 'current'
 
 
 def test_metadata_i_nom_and_ratio_missing_returns_none_none(tmp_path):
     csv_path = tmp_path / "IVtrace_nometa_20260101_000000.csv"
     _write_csv(csv_path)
-    I_nom, X = metadata_i_nom_and_ratio(csv_path)
+    I_nom, X, excitation_type = metadata_i_nom_and_ratio(csv_path)
     assert I_nom is None
     assert X is None
+    assert excitation_type == 'current'
+
+
+def test_metadata_i_nom_and_ratio_reads_voltage_label(tmp_path):
+    # Баг-репорт: при возбуждении напряжением шапка пишет "Номинальное
+    # первичное напряжение", а не "...первичный ток" — обе подписи должны
+    # распознаваться.
+    csv_path = tmp_path / "IVtrace_v_20260101_000000.csv"
+    _write_csv(csv_path, extra_header_lines=[
+        "# Тип возбуждения: voltage",
+        "# Номинальное первичное напряжение: 50.0 В",
+        "# Коэффициент преобразования 1:100.0",
+    ])
+    I_nom, X, excitation_type = metadata_i_nom_and_ratio(csv_path)
+    assert I_nom == 50.0
+    assert X == 100.0
+    assert excitation_type == 'voltage'
 
 
 # ----------------------------------------------------------------------
 # estimate_ratio_from_data (п.10, BETA)
 # ----------------------------------------------------------------------
+
+def test_estimate_ratio_from_data_uses_x_real_when_present():
+    # Баг-репорт: раньше коэффициент всегда оценивался по голой уставке
+    # X_set, игнорируя витки. X_real = X_set * 10 (turns=10); истинный
+    # коэффициент 1:1500 определён относительно РЕАЛЬНОГО входа
+    # (I_meas = X_real / 1500). Со старым багом (счёт от X_set) результат
+    # получился бы в 10 раз меньше настоящего (150 вместо 1500).
+    df = pd.DataFrame({
+        'X_set': [0.0, 15.0, 30.0, 75.0, 150.0],
+        'X_real': [0.0, 150.0, 300.0, 750.0, 1500.0],
+        'I_meas_A': [0.0, 0.1, 0.2, 0.5, 1.0],
+    })
+    result = estimate_ratio_from_data(df)
+    assert result['X_actual'] == pytest.approx(1500.0, rel=1e-6)
+
 
 def test_estimate_ratio_from_data_recovers_known_ratio():
     # I_meas = X_set / 1500, точно без шума -> МНК должен вернуть ровно 1500.

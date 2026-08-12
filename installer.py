@@ -237,7 +237,14 @@ class Installer:
         self._status("Создание ярлыков…")
         exe = target / "IVTrace.exe"
         try:
-            core.create_shortcut(exe, Path.home() / "Desktop" / "IVTrace.lnk")
+            desktop = core.get_desktop_path()
+        except Exception:
+            desktop = Path.home() / "Desktop"  # лучше так, чем совсем без ярлыка
+        try:
+            core.create_shortcut(exe, desktop / "IVTrace.lnk")
+        except Exception:
+            pass  # ярлык — удобство, не критично для самой установки
+        try:
             start_menu = (Path.home() / "AppData" / "Roaming" / "Microsoft" /
                           "Windows" / "Start Menu" / "Programs")
             core.create_shortcut(exe, start_menu / "IVTrace.lnk")

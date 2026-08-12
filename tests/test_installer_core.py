@@ -175,6 +175,42 @@ def test_copy_payload_overwrites_existing_files(tmp_path):
     assert (dest / "leftover.txt").exists()  # copytree(dirs_exist_ok=True) не чистит лишнее — это не rsync --delete
 
 
+# -------------------------------------------------------------- get_desktop_path
+
+def test_get_desktop_path_returns_powershell_stdout_as_path(monkeypatch):
+    calls = []
+
+    class _Result:
+        stdout = "D:\\Users\\Legoshin\\Desktop\n"
+
+    def fake_run(*a, **kw):
+        calls.append((a, kw))
+        return _Result()
+
+    monkeypatch.setattr(ic.subprocess, "run", fake_run)
+
+    result = ic.get_desktop_path()
+
+    assert result == ic.Path("D:\\Users\\Legoshin\\Desktop")
+    assert len(calls) == 1
+    args, kwargs = calls[0]
+    command = args[0]
+    assert command[0] == "powershell"
+    assert "SpecialFolders" in command[-1]
+    assert kwargs.get("check") is True
+    assert kwargs.get("capture_output") is True
+
+
+def test_get_desktop_path_raises_on_empty_output(monkeypatch):
+    class _Result:
+        stdout = "   \n"
+
+    monkeypatch.setattr(ic.subprocess, "run", lambda *a, **kw: _Result())
+
+    with pytest.raises(RuntimeError):
+        ic.get_desktop_path()
+
+
 # -------------------------------------------------------------- create_shortcut
 
 def test_create_shortcut_invokes_powershell_with_expected_paths(monkeypatch, tmp_path):

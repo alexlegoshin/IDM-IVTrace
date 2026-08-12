@@ -72,6 +72,8 @@ def test_install_into_happy_path_writes_record_and_shortcuts(monkeypatch, tmp_pa
     monkeypatch.setattr(installer.core, "copy_payload", lambda src, dst: copy_calls.append((src, dst)))
     monkeypatch.setattr(installer.core, "own_build_tag", lambda: "v2.0")
 
+    monkeypatch.setattr(installer.core, "get_desktop_path", lambda: tmp_path / "RealDesktop")
+
     shortcut_calls = []
     monkeypatch.setattr(installer.core, "create_shortcut", lambda exe, path: shortcut_calls.append((exe, path)))
 
@@ -87,10 +89,55 @@ def test_install_into_happy_path_writes_record_and_shortcuts(monkeypatch, tmp_pa
     assert written == {"root": target, "tag": "v2.0", "release_date": None}
     assert len(shortcut_calls) == 2  # Десктоп + Меню Пуск
     assert all(exe == target / "IVTrace.exe" for exe, _ in shortcut_calls)
+    assert shortcut_calls[0][1] == tmp_path / "RealDesktop" / "IVTrace.lnk"  # реальный (возможно, переопределённый) Desktop, не Path.home()/"Desktop"
 
     statuses = _drain_statuses(inst)
     assert "Копирование файлов…" in statuses
     assert "Создание ярлыков…" in statuses
+
+
+def test_install_into_falls_back_to_home_desktop_when_get_desktop_path_fails(monkeypatch, tmp_path):
+    inst = _bare_installer()
+    monkeypatch.setattr(inst, "_payload_dir", lambda: tmp_path / "payload")
+    monkeypatch.setattr(installer.core, "copy_payload", lambda src, dst: None)
+    monkeypatch.setattr(installer.core, "own_build_tag", lambda: "v2.0")
+    monkeypatch.setattr(installer, "write_install_record", lambda *a, **kw: None)
+
+    def failing_get_desktop_path():
+        raise RuntimeError("powershell недоступен")
+    monkeypatch.setattr(installer.core, "get_desktop_path", failing_get_desktop_path)
+
+    shortcut_calls = []
+    monkeypatch.setattr(installer.core, "create_shortcut", lambda exe, path: shortcut_calls.append((exe, path)))
+
+    inst._install_into(tmp_path / "install", lookup_release_date=False)
+
+    assert shortcut_calls[0][1] == installer.Path.home() / "Desktop" / "IVTrace.lnk"
+
+
+def test_install_into_still_creates_start_menu_shortcut_when_desktop_shortcut_fails(monkeypatch, tmp_path):
+    """Ярлык на рабочем столе и ярлык в Пуск — независимые попытки: падение
+    одной не должно молча гасить другую (раньше обе создавались в одном
+    try/except, и первая же ошибка обрывала обе)."""
+    inst = _bare_installer()
+    monkeypatch.setattr(inst, "_payload_dir", lambda: tmp_path / "payload")
+    monkeypatch.setattr(installer.core, "copy_payload", lambda src, dst: None)
+    monkeypatch.setattr(installer.core, "own_build_tag", lambda: "v2.0")
+    monkeypatch.setattr(installer.core, "get_desktop_path", lambda: tmp_path / "RealDesktop")
+    monkeypatch.setattr(installer, "write_install_record", lambda *a, **kw: None)
+
+    shortcut_calls = []
+
+    def create_shortcut(exe, path):
+        if "RealDesktop" in str(path):
+            raise OSError("доступ запрещён")
+        shortcut_calls.append((exe, path))
+    monkeypatch.setattr(installer.core, "create_shortcut", create_shortcut)
+
+    inst._install_into(tmp_path / "install", lookup_release_date=False)
+
+    assert len(shortcut_calls) == 1
+    assert "Start Menu" in str(shortcut_calls[0][1])
 
 
 def test_install_into_lookup_release_date_when_requested(monkeypatch, tmp_path):
@@ -98,6 +145,7 @@ def test_install_into_lookup_release_date_when_requested(monkeypatch, tmp_path):
     monkeypatch.setattr(inst, "_payload_dir", lambda: tmp_path / "payload")
     monkeypatch.setattr(installer.core, "copy_payload", lambda src, dst: None)
     monkeypatch.setattr(installer.core, "own_build_tag", lambda: "v2.0")
+    monkeypatch.setattr(installer.core, "get_desktop_path", lambda: tmp_path / "RealDesktop")
     monkeypatch.setattr(installer.core, "create_shortcut", lambda exe, path: None)
     monkeypatch.setattr(installer.core, "fetch_releases",
                         lambda: [{"tag_name": "v2.0", "published_at": "2026-08-10T00:00:00Z"}])

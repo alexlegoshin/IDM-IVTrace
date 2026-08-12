@@ -51,6 +51,48 @@ def test_write_results_csv_header_and_data_roundtrip(tmp_path):
     assert len(back) == 3
 
 
+def test_write_results_csv_notes_gost_8_401_80_when_i_nom_and_ratio_present(tmp_path):
+    df = pd.DataFrame([
+        {'Timestamp': '2026-01-01T00:00:00', 'Branch': 'forward', 'X_set': 0.0, 'I_meas_A': 0.0},
+    ])
+    csv_path = tmp_path / "IVtrace_gost_20260101_000000.csv"
+    p = _params()
+    p['I_nom'] = 1000.0
+    p['ratio'] = 100.0
+    write_results_csv(csv_path, df, p, excitation_type='current', unit='A')
+
+    header_text = csv_path.read_text(encoding='utf-8')
+    assert 'ГОСТ 8.401-80' in header_text
+
+
+def test_write_results_csv_omits_gost_note_without_i_nom_or_ratio(tmp_path):
+    df = pd.DataFrame([
+        {'Timestamp': '2026-01-01T00:00:00', 'Branch': 'forward', 'X_set': 0.0, 'I_meas_A': 0.0},
+    ])
+    csv_path = tmp_path / "IVtrace_nogost_20260101_000000.csv"
+    write_results_csv(csv_path, df, _params(), excitation_type='current', unit='A')
+
+    header_text = csv_path.read_text(encoding='utf-8')
+    assert 'ГОСТ 8.401-80' not in header_text
+
+
+def test_write_results_csv_labels_i_nom_as_voltage_for_voltage_excitation(tmp_path):
+    # Баг-репорт: раньше писалось "Номинальный первичный ток... А" даже при
+    # возбуждении напряжением — единица и величина не соответствовали
+    # реальному смыслу I_nom в этом случае.
+    df = pd.DataFrame([
+        {'Timestamp': '2026-01-01T00:00:00', 'Branch': 'forward', 'X_set': 0.0, 'I_meas_A': 0.0},
+    ])
+    csv_path = tmp_path / "IVtrace_vnom_20260101_000000.csv"
+    p = _params()
+    p['I_nom'] = 50.0
+    write_results_csv(csv_path, df, p, excitation_type='voltage', unit='V')
+
+    header_text = csv_path.read_text(encoding='utf-8')
+    assert 'Номинальное первичное напряжение: 50.0 В' in header_text
+    assert 'первичный ток' not in header_text
+
+
 def test_write_results_csv_voltage_has_no_voltage_limit_line(tmp_path):
     df = pd.DataFrame([
         {'Timestamp': '2026-01-01T00:00:00', 'Branch': 'forward', 'X_set': 0.0, 'I_meas_A': 0.0},

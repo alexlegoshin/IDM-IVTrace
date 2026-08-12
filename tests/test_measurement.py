@@ -451,6 +451,54 @@ def test_no_retries_happen_without_ratio():
     assert results[0]['Rejected'] is False
 
 
+def test_error_percent_without_i_nom_is_relative_to_point_and_rejects_tiny_deviation():
+    # Баг-репорт: без I_nom погрешность считается относительно ЭТОЙ точки
+    # (expected=0.01), поэтому даже крошечное абсолютное отклонение (0.01)
+    # даёт колоссальный процент и точка бракуется — при том что тот же
+    # датчик мог бы быть вполне исправен в приведённых терминах.
+    dmm = FakeDMM(readings=[0.02, 0.02, 0.02, 0.02] * 3)
+    src = FakeSource()
+    relay = FakeRelay()
+    results, aborted = _run(
+        dmm, src, relay, X_start=0.01, X_stop=0.01, X_step=1, branch=Branch.POSITIVE,
+        turns=1.0, ratio=1.0, stop_on_error=True, error_threshold=1.0,
+    )
+    assert results[0]['Rejected'] is True
+    assert aborted is not None
+
+
+def test_error_percent_with_i_nom_is_referred_to_nominal_not_point():
+    # Тот же сценарий (точка 0.01, показание 0.02, ratio=1, порог 1%), но с
+    # I_nom=100 — теперь погрешность приведённая: |0.02-0.01|/100*100 = 0.01%,
+    # в допуске. Это и есть исправление: живая отсечка должна согласовываться
+    # с приведённой погрешностью из отчёта/графика (analysis.py), а не
+    # взрываться на малых уставках.
+    dmm = FakeDMM(readings=[0.02, 0.02, 0.02, 0.02])
+    src = FakeSource()
+    relay = FakeRelay()
+    results, aborted = _run(
+        dmm, src, relay, X_start=0.01, X_stop=0.01, X_step=1, branch=Branch.POSITIVE,
+        turns=1.0, ratio=1.0, I_nom=100.0, stop_on_error=True, error_threshold=1.0,
+    )
+    assert aborted is None
+    assert results[0]['Rejected'] is False
+
+
+def test_i_nom_without_ratio_has_no_effect_still_relative_by_default():
+    # I_nom без ratio не может дать y_sec_nom (нужен и ratio) — expected
+    # тоже не определить, поэтому проверки/повторы вообще не работают, как
+    # и без обоих параметров (см. test_no_retries_happen_without_ratio).
+    dmm = FakeDMM(readings=[999.0, 999.0, 999.0, 999.0])
+    src = FakeSource()
+    relay = FakeRelay()
+    results, aborted = _run(
+        dmm, src, relay, X_start=1, X_stop=1, X_step=1, branch=Branch.POSITIVE,
+        I_nom=100.0, stop_on_error=True, error_threshold=1.0,
+    )
+    assert aborted is None
+    assert results[0]['Rejected'] is False
+
+
 def test_nan_reading_does_not_trigger_rejection_or_retries():
     # Все чтения провалились -> NaN. Это сбой связи, а не "мимо ожидания" —
     # ретраить/браковать по погрешности бессмысленно без единого показания.

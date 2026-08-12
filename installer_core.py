@@ -153,6 +153,34 @@ def copy_payload(src_dir: Path, dest_dir: Path) -> None:
     shutil.copytree(src_dir, dest_dir, dirs_exist_ok=True)
 
 
+def get_desktop_path() -> Path:
+    """
+    Реальный путь к рабочему столу пользователя — через тот же COM
+    WScript.Shell, что и create_shortcut, а не Path.home() / "Desktop".
+
+    Path.home() — это %USERPROFILE%, а рабочий стол — самостоятельная
+    "known folder", которая на многих машинах переопределена (перенос папки
+    через OneDrive, групповую политику или вручную в свойствах папки) и
+    физически лежит в другом месте, порой на другом диске. Если ставить
+    ярлык по Path.home()/"Desktop" вслепую, он молча создаётся в
+    "правильной по умолчанию", но фактически не видимой пользователю папке.
+    SpecialFolders("Desktop") возвращает путь с учётом любого такого
+    переопределения.
+    """
+    result = subprocess.run(
+        ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+         '(New-Object -ComObject WScript.Shell).SpecialFolders("Desktop")'],
+        check=True,
+        capture_output=True,
+        text=True,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    path_str = result.stdout.strip()
+    if not path_str:
+        raise RuntimeError("SpecialFolders(\"Desktop\") вернул пустой путь")
+    return Path(path_str)
+
+
 def create_shortcut(target_exe: Path, shortcut_path: Path, working_dir: Optional[Path] = None) -> None:
     """
     Создаёт .lnk через PowerShell (COM WScript.Shell) — без новой Python-

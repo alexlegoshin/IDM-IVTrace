@@ -186,9 +186,22 @@ def write_results_csv(csv_path: Path, df: pd.DataFrame, params: dict,
         else:
             f.write(f"# Ограничение тока: {params.get('I_limit')} А\n")
         if params.get('I_nom'):
-            f.write(f"# Номинальный первичный ток: {params['I_nom']} А\n")
+            # Баг-репорт: раньше здесь всегда писалось "первичный ток... А",
+            # даже при возбуждении напряжением — подпись не имела отношения
+            # к тому, что I_nom реально означает в этом случае.
+            if excitation_type == 'current':
+                f.write(f"# Номинальный первичный ток: {params['I_nom']} А\n")
+            else:
+                f.write(f"# Номинальное первичное напряжение: {params['I_nom']} В\n")
         if params.get('ratio'):
             f.write(f"# Коэффициент преобразования 1:{params['ratio']}\n")
+        if params.get('I_nom') and params.get('ratio'):
+            f.write(
+                "# Погрешность — приведённая, по ГОСТ 8.401-80 (формула 3, п.2.3.5): "
+                "γ = ΔY / Y_N × 100%, где Y_N — номинальный выходной сигнал датчика "
+                "(I_nom × витки / коэффициент преобразования), нормирующее значение "
+                "принято равным номинальному\n"
+            )
         if params.get('zero_offset'):
             f.write(f"# Смещение нуля: {params['zero_offset']} {OUTPUT_UNITS[output_type]} "
                     f"(вычитается из Y_meas при расчёте погрешности — см. analysis.py)\n")
@@ -352,6 +365,7 @@ def run_measurement_session(
             ),
             should_stop=should_stop,
             ratio=params.get('ratio'),
+            I_nom=params.get('I_nom'),
             stop_on_error=params.get('stop_on_error', False),
             error_threshold=params.get('error_threshold', 1.0),
             log_callback=log,
