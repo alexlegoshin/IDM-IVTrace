@@ -6,6 +6,7 @@
 /dist/
 /release_pkg/
 *.manifest
+/IVTrace-*-win64.zip
 
 # Пишется CI перед сборкой (installer.spec/ivtrace.spec), тег релиза — не коммитим
 /assets/VERSION

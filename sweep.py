@@ -180,6 +180,32 @@ def _preset_sequence(magnitude: float, step: float, preset: DirectionPreset) -> 
     raise ValueError(f"Неизвестный пресет направления: {preset!r}")
 
 
+def preset_applies(X_start: float, X_stop: float, branch: Branch) -> bool:
+    """
+    True, если выбранная схема прохода (preset) реально повлияет на план
+    plan_sweep() при этих X_start/X_stop/branch — то есть branch=BOTH И
+    развёртка ОДНОСТОРОННЯЯ, заякоренная в нуле (см. докстринг модуля).
+
+    Баг-репорт: если X_start/X_stop уже сами по себе охватывают обе
+    полярности буквально (например 150 → −150), preset ни на что не
+    влияет — plan_sweep идёт прямым проходом между ними, полностью
+    игнорируя выбранную схему (петлю гистерезиса и т.п.), даже если
+    оператор её явно выбрал в UI. Эта функция — чтобы UI мог честно
+    предупредить об этом ДО старта измерения, а не молча измерить не то,
+    что подразумевал выбор в выпадающем списке.
+
+    Логика буквально повторяет ветвление plan_sweep — единственный
+    источник истины, чтобы предупреждение не могло разойтись с тем, что
+    измерение реально сделает.
+    """
+    if branch != Branch.BOTH:
+        return False
+    spans_both_signs = (X_start < 0 < X_stop) or (X_stop < 0 < X_start)
+    if spans_both_signs:
+        return False
+    return X_start == 0 or X_stop == 0
+
+
 def plan_sweep(X_start: float, X_stop: float, X_step: float,
                branch: Branch = Branch.BOTH,
                preset: DirectionPreset = DirectionPreset.DIVERGING) -> List[SweepPoint]:

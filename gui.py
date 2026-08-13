@@ -46,7 +46,7 @@ from measurement import (
     DEFAULT_ADAPTIVE_COOLING_MIN_DELAY, DEFAULT_ADAPTIVE_COOLING_MAX_DELAY,
     estimate_duration_seconds,
 )
-from sweep import Branch, DirectionPreset, plan_sweep, plan_custom_sweep
+from sweep import Branch, DirectionPreset, plan_sweep, plan_custom_sweep, preset_applies
 
 
 # п.33 — минимализм: бело-кремовый фон, чёрный текст, геометричный
@@ -1231,11 +1231,40 @@ class IVTraceGUI:
     }
 
     def _on_preset_change(self):
-        """п.9 (баг-репорт): короткая наглядная расшифровка выбранной схемы прохода."""
+        """
+        п.9 (баг-репорт): короткая наглядная расшифровка выбранной схемы
+        прохода.
+
+        Баг-репорт: если введённый диапазон уже сам по себе двуполярный
+        (например 150 -> -150) — preset ни на что не влияет (см.
+        sweep.plan_sweep/preset_applies), измерение идёт буквальным
+        проходом между X_start и X_stop, полностью игнорируя выбранную
+        схему. Раньше это никак не показывалось: выпадающий список и его
+        описание выглядели так, будто пресет применится, а по факту нет.
+        Здесь та же самая логика (sweep.preset_applies), что использует и
+        сам план измерения — предупреждение не может разойтись с тем, что
+        реально будет измерено.
+        """
         if not hasattr(self, 'preset_desc_label'):
             return
-        self.preset_desc_label.configure(
-            text=self._PRESET_DESCRIPTIONS.get(self.preset_var.get(), ""))
+        try:
+            x_start = float(self.e_start.get().strip().replace(",", "."))
+            x_stop = float(self.e_stop.get().strip().replace(",", "."))
+            branch = Branch(self.branch_var.get())
+        except ValueError:
+            self.preset_desc_label.configure(
+                text=self._PRESET_DESCRIPTIONS.get(self.preset_var.get(), ""),
+                foreground=MUTED)
+            return
+        if branch == Branch.BOTH and not preset_applies(x_start, x_stop, branch):
+            self.preset_desc_label.configure(
+                text=(f"⚠ {x_start:+g} → {x_stop:+g} уже охватывает обе полярности напрямую — "
+                      f"схема прохода не применяется, идёт буквальный проход между ними"),
+                foreground=BUSY_COLOR)
+        else:
+            self.preset_desc_label.configure(
+                text=self._PRESET_DESCRIPTIONS.get(self.preset_var.get(), ""),
+                foreground=MUTED)
 
     def _set_branch_safe(self, raw):
         """
@@ -1274,6 +1303,11 @@ class IVTraceGUI:
         """
         if not hasattr(self, 'sweep_preview_label'):
             return
+
+        # Держим предупреждение о "молча игнорируемом пресете" в актуальном
+        # состоянии при любом изменении, приводящем сюда (начало/конец,
+        # полярность, сам пресет) — см. _on_preset_change.
+        self._on_preset_change()
 
         is_custom = self.custom_program_var.get()
         if is_custom:

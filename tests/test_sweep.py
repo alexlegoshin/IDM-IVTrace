@@ -3,7 +3,7 @@ import math
 import pytest
 
 from sweep import (
-    Branch, DirectionPreset, SweepPoint, _raw_pass, plan_sweep,
+    Branch, DirectionPreset, SweepPoint, _raw_pass, plan_sweep, preset_applies,
     parse_custom_program, plan_custom_sweep,
 )
 
@@ -127,6 +127,44 @@ def test_plan_bipolar_range_ignores_direction_preset():
     # пресетом результат одинаковый.
     a = plan_sweep(-25, 25, 10, preset=DirectionPreset.DIVERGING)
     b = plan_sweep(-25, 25, 10, preset=DirectionPreset.FULL_CYCLE)
+    assert xs(a) == xs(b)
+
+
+# ----------------------------------------------------------------------
+# preset_applies — предсказывает, влияет ли выбранная схема прохода на
+# результат plan_sweep (баг-репорт: UI должен честно предупреждать, когда
+# выбранный пресет тихо игнорируется, а не просто молча измерить не то)
+# ----------------------------------------------------------------------
+
+def test_preset_applies_false_for_literally_bipolar_range():
+    # Ровно сценарий баг-репорта: 150 -> -150 уже сам по себе двуполярный,
+    # петля гистерезиса (или любой другой пресет) здесь не участвует.
+    assert preset_applies(150, -150, Branch.BOTH) is False
+
+
+def test_preset_applies_true_for_anchored_one_sided_range():
+    assert preset_applies(0, 150, Branch.BOTH) is True
+    assert preset_applies(150, 0, Branch.BOTH) is True
+
+
+def test_preset_applies_false_when_branch_is_not_both():
+    assert preset_applies(0, 150, Branch.POSITIVE) is False
+    assert preset_applies(0, 150, Branch.NEGATIVE) is False
+    assert preset_applies(0, 150, Branch.NO_RELAY) is False
+
+
+def test_preset_applies_false_for_unanchored_one_sided_range():
+    # 150 -> 250: одна полярность, но ни один конец не в нуле — пресету
+    # нечего "выстраивать" (см. модульный докстринг sweep.py).
+    assert preset_applies(150, 250, Branch.BOTH) is False
+
+
+def test_preset_applies_agrees_with_plan_sweep_ignoring_preset():
+    # Явная перекрёстная проверка: там, где preset_applies говорит False,
+    # plan_sweep с разными пресетами обязан давать одинаковый результат.
+    a = plan_sweep(150, -150, 10, branch=Branch.BOTH, preset=DirectionPreset.DIVERGING)
+    b = plan_sweep(150, -150, 10, branch=Branch.BOTH, preset=DirectionPreset.FULL_CYCLE)
+    assert preset_applies(150, -150, Branch.BOTH) is False
     assert xs(a) == xs(b)
 
 
