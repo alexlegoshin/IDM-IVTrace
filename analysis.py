@@ -174,11 +174,26 @@ def load_and_analyze(latest_csv: Path, I_nom: float, X: float, save_png: bool = 
     stats_source = accepted if not accepted.empty else df
 
     # ---------- Построение графиков ----------
-    plt.style.use('default')
-    fig, (ax1, ax2) = plt.subplots(
-        2, 1, figsize=(12, 10), sharex=True,
-        gridspec_kw={'height_ratios': [3, 1]},
-    )
+    # Баг-репорт (частые вылеты): для фигуры, встраиваемой в Tk-GUI
+    # (close_fig=False), НЕ используем pyplot — pyplot держит фигуру в своём
+    # глобальном менеджере с Tcl-обработчиком, и когда такую фигуру собирает
+    # сборщик мусора из НЕ главного потока (а в приложении полно рабочих
+    # потоков), Tk падает с «Tcl_AsyncDelete: async handler deleted by the
+    # wrong thread». Объектный Figure() этого менеджера не заводит вовсе.
+    # Для CLI-режима show=True (отдельный процесс, окно нужно) оставляем
+    # pyplot — там проблемы потоков нет.
+    if show:
+        plt.style.use('default')
+        fig, (ax1, ax2) = plt.subplots(
+            2, 1, figsize=(12, 10), sharex=True,
+            gridspec_kw={'height_ratios': [3, 1]},
+        )
+    else:
+        from matplotlib.figure import Figure
+        from matplotlib.backends.backend_agg import FigureCanvasAgg
+        fig = Figure(figsize=(12, 10))
+        FigureCanvasAgg(fig)  # рендерер для tight_layout()/savefig() без pyplot
+        ax1, ax2 = fig.subplots(2, 1, sharex=True, gridspec_kw={'height_ratios': [3, 1]})
     fig.patch.set_facecolor('white')
     ax1.set_facecolor('white')
     ax2.set_facecolor('white')
@@ -272,19 +287,21 @@ def load_and_analyze(latest_csv: Path, I_nom: float, X: float, save_png: bool = 
     if y2lim is not None:
         ax2.set_ylim(*y2lim)
 
-    plt.tight_layout()
+    fig.tight_layout()
 
     png_path: Optional[Path] = None
     if save_png:
         png_path = latest_csv.with_suffix('.png')
-        plt.savefig(png_path, dpi=150, bbox_inches='tight')
+        fig.savefig(png_path, dpi=150, bbox_inches='tight')
 
     if show:
         plt.show()
 
     # close_fig=False используется GUI, чтобы встроить фигуру в окно
     # (FigureCanvasTkAgg); в этом случае ответственность за close — на вызове.
-    if close_fig:
+    # Для объектной Figure (show=False) pyplot-менеджера нет, plt.close нужен
+    # только для pyplot-фигуры CLI-ветки (show=True).
+    if close_fig and show:
         plt.close(fig)
 
     branches_present = sorted(df['Branch'].unique().tolist())

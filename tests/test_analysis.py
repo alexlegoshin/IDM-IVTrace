@@ -427,6 +427,34 @@ def test_manually_excluded_points_removed_from_stats_but_kept_in_dataframe(tmp_p
     assert len(stats['dataframe']) == 3
 
 
+def test_manually_excluded_points_not_drawn_on_graph(tmp_path):
+    """
+    Баг-репорт: после «Исключить + Сохранить и перестроить» точка всё равно
+    строилась. ManuallyExcluded должна исключаться не только из статистики, но
+    и из ПОСТРОЕНИЯ (оставаясь в df/CSV).
+    """
+    csv_path = tmp_path / "IVtrace_mex_20260101_000000.csv"
+    with open(csv_path, 'w', encoding='utf-8') as f:
+        f.write("# Датчик: T\n#\n")
+        f.write("Timestamp,Branch,X_set,X_real,Y_meas,Y_unit,Rejected,RejectReason,PolarityMismatch,ManuallyExcluded\n")
+        f.write("t,zero,0,0,0.0,A,False,,False,False\n")
+        f.write("t,forward,10,10,0.10,A,False,,False,False\n")
+        f.write("t,forward,20,20,0.30,A,False,,False,True\n")   # исключена вручную
+        f.write("t,forward,30,30,0.30,A,False,,False,False\n")
+
+    # close_fig=False -> объектная Figure (без pyplot), её отдельно закрывать
+    # не нужно (соберётся сборщиком мусора).
+    stats = load_and_analyze(csv_path, I_nom=100.0, X=100.0, save_png=False, close_fig=False)
+    plotted = set()
+    for line in stats['figure'].axes[0].get_lines():
+        if line.get_linestyle() == '--':
+            continue
+        plotted.update(line.get_xdata().tolist())
+    assert 20.0 not in plotted          # исключённая не рисуется
+    assert 30.0 in plotted              # обычная рисуется
+    assert len(stats['dataframe']) == 4  # но остаётся в данных
+
+
 # ----------------------------------------------------------------------
 # п.30 — подписи погрешности (смоук: не падает, PNG создаётся)
 # ----------------------------------------------------------------------

@@ -220,6 +220,12 @@ class IVTraceGUI:
     def __init__(self, root: tk.Tk, args):
         self.root = root
         self.args = args
+        # Перехват ЛЮБОГО необработанного исключения в Tk-колбэке (обработчики
+        # кнопок, root.after и т.п.). Раньше Tk просто печатал трассировку в
+        # stderr (в собранном exe невидимую) и молча продолжал — так «вылеты»
+        # разных функций оставались без следа. Теперь пишем в файл-лог с полной
+        # трассировкой и показываем оператору короткое сообщение.
+        self.root.report_callback_exception = self._on_tk_callback_exception
         # work_dir() уважает переопределение из UI (п.23, apppaths.set_work_dir);
         # явный --data-dir из командной строки всё равно приоритетнее.
         self.data_dir = Path(getattr(args, "data_dir", None) or work_dir())
@@ -1444,6 +1450,30 @@ class IVTraceGUI:
         self.status_label.configure(text=text, foreground=color)
         self.status_dot.itemconfigure(self._dot, fill=color)
 
+    def _on_tk_callback_exception(self, exc_type, exc_value, exc_tb):
+        """
+        Единый обработчик необработанных исключений в Tk-колбэках (см. __init__,
+        report_callback_exception). Пишет полную трассировку в файл-лог и
+        показывает оператору короткое сообщение — вместо прежнего молчаливого
+        проглатывания, из-за которого «вылеты» разных функций были без следа.
+        Сам обработчик не должен падать (иначе рекурсия), поэтому всё в try.
+        """
+        try:
+            _log.error("Необработанное исключение в Tk-колбэке",
+                       exc_info=(exc_type, exc_value, exc_tb))
+        except Exception:
+            pass
+        try:
+            traceback.print_exception(exc_type, exc_value, exc_tb)
+        except Exception:
+            pass
+        try:
+            messagebox.showerror(
+                "Внутренняя ошибка",
+                f"{exc_type.__name__}: {exc_value}\n\nПодробности записаны в журнал приложения.")
+        except Exception:
+            pass
+
     # --------------------------------------------------------------- preflight
     def _run_preflight(self):
         self._preflight_ok = False
@@ -2452,6 +2482,9 @@ class IVTraceGUI:
             )
             self.events.put(("done", str(csv_path)))
         except Exception as e:
+            # В файл-лог с трассировкой (applog) — чтобы разобрать сбой/вылет
+            # постфактум на реальной машине; в UI — короткое сообщение.
+            _log.exception("Ошибка измерительного потока")
             traceback.print_exc()
             self.events.put(("error", str(e)))
         finally:
@@ -2616,17 +2649,31 @@ class IVTraceGUI:
         df = self._current_df if self._current_df is not None and self.plot_csv_path == csv_path \
             else pd.read_csv(csv_path, comment='#')
 
+        # Баг-репорт: определение коэффициента НЕ учитывало смещение нуля.
+        # Смещение вычитается из Y_meas ДО подгонки прямой через ноль (иначе
+        # оно смещает саму оценку наклона). Берём то, что ввёл оператор в поле
+        # смещения (актуальнее для «этого» датчика), а при пустом поле —
+        # значение из шапки CSV, как раньше.
+        raw_offset = self.e_zero_offset.get().strip().replace(",", ".")
         try:
-            result = estimate_ratio_from_data(df, zero_offset=metadata_zero_offset(csv_path) or 0.0)
+            zero_offset = float(raw_offset) if raw_offset else (metadata_zero_offset(csv_path) or 0.0)
+        except ValueError:
+            messagebox.showerror("Смещение нуля", "Смещение нуля должно быть числом.")
+            return
+
+        try:
+            result = estimate_ratio_from_data(df, zero_offset=zero_offset)
         except ValueError as e:
             messagebox.showerror("Не удалось определить коэффициент", str(e))
             return
 
+        offset_note = f"\nУчтено смещение нуля: {zero_offset:g}" if zero_offset else "\nСмещение нуля: 0"
         messagebox.showinfo(
             "Коэффициент преобразования (BETA)",
             f"Фактический: 1:{result['X_actual']:.2f}\n"
             f"Округлённый (кратно 25): 1:{result['X_rounded']:.0f}\n"
-            f"Расхождение: {result['discrepancy_percent']:.2f}%",
+            f"Расхождение: {result['discrepancy_percent']:.2f}%"
+            f"{offset_note}",
         )
 
     # -------------------------------------------------------------- point editing
@@ -2676,9 +2723,26 @@ class IVTraceGUI:
         if self._current_df is None or self.plot_csv_path is None:
             messagebox.showinfo("Точки", "Сначала постройте график.")
             return
+        # Баг-репорт: «Сохранить и перестроить» иногда молча ничего не делал.
+        # Оборачиваем в try/except с логом и видимой ошибкой, чтобы сбой (нет
+        # прав на запись, файл открыт в Excel и т.п.) не проглатывался.
         from analysis import save_dataframe_with_metadata
-        save_dataframe_with_metadata(self.plot_csv_path, self._current_df)
-        self._append_log(f"Изменения точек сохранены: {self.plot_csv_path}\n")
+        try:
+            n_excluded = 0
+            if 'ManuallyExcluded' in self._current_df.columns:
+                n_excluded = int(self._current_df['ManuallyExcluded'].fillna(False).astype(bool).sum())
+            save_dataframe_with_metadata(self.plot_csv_path, self._current_df)
+        except Exception as e:
+            _log.exception("Сохранение исключённых точек не удалось")
+            messagebox.showerror(
+                "Не удалось сохранить",
+                f"Не удалось записать изменения в файл:\n{e}\n\n"
+                "Возможно, файл открыт в другой программе. Подробности — в журнале.")
+            return
+        self._append_log(f"Изменения точек сохранены ({n_excluded} исключено): {self.plot_csv_path}\n")
+        # Перестраиваем график по обновлённому файлу; исключённые точки теперь
+        # не строятся (см. analysis.load_and_analyze). _do_analyze сам покажет
+        # ошибку и переключит на вкладку графика.
         self._do_analyze()
 
     def _do_invert_input(self):
@@ -2787,12 +2851,14 @@ class IVTraceGUI:
 
     def _embed_figure(self, fig):
         from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
-        import matplotlib.pyplot as plt
 
+        # Старый холст (Tk-виджеты) уничтожаем на ГЛАВНОМ потоке. Саму фигуру
+        # (объектный Figure без pyplot-менеджера, см. analysis.load_and_analyze)
+        # НЕ закрываем через plt.close — у неё нет Tcl-обработчика, она безопасно
+        # соберётся сборщиком мусора; plt.close тут только тянул бы pyplot и его
+        # потоко-небезопасный менеджер обратно (баг-репорт про вылеты).
         for w in self.plot_frame.winfo_children():
             w.destroy()
-        if self._current_fig is not None:
-            plt.close(self._current_fig)
         self._current_fig = fig
         fig.set_size_inches(8.5, 6.2)
 
@@ -2854,12 +2920,9 @@ class IVTraceGUI:
                 self._warning_banner.destroy()
             except Exception:
                 pass
-        if self._current_fig is not None:
-            try:
-                import matplotlib.pyplot as plt
-                plt.close(self._current_fig)
-            except Exception:
-                pass
+        # Объектную Figure (без pyplot-менеджера) отдельно закрывать не нужно —
+        # она соберётся сборщиком мусора; pyplot сюда не тянем (см. _embed_figure).
+        self._current_fig = None
         self.root.destroy()
 
     def _drain_events(self):
