@@ -22,6 +22,10 @@ pyvisa грузит бэкенд классом *VisaLibrary. У NI-VISA (и л�
 from dataclasses import dataclass, field
 from typing import List, Optional
 
+from applog import get_logger
+
+log = get_logger(__name__)
+
 
 # Явный спецификатор IVI-бэкенда (NI-VISA и совместимые). Заставляет pyvisa
 # грузить именно настоящую VISA, а не откатываться на pyvisa-py, если тот
@@ -192,10 +196,13 @@ def make_resource_manager():
     """
     status = check_visa()
     if not status.ok:
+        log.error("make_resource_manager: рабочей NI-VISA нет (%s)", status.backend or "?")
         raise RuntimeError(status.message)
 
+    log.info("VISA-бэкенд OK: %s (ресурсов видно: %s)", status.backend, status.resource_count)
     import pyvisa
     try:
         return pyvisa.ResourceManager(_IVI_BACKEND)
-    except Exception:
+    except Exception as e:
+        log.warning("ResourceManager('%s') не создался (%s) — откат на дефолтный бэкенд", _IVI_BACKEND, e)
         return pyvisa.ResourceManager()

@@ -149,8 +149,10 @@ def _log_calibration_warnings(instrument_configs, log: LogFn) -> None:
         info = resolve_calibration_info(cfg)
         if info.status == CalibrationStatus.UNKNOWN:
             log(f"ℹ {info.message}")
+            _flog.info("Поверка: %s", info.message)
         elif info.status in (CalibrationStatus.DUE_SOON, CalibrationStatus.OVERDUE, CalibrationStatus.AMBIGUOUS):
             log(f"⚠ {info.message}")
+            _flog.warning("Поверка: %s", info.message)
 
 
 def write_results_csv(csv_path: Path, df: pd.DataFrame, params: dict,
@@ -336,6 +338,9 @@ def run_measurement_session(
     if on_session_open is not None:
         on_session_open(handle)
 
+    _flog.info("Открываю приборы: мультиметр %s (%s), источник %s (%s), реле %s",
+               dmm_addr, dmm_cfg.stem, src_addr, src_cfg.stem,
+               "нет (No Relay)" if no_relay else relay_port)
     dmm = handle.dmm = Multimeter(dmm_addr, dmm_cfg, rm=rm)
     src = handle.src = (CurrentSource(src_addr, src_cfg, rm=rm)
                         if excitation_type == 'current'
@@ -343,6 +348,7 @@ def run_measurement_session(
     relay = handle.relay = None if no_relay else RelayController(relay_port)
 
     log("Приборы и реле инициализированы. Начинаю измерения...")
+    _flog.info("Приборы и реле инициализированы")
     suppress_notifications = params.get('suppress_notifications', False)
     # п.38: галочка "отключить все предупреждения" гасит и уведомления о
     # поверке — но не саму проверку (см. calibration.py — она не блокирует

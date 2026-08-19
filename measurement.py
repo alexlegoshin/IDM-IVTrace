@@ -10,6 +10,9 @@ from instruments import Multimeter as DMM
 from instruments import is_overflow_reading
 from relay import RelayController
 from sweep import Branch, DirectionPreset, SweepPoint, plan_sweep
+from applog import get_logger
+
+_flog = get_logger(__name__)
 
 # Единицы измерения задаваемой величины возбуждения — используются и в
 # именах колонок CSV, и в подписях графиков analysis.py.
@@ -126,7 +129,12 @@ def _ramp_steps(start: float, target: float, duration: float) -> List[Tuple[floa
 
 
 def _log(message: str, log_callback: Optional[Callable[[str], None]]) -> None:
-    """Вывод хода измерения: в GUI — через колбэк, в CLI — в stdout."""
+    """
+    Вывод хода измерения: в GUI — через колбэк, в CLI — в stdout, И в файл-лог
+    (applog) — чтобы весь ход измерения (каждая точка, коммутация реле, брак)
+    оставался в журнале для разбора постфактум, а не только на экране.
+    """
+    _flog.debug("%s", message.strip())
     if log_callback is not None:
         log_callback(message)
     else:

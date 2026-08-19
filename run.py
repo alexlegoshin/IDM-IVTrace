@@ -44,13 +44,17 @@ def preflight(skip_selftest: bool = False) -> tuple:
          если не отключены флагом.
     """
     from visa_backend import check_visa
+    from applog import get_logger
+    flog = get_logger(__name__)
 
     lines = []
 
     visa = check_visa()
     lines.append("[VISA] " + visa.summary_line())
+    flog.info("Предполёт: VISA — %s", visa.summary_line())
     if not visa.ok:
         lines.append(visa.message)
+        flog.error("Предполёт заблокирован: NI-VISA недоступна")
         return False, "\n".join(lines)
 
     if skip_selftest:

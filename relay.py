@@ -17,6 +17,10 @@ from typing import List, Optional
 import serial
 from serial.tools import list_ports
 
+from applog import get_logger
+
+log = get_logger(__name__)
+
 BAUDRATE = 115200
 BOOT_DELAY = 5.0       # время на загрузку контроллера после открытия порта
 CMD_DELAY = 0.3        # начальная пауза после отправки команды перед первым чтением
@@ -59,15 +63,22 @@ class RelayController:
 
     def __init__(self, port: str, wait_for_boot: bool = True):
         self.port = port
+        log.info("Открываю плату реле на %s (%d бод, ожидание загрузки: %s)",
+                 port, BAUDRATE, wait_for_boot)
         self.ser = serial.Serial(port, baudrate=BAUDRATE, timeout=RESPONSE_TIMEOUT)
         if wait_for_boot:
             time.sleep(BOOT_DELAY)
         self.ser.reset_input_buffer()
+        log.info("Плата реле готова на %s", port)
 
     def _send(self, cmd: str) -> str:
         self.ser.reset_input_buffer()
         self.ser.write(cmd.encode('utf-8') + b'\r\n')
-        return _read_response(self.ser)
+        resp = _read_response(self.ser)
+        log.debug("Реле %s: %s -> %r", self.port, cmd, resp)
+        if 'OK' not in resp.upper():
+            log.warning("Реле %s: команда %s без подтверждения OK (ответ: %r)", self.port, cmd, resp)
+        return resp
 
     def check(self) -> str:
         """Отправляет BEN и возвращает ответ платы (статус жгутов)."""
@@ -99,6 +110,7 @@ class RelayController:
         Исключение при записи в порт пробрасывается наверх — по нему
         safety.emergency_shutdown() понимает, что пора рвать порт.
         """
+        log.warning("Реле %s: АВАРИЙНОЕ размыкание (I_0 без ожидания ответа)", self.port)
         self.ser.write(b'I_0\r\n')
         try:
             self.ser.flush()
@@ -116,6 +128,7 @@ class RelayController:
         при потере связи контроллер платы уходит в исходное (разомкнутое)
         состояние сам.
         """
+        log.warning("Реле %s: принудительный обрыв порта (drop)", self.port)
         self.ser.close()
 
     def close(self):
@@ -157,6 +170,7 @@ def discover_relay_port(candidate_ports: Optional[List[str]] = None, quiet: bool
         raise RuntimeError("Не найдено ни одного serial-порта. Проверьте подключение платы реле.")
 
     _say("Поиск платы реле...")
+    log.info("Поиск платы реле среди портов: %s", ", ".join(ports))
     for port in ports:
         try:
             ser = serial.Serial(port, baudrate=BAUDRATE, timeout=RESPONSE_TIMEOUT)
@@ -166,12 +180,16 @@ def discover_relay_port(candidate_ports: Optional[List[str]] = None, quiet: bool
             resp = _read_response(ser)
             ser.close()
             _say(f"  {port}  ->  {resp!r}")
+            log.debug("Проба реле на %s -> %r", port, resp)
             if 'OK' in resp.upper():
                 _say(f"\nПлата реле найдена на {port}\n")
+                log.info("Плата реле найдена на %s", port)
                 return port
         except Exception as e:
             _say(f"  {port}  ->  Ошибка при опросе: {e}")
+            log.debug("Проба реле на %s: ошибка %s", port, e)
 
+    log.warning("Плата реле не обнаружена ни на одном порту (%d проверено)", len(ports))
     raise RuntimeError(
         "Не удалось обнаружить плату реле ни на одном порту. "
         "Проверьте подключение или укажите порт вручную (--relay-port)."

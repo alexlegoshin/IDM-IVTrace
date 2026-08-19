@@ -21,6 +21,10 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
+from applog import get_logger
+
+log = get_logger(__name__)
+
 from apppaths import tests_dir, resource_base
 
 
@@ -100,9 +104,17 @@ def run_selftests(verbose: bool = False) -> SelfTestResult:
             os.chdir(old_cwd)
 
     output = buf.getvalue()
-    return SelfTestResult(
+    result = SelfTestResult(
         ok=(returncode == 0),
         returncode=returncode,
         output=output,
         summary=_summarize(output),
     )
+    if result.ok:
+        log.info("Предполётные самотесты: OK (%s)", result.summary)
+    else:
+        # Провал самотестов блокирует измерение — в лог с выводом pytest,
+        # чтобы понять, что именно рассогласовано.
+        log.error("Предполётные самотесты ПРОВАЛЕНЫ (rc=%s): %s\n%s",
+                  returncode, result.summary, output)
+    return result

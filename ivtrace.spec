@@ -17,7 +17,23 @@ from pathlib import Path
 from PyInstaller.utils.hooks import collect_submodules
 
 # Встроенные плагины pytest нужны для предполётных самотестов внутри exe.
-hidden = ["pytest"] + collect_submodules("_pytest")
+# openpyxl подтягиваем ЦЕЛИКОМ: экспорт XLSX (analysis.export_xlsx) и
+# предполётный самотест test_analysis используют openpyxl, а он лениво
+# импортирует часть подмодулей (cell/_writer, worksheet/_writer и т.п.),
+# которые статический анализ PyInstaller пропускает — из-за чего в собранном
+# exe экспорт/самотест падали с ModuleNotFoundError (баг-репорт «проблема с
+# pyexcel при сборке v2.0»). collect_submodules гарантирует, что все они
+# попадут в сборку. et_xmlfile — зависимость openpyxl для записи.
+# Бэкенды matplotlib: backend_agg — рендер PNG/встраиваемой фигуры (объектный
+# Figure, см. analysis.load_and_analyze), backend_tkagg — встраивание в GUI.
+hidden = (
+    ["pytest"]
+    + collect_submodules("_pytest")
+    + collect_submodules("openpyxl")
+    + ["et_xmlfile",
+       "matplotlib.backends.backend_agg",
+       "matplotlib.backends.backend_tkagg"]
+)
 
 # tests/ бандлится поштучно, а не целой папкой — БЕЗ test_installer.py/
 # test_installer_core.py. Баг-репорт: эти два файла тестируют installer.py/

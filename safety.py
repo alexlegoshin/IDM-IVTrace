@@ -29,6 +29,12 @@
 """
 from typing import Callable, List, Optional
 
+from applog import get_logger
+
+# _flog, а не log: параметр функции emergency_shutdown называется log (колбэк
+# вывода оператору) — путать нельзя.
+_flog = get_logger(__name__)
+
 # Насколько ужимается VISA-таймаут приборов на время аварийной
 # последовательности. Ноль не годится: в VISA это «вернуть управление
 # немедленно», из-за чего гарантированно провалились бы и те команды,
@@ -63,9 +69,17 @@ def emergency_shutdown(src=None, relay=None, dmm=None,
     ли реле на самом деле.
     """
     steps: List[str] = []
+    _flog.warning("АВАРИЙНЫЙ ОСТАНОВ: начало (src=%s, relay=%s, dmm=%s)",
+                  src is not None, relay is not None, dmm is not None)
 
     def record(message: str) -> None:
         steps.append(message)
+        # В файл-лог каждый шаг (и успех, и провал) — чтобы постфактум было
+        # видно, разомкнулось ли реле на самом деле, а не только по памяти.
+        if "НЕ УДАЛОСЬ" in message:
+            _flog.error("АВАРИЙНЫЙ ОСТАНОВ: %s", message)
+        else:
+            _flog.warning("АВАРИЙНЫЙ ОСТАНОВ: %s", message)
         if log is not None:
             log(f"[АВАРИЙНЫЙ ОСТАНОВ] {message}")
 

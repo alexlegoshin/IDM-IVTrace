@@ -5,6 +5,9 @@ from pathlib import Path
 from typing import List, Optional
 
 from apppaths import APP_VERSION
+from applog import get_logger
+
+_flog = get_logger(__name__)
 
 
 class ConfigManager:
@@ -117,6 +120,7 @@ class SensorConfigManager:
         }
         with open(path, 'w', encoding='utf-8') as f:
             json.dump(payload, f, indent=4, ensure_ascii=False)
+        _flog.info("Профиль датчика сохранён: %s (%s)", name, path)
         return path
 
     def load_sensor_config(self, name: str, excitation_type: Optional[str] = None) -> Optional[dict]:
@@ -135,6 +139,7 @@ class SensorConfigManager:
             filename = self._safe_filename(name)
         except ValueError as e:
             print(f"Предупреждение: {e}")
+            _flog.warning("Загрузка профиля %r: недопустимое имя (%s)", name, e)
             return None
 
         dirs = [self._subdir(excitation_type)] if excitation_type else list(self.subdirs.values())
@@ -144,10 +149,14 @@ class SensorConfigManager:
                 continue
             try:
                 with open(path, 'r', encoding='utf-8') as f:
-                    return json.load(f)
+                    data = json.load(f)
+                _flog.info("Профиль датчика загружен: %s (%s)", name, path)
+                return data
             except (json.JSONDecodeError, OSError) as e:
                 print(f"Предупреждение: не удалось прочитать конфиг датчика ({e})")
+                _flog.warning("Профиль %s повреждён/недоступен (%s): %s", name, path, e)
                 return None
+        _flog.debug("Профиль датчика не найден: %s (тип: %s)", name, excitation_type)
         return None
 
     def list_sensor_configs(self, excitation_type: Optional[str] = None) -> List[str]:

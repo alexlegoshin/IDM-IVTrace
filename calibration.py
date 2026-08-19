@@ -41,6 +41,10 @@ from pathlib import Path
 from enum import Enum
 from typing import List, Optional
 
+from applog import get_logger
+
+_flog = get_logger(__name__)
+
 # "менее 3 месяцев" по ТЗ.
 WARNING_WINDOW_DAYS = 90
 
@@ -190,7 +194,11 @@ def load_registry(path: Optional[Path] = None) -> List[InstrumentRecord]:
         return []
     try:
         data = json.loads(path.read_text(encoding='utf-8'))
-    except (json.JSONDecodeError, OSError):
+    except (json.JSONDecodeError, OSError) as e:
+        # Реестр повреждён/недоступен — молча трактуем как «поверка не
+        # заведена» (не блокируем измерение), но в лог пишем: иначе оператор
+        # не поймёт, почему все приборы вдруг «не в реестре».
+        _flog.warning("Реестр поверки не прочитан (%s): %s", path, e)
         return []
     return [InstrumentRecord.from_dict(r) for r in data.get('records', [])]
 
