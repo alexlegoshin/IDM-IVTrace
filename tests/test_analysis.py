@@ -91,6 +91,52 @@ def test_read_metadata_parses_hash_lines(tmp_path):
 # load_and_analyze
 # ----------------------------------------------------------------------
 
+def test_graph_excludes_rejected_but_keeps_in_dataframe_and_axis_without_gost(tmp_path):
+    """
+    Ш5: бракованная точка НЕ строится на графике (баг п.9), но остаётся в
+    df/return (сырые данные для протокола); ось Y нижнего графика — просто
+    «Погрешность, %» без «ГОСТ»/«приведённая» (баг п.19); ожидаемая прямая —
+    на фоне (zorder ниже измеренных, баг п.5).
+    """
+    import matplotlib.pyplot as plt
+
+    csv_path = tmp_path / "IVtrace_g_20260101_000000.csv"
+    with open(csv_path, "w", encoding="utf-8") as f:
+        f.write("# Датчик: G\n#\n")
+        f.write("Timestamp,Branch,X_set,X_real,Y_meas,Y_unit,Rejected,RejectReason,PolarityMismatch\n")
+        f.write("t,zero,0,0,0.0,A,False,,False\n")
+        f.write("t,forward,10,10,0.10,A,False,,False\n")
+        f.write('t,forward,20,20,0.55,A,True,"brak",False\n')  # бракованная
+        f.write("t,forward,30,30,0.30,A,False,,False\n")
+
+    stats = load_and_analyze(csv_path, I_nom=100.0, X=100.0, save_png=False, close_fig=False)
+    fig = stats["figure"]
+    ax1, ax2 = fig.axes[0], fig.axes[1]
+
+    # ось без ГОСТ
+    assert ax2.get_ylabel() == "Погрешность, %"
+    assert "ГОСТ" not in ax2.get_ylabel()
+
+    # брак остаётся в данных/статистике
+    assert stats["rejected_points"] == 1
+    assert len(stats["dataframe"]) == 4
+
+    # но НЕ на графике: бракованная X=20 не входит ни в одну измеренную линию
+    plotted_x, expected_zorders, measured_zorders = set(), [], []
+    for line in ax1.get_lines():
+        if line.get_linestyle() == "--":  # ожидаемая прямая
+            expected_zorders.append(line.get_zorder())
+            continue
+        measured_zorders.append(line.get_zorder())
+        plotted_x.update(line.get_xdata().tolist())
+    assert 20.0 not in plotted_x
+    assert 30.0 in plotted_x and 10.0 in plotted_x
+    # ожидаемая — на фоне (ниже измеренных)
+    assert max(expected_zorders) < min(measured_zorders)
+
+    plt.close(fig)
+
+
 def test_load_and_analyze_computes_expected_error(tmp_path):
     csv_path = tmp_path / "IVtrace_x_20260101_000000.csv"
     # K = I_meas / X_set идеально линеен -> ожидаем нулевую (или почти нулевую) погрешность.
@@ -561,6 +607,38 @@ def test_export_xlsx_accepts_explicit_output_path(tmp_path):
     result = export_xlsx(csv_path, xlsx_path=custom_path)
     assert result == custom_path
     assert custom_path.exists()
+
+
+def test_export_xlsx_survives_rejected_rows_with_nan(tmp_path):
+    """
+    Регрессия (баг-репорт «XLSX не сохраняется»): реальные измерения содержат
+    бракованные/сбойные точки — NaN в Y_meas, пустой RejectReason, bool-колонки.
+    Раньше подбор ширин `astype(str).map(len)` падал на NaN под pandas 3.x и
+    ронял весь экспорт. Теперь файл должен сохраниться, NaN -> пустая ячейка.
+    """
+    from openpyxl import load_workbook
+
+    csv_path = tmp_path / "IVtrace_rej_20260101_000000.csv"
+    with open(csv_path, "w", encoding="utf-8") as f:
+        f.write("# Датчик: TestSensor\n#\n")
+        f.write("Timestamp,Branch,X_set,X_real,Y_meas,Y_unit,Rejected,RejectReason,PolarityMismatch\n")
+        f.write("2026-01-01T00:00:00,zero,0.0,0.0,0.001,A,False,,False\n")
+        f.write("2026-01-01T00:00:01,forward,10.0,10.0,0.099,A,False,,False\n")
+        # бракованная точка: Y_meas пустой (NaN), RejectReason заполнен
+        f.write('2026-01-01T00:00:02,forward,20.0,20.0,,A,True,"погрешность 20% > 1%",False\n')
+
+    xlsx_path = export_xlsx(csv_path)
+    assert xlsx_path.exists()
+
+    wb = load_workbook(xlsx_path)
+    ws = wb["Данные"]
+    # строка с NaN Y_meas записана, пропуск -> пустая ячейка (None), не строка "nan"
+    y_meas_col = [c.value for c in ws["E"]]
+    assert y_meas_col[0] == "Y_meas"
+    assert y_meas_col[3] is None  # 3-я точка данных (row 4): Y_meas был пустым
+    # bool-колонка Rejected сохранена как значение, а не упала
+    rejected_col = [c.value for c in ws["G"]]
+    assert rejected_col[3] in (True, "True", 1)
 
 
 # ----------------------------------------------------------------------

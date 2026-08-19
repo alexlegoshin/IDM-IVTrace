@@ -5,6 +5,8 @@
     "registry_number": "92879-24",
     "timeout": 5000,
     "encoding": "utf-8",
+    "local_command": "SYST:LOC",
+    "local_notes": "local_command (п.8) — возврат из REMOTE в местное управление после цикла. 'SYSTem:LOCal' — стандартная SCPI-команда линейки ITECH IT-M; на реальном АКИП-1162 не проверялась. Неизвестная прибору команда безвредна (write не поднимает ошибку).",
     "init_commands": [
         "*RST",
         "SOUR:CC:PRI"

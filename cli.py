@@ -11,11 +11,12 @@ from limits import (
     strictest_current_source_limits,
     strictest_voltage_source_limits,
     voltage_ceiling_block_reason,
-    smooth_ramp_block_reason,
+    smooth_ramp_warning,
 )
 from measurement import (
     DEFAULT_AVERAGING_COUNT, DEFAULT_AVERAGING_DELAY, DEFAULT_DISCARD_FIRST,
     DEFAULT_ADAPTIVE_COOLING_MIN_DELAY, DEFAULT_ADAPTIVE_COOLING_MAX_DELAY,
+    MAX_MEASUREMENT_ATTEMPTS,
 )
 from sweep import Branch, DirectionPreset
 
@@ -222,6 +223,16 @@ def build_parser(default_data_dir: Path = Path("data")) -> argparse.ArgumentPars
         help="Остановить измерение при превышении порога погрешности",
     )
     p_measure.add_argument(
+        "--recheck-count", type=int, default=None,
+        help="Число доп. перепромеров точки при подозрении на брак (0 = без "
+             "перепромеров, брак сразу; по умолчанию 2 — всего 3 попытки на точку)",
+    )
+    p_measure.add_argument(
+        "--zero-crossing-smooth", action="store_true",
+        help="Плавный проход нуля (только для --preset full_cycle): у нуля ток "
+             "меняется мелким подшагом, без резкого скачка",
+    )
+    p_measure.add_argument(
         "--branch", choices=[b.value for b in Branch], default=None,
         help="Какая полярность измеряется: both (обе, через реле, по умолчанию), "
              "positive или negative (только одна)",
@@ -403,9 +414,10 @@ def validate_measure_params(params: dict, excitation_type: str,
                 errors.append(block)
 
         if params.get('smooth_ramp'):
-            ramp_block = smooth_ramp_block_reason(current_sweep_max_abs(params, excitation_type))
-            if ramp_block:
-                errors.append(ramp_block)
+            # Баг-репорт: раньше ток выше 300 А ЗАПРЕЩАЛ плавное нарастание.
+            # Теперь это лишь предупреждение (см. limits.smooth_ramp_warning),
+            # ампераж не ограничен — предупреждение показывается перед стартом
+            # (GUI: диалог подтверждения; CLI: cmd_measure), не блокирует здесь.
             if params.get('ramp_duration') is None or params['ramp_duration'] <= 0:
                 errors.append("Время шага плавного нарастания должно быть положительным числом.")
 
@@ -563,6 +575,19 @@ def resolve_measure_params(args, config_mgr: ConfigManager, sensor_config_mgr=No
         'adaptive_cooling_max_delay': (
             args.adaptive_cooling_max_delay if args.adaptive_cooling_max_delay is not None
             else loaded.get('adaptive_cooling_max_delay', DEFAULT_ADAPTIVE_COOLING_MAX_DELAY)
+        ),
+        # Число доп. перепромеров при подозрении на брак (п.12): 0 = без
+        # перепромеров. Дефолт MAX_MEASUREMENT_ATTEMPTS-1 (=2) сохраняет прежнее
+        # поведение (всего 3 попытки на точку).
+        'recheck_count': (
+            args.recheck_count if getattr(args, 'recheck_count', None) is not None
+            else loaded.get('recheck_count', MAX_MEASUREMENT_ATTEMPTS - 1)
+        ),
+        # Плавный проход нуля (п.18) — только для FULL_CYCLE; store_true, поэтому
+        # флаг может лишь включить, а выключить/сохранить включённым — конфиг.
+        'zero_crossing_smooth': (
+            getattr(args, 'zero_crossing_smooth', False)
+            or loaded.get('zero_crossing_smooth', False)
         ),
     }
 
@@ -727,6 +752,13 @@ def resolve_measure_params(args, config_mgr: ConfigManager, sensor_config_mgr=No
         warning = relay_current_warning(current_sweep_max_abs(params, excitation_type))
         if warning:
             print(f"\n⚠ {warning}\n")
+
+    # Предупреждение о плавном нарастании на больших токах (баг-репорт: раньше
+    # это был запрет; теперь — предупреждение, ампераж не ограничен).
+    if not params['suppress_notifications'] and params.get('smooth_ramp') and excitation_type == 'current':
+        ramp_warn = smooth_ramp_warning(current_sweep_max_abs(params, excitation_type))
+        if ramp_warn:
+            print(f"\n⚠ {ramp_warn}\n")
 
     # Сохраняем конфиг датчика, если указано
     if args.save_config and sensor_config_mgr:

@@ -4,6 +4,8 @@
     "keywords": ["RIGOL", "DM3068", "DM3058", "DM3064", "DM3054"],
     "timeout": 5000,
     "encoding": "utf-8",
+    "local_command": "SYST:LOC",
+    "local_notes": "local_command (п.8) — возврат из REMOTE в местное управление после цикла. 'SYSTem:LOCal' — стандартная SCPI-команда; на реальном RIGOL DM3068 не проверялась. Неизвестная прибору команда безвредна (write не поднимает ошибку).",
     "write_termination": "\n",
     "read_termination": "\n",
     "init_commands": [

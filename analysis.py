@@ -6,11 +6,9 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
-try:
-    from scipy.interpolate import CubicSpline
-    SCIPY_AVAILABLE = True
-except ImportError:
-    SCIPY_AVAILABLE = False
+from applog import get_logger
+
+log = get_logger(__name__)
 
 
 def find_latest_csv(data_dir: Path) -> Path:
@@ -189,74 +187,83 @@ def load_and_analyze(latest_csv: Path, I_nom: float, X: float, save_png: bool = 
 
     x_label = f"1:{int(X)}" if float(X).is_integer() else f"1:{X:.1f}"
 
-    # Верхний график: выход датчика. Forward и reverse рисуются отдельно —
-    # это две разные ветви одного и того же прохода через 0, их нельзя
-    # просто сортировать вместе по excitation_col без учёта знака.
-    branch_styles = {
-        'forward': dict(color='steelblue', marker='o', label=f'{label} (forward) – измер.'),
-        'reverse': dict(color='seagreen', marker='s', label=f'{label} (reverse) – измер.'),
-    }
-    for branch_name, sub in df.groupby('Branch', sort=False):
-        sub = sub.sort_values(excitation_col)
-        style = branch_styles.get(branch_name, dict(color='gray', marker='.', label=f'{label} ({branch_name})'))
-        # meas_corrected (см. выше) — тот же ряд, что и meas_col, за вычетом
-        # смещения нуля; на графике показываем скорректированное значение —
-        # иначе кривая была бы визуально сдвинута на константу, которую
-        # оператор и так знает и уже учёл.
-        ax1.plot(sub[excitation_col], meas_corrected.loc[sub.index], marker=style['marker'], linestyle='-',
-                  color=style['color'], markersize=4, label=style['label'])
+    # Бракованные/вручную исключённые точки НЕ строятся на графике (баг-репорт
+    # п.9): они остаются в df и CSV (сырые данные, протокол), но искажали бы
+    # обе кривые — излом амплитуды и выброс погрешности (см. эталон-«до»).
+    # Для ПОСТРОЕНИЯ берём только принятые; сводная статистика уже считается по
+    # accepted (см. stats_source выше).
+    plot_df = df[~excluded_mask]
+    if plot_df.empty:
+        plot_df = df  # крайний случай: забраковано всё — лучше показать сырое, чем пустоту
 
+    # Ветви рисуются В ПОРЯДКЕ ИЗМЕРЕНИЯ (без сортировки по X) и соединяются
+    # ПРЯМЫМИ (баг-репорт п.11): для FULL_CYCLE это даёт наглядную замкнутую
+    # петлю гистерезиса на forward/reverse, а для точек X=0 (ветвь 'zero', все
+    # на одной абсциссе) — ту самую вертикальную линию через нули, которую
+    # заказчик просил сделать фичей. Сортировка по X (как было) и сплайн (убран)
+    # эту петлю схлопывали, а сплайн ещё и давал артефактные провалы.
+    branch_styles = {
+        'zero':    dict(color='#8338ec', marker='D', label=f'{label} (нуль)', zorder=4),
+        'forward': dict(color='steelblue', marker='o', label=f'{label} (forward) – измер.', zorder=3),
+        'reverse': dict(color='seagreen', marker='s', label=f'{label} (reverse) – измер.', zorder=3),
+    }
+    _default_style = dict(color='gray', marker='.', label=None, zorder=3)
+    _branch_order = {'zero': 0, 'forward': 1, 'reverse': 2}
+    # groupby(sort=False) сохраняет порядок строк ВНУТРИ группы (порядок
+    # измерения); группы упорядочиваем сами (нуль → forward → reverse) для
+    # стабильной легенды.
+    branches_plot = sorted(plot_df.groupby('Branch', sort=False),
+                           key=lambda kv: _branch_order.get(kv[0], 99))
+
+    # Ожидаемая прямая — на самый фон (zorder=1), чтобы измеренные точки были
+    # ПОВЕРХ неё, а не она перекрывала данные (баг-репорт п.5).
     df_sorted_for_expected = df.sort_values(excitation_col)
     ax1.plot(df_sorted_for_expected[excitation_col], df_sorted_for_expected['Y_expected'], '--',
-              color='orange', linewidth=1.5, label=f'Ожидаемый ({x_label})')
+             color='orange', linewidth=1.5, label=f'Ожидаемый ({x_label})', zorder=1)
+
+    for branch_name, sub in branches_plot:
+        style = branch_styles.get(branch_name, {**_default_style, 'label': f'{label} ({branch_name})'})
+        # meas_corrected — meas_col за вычетом смещения нуля (показываем
+        # скорректированное; см. выше). Порядок sub — измерения, не сортируем.
+        ax1.plot(sub[excitation_col], meas_corrected.loc[sub.index], marker=style['marker'], linestyle='-',
+                 color=style['color'], markersize=4, label=style['label'], zorder=style['zorder'])
+
     ax1.set_ylabel(f'Выходной {output_label} датчика, {output_unit}')
     ax1.set_title(f'Амплитудная характеристика датчика (возбуждение — {excitation_label})\n'
                   f'Диапазон {X_start}..{X_stop} {excitation_unit}')
-    ax1.legend(loc='upper left')
+    # loc='best' — matplotlib сам ставит легенду туда, где меньше данных
+    # (баг-репорт п.6: динамически, чтобы не перекрывала график).
+    ax1.legend(loc='best')
     ax1.grid(True, which='major', linestyle='-', linewidth=0.6, alpha=0.7)
     ax1.grid(True, which='minor', linestyle=':', linewidth=0.4, alpha=0.5)
 
-    # Нижний график: приведённая погрешность.
-    # ВАЖНО: forward и reverse обе проходят через excitation_col=0, так что
-    # в объединённых данных x не строго возрастает (дубли на 0, а иногда и
-    # на других точках при неровном шаге). CubicSpline требует строго
-    # возрастающую последовательность x, поэтому дубли усредняем перед
-    # построением сплайна — сами измеренные точки (крестики) остаются
-    # нетронутыми и показывают обе ветви как есть.
-    x = df[excitation_col].values
-    y = df['Error_percent'].values
-    order = np.argsort(x)
-    x_sorted, y_sorted = x[order], y[order]
+    # Нижний график: погрешность. Те же ветви, тем же порядком и цветом —
+    # прямыми (без сплайна, п.11). Подпись оси — БЕЗ «ГОСТ 8.401-80» и
+    # «приведённая» (п.19): термины уместны в протоколе CSV, но на графике
+    # не помещаются и лишни; цвета ветвей уже объяснены легендой верхнего графика.
+    for branch_name, sub in branches_plot:
+        style = branch_styles.get(branch_name, _default_style)
+        ax2.plot(sub[excitation_col], sub['Error_percent'], marker=style['marker'], linestyle='-',
+                 color=style['color'], markersize=4, alpha=0.85, zorder=style['zorder'])
 
-    x_unique, unique_idx, counts = np.unique(x_sorted, return_index=True, return_counts=True)
-    y_avg = np.array([
-        y_sorted[start:start + count].mean()
-        for start, count in zip(unique_idx, counts)
-    ])
-
-    if SCIPY_AVAILABLE and len(x_unique) > 3:
-        cs = CubicSpline(x_unique, y_avg)
-        x_smooth = np.linspace(x_unique[0], x_unique[-1], 500)
-        ax2.plot(x_smooth, cs(x_smooth), '-', color='firebrick', linewidth=1.2,
-                  label='Погрешность приведённая (сглаженная)')
-    else:
-        ax2.plot(x_unique, y_avg, '-', color='firebrick', linewidth=1.2,
-                  label='Погрешность приведённая')
-
-    ax2.plot(df[excitation_col], df['Error_percent'], 'x', color='firebrick', markersize=6, alpha=0.7)
-    ax2.axhline(y=0, color='gray', linewidth=0.5)
+    # Заметный ноль (баг-репорт п.5): контрастная линия чуть толще, на фоне.
+    ax2.axhline(y=0, color='#222222', linewidth=1.1, zorder=1)
     ax2.set_xlabel(f'Заданное возбуждение ({excitation_label}), {excitation_unit}')
-    ax2.set_ylabel('Приведённая погрешность (ГОСТ 8.401-80), %')
-    ax2.legend(loc='upper right')
+    ax2.set_ylabel('Погрешность, %')
     ax2.grid(True, which='major', linestyle='-', linewidth=0.6, alpha=0.7)
     ax2.grid(True, which='minor', linestyle=':', linewidth=0.4, alpha=0.5)
 
-    # Подписи погрешности над точками (п.30) — вертикальные (horizontal
-    # текст на плотном шаге налезает сам на себя), точность 0.001 %.
+    # Подписи погрешности (п.30), вертикальные, точность 0.001 %. Баг-репорт
+    # п.11: при гистерезисе метки встречных ветвей налезали друг на друга —
+    # разводим по вертикали: forward/zero над точкой, reverse под ней.
     if show_error_labels:
-        for xv, yv in zip(df[excitation_col].values, df['Error_percent'].values):
-            ax2.annotate(f"{yv:.3f}%", xy=(xv, yv), xytext=(0, 6), textcoords='offset points',
-                        rotation=90, ha='center', va='bottom', fontsize=7, color='firebrick')
+        for branch_name, sub in branches_plot:
+            above = branch_name != 'reverse'
+            dy, va = (6, 'bottom') if above else (-6, 'top')
+            color = branch_styles.get(branch_name, _default_style)['color']
+            for xv, yv in zip(sub[excitation_col].values, sub['Error_percent'].values):
+                ax2.annotate(f"{yv:.3f}%", xy=(xv, yv), xytext=(0, dy), textcoords='offset points',
+                             rotation=90, ha='center', va=va, fontsize=7, color=color)
 
     if xlim is not None:
         ax1.set_xlim(*xlim)
@@ -459,6 +466,43 @@ def estimate_ratio_from_data(df: pd.DataFrame, excitation_col: Optional[str] = N
 # п.21 — экспорт в XLSX
 # ----------------------------------------------------------------------
 
+def _xlsx_cell(value):
+    """
+    Готовит одно значение к записи в ячейку openpyxl.
+
+    Баг-репорт (корень «XLSX не сохраняется»): openpyxl не принимает часть
+    типов, которые приходят из pandas — прежде всего NaN (float) в колонках с
+    пропусками (Y_meas у бракованных точек, пустой RejectReason) и numpy-
+    скаляры (numpy.bool_/int64/float64). NaN -> None (пустая ячейка), любой
+    numpy-скаляр -> нативный питоновский тип через .item(); остальное — как есть.
+    """
+    if isinstance(value, float) and pd.isna(value):
+        return None
+    item = getattr(value, "item", None)  # numpy-скаляры несут .item()
+    if callable(item):
+        try:
+            return value.item()
+        except (ValueError, TypeError):
+            return value
+    return value
+
+
+def _col_content_width(series: pd.Series) -> int:
+    """
+    Максимальная длина строкового представления значений колонки — для
+    авто-ширины.
+
+    Баг-репорт: раньше здесь было `series.astype(str).map(len)`, и под pandas
+    3.x (строки на бэкенде PyArrow) `.map(len)` получал NaN как float и падал
+    с `TypeError: object of type 'float' has no len()`, роняя весь экспорт.
+    `len(str(v))` внутри map превращает NaN в "nan" (len 3) и не падает ни на
+    каком типе.
+    """
+    if len(series) == 0:
+        return 0
+    return int(series.map(lambda v: len(str(v))).max())
+
+
 def export_xlsx(csv_path: Path, xlsx_path: Optional[Path] = None) -> Path:
     """
     Экспорт результатов измерения в XLSX (п.21): лист "Данные" — полная
@@ -473,34 +517,44 @@ def export_xlsx(csv_path: Path, xlsx_path: Optional[Path] = None) -> Path:
     csv_path = Path(csv_path)
     xlsx_path = Path(xlsx_path) if xlsx_path is not None else csv_path.with_suffix('.xlsx')
 
-    metadata = _read_metadata(csv_path)
-    df = pd.read_csv(csv_path, comment='#')
+    try:
+        metadata = _read_metadata(csv_path)
+        df = pd.read_csv(csv_path, comment='#')
 
-    wb = Workbook()
-    ws_data = wb.active
-    ws_data.title = "Данные"
-    ws_data.append(list(df.columns))
-    for cell in ws_data[1]:
-        cell.font = Font(bold=True)
-    for row in df.itertuples(index=False):
-        ws_data.append(list(row))
-    ws_data.freeze_panes = "A2"
-    for i, col in enumerate(df.columns, start=1):
-        content_width = df[col].astype(str).map(len).max() if len(df) else 0
-        width = max(len(str(col)), content_width) + 2
-        ws_data.column_dimensions[get_column_letter(i)].width = min(width, 40)
+        wb = Workbook()
+        ws_data = wb.active
+        ws_data.title = "Данные"
+        ws_data.append(list(df.columns))
+        for cell in ws_data[1]:
+            cell.font = Font(bold=True)
+        for row in df.itertuples(index=False):
+            ws_data.append([_xlsx_cell(v) for v in row])
+        ws_data.freeze_panes = "A2"
+        for i, col in enumerate(df.columns, start=1):
+            content_width = _col_content_width(df[col])
+            width = max(len(str(col)), content_width) + 2
+            ws_data.column_dimensions[get_column_letter(i)].width = min(width, 40)
 
-    ws_meta = wb.create_sheet("Метаданные")
-    ws_meta.append(["Параметр", "Значение"])
-    for cell in ws_meta[1]:
-        cell.font = Font(bold=True)
-    for key, value in metadata.items():
-        ws_meta.append([key, value])
-    ws_meta.column_dimensions['A'].width = 42
-    ws_meta.column_dimensions['B'].width = 60
-    ws_meta.freeze_panes = "A2"
+        ws_meta = wb.create_sheet("Метаданные")
+        ws_meta.append(["Параметр", "Значение"])
+        for cell in ws_meta[1]:
+            cell.font = Font(bold=True)
+        for key, value in metadata.items():
+            ws_meta.append([key, value])
+        ws_meta.column_dimensions['A'].width = 42
+        ws_meta.column_dimensions['B'].width = 60
+        ws_meta.freeze_panes = "A2"
 
-    wb.save(xlsx_path)
+        wb.save(xlsx_path)
+    except Exception:
+        # Баг-репорт: экспорт «тихо не сохранялся». Корень — падение на подборе
+        # ширин колонок с NaN (см. _col_content_width). Теперь любая ошибка
+        # экспорта попадает в лог с трассировкой и пробрасывается наверх с
+        # понятным текстом — вызывающий код (GUI) покажет её оператору, а не
+        # проглотит молча.
+        log.exception("Не удалось сохранить XLSX: %s -> %s", csv_path, xlsx_path)
+        raise
+    log.info("XLSX сохранён: %s (%d строк)", xlsx_path, len(df))
     return xlsx_path
 
 

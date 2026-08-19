@@ -20,6 +20,7 @@ import os
 import queue
 import sys
 import threading
+import time
 import traceback
 from pathlib import Path
 
@@ -39,14 +40,21 @@ from config import ConfigManager, SensorConfigManager
 from cli import current_sweep_max_abs, make_csv_filename, validate_measure_params
 from discovery import DiscoveryService
 from instruments import identify_instrument
-from limits import relay_current_warning, relay_current_block_reason, SMOOTH_RAMP_MAX_CURRENT_A
+from limits import (
+    relay_current_warning, relay_current_block_reason,
+    smooth_ramp_warning, SMOOTH_RAMP_WARN_CURRENT_A,
+)
 from measurement import (
     EXCITATION_UNITS,
     DEFAULT_AVERAGING_COUNT, DEFAULT_AVERAGING_DELAY, DEFAULT_DISCARD_FIRST,
     DEFAULT_ADAPTIVE_COOLING_MIN_DELAY, DEFAULT_ADAPTIVE_COOLING_MAX_DELAY,
+    MAX_MEASUREMENT_ATTEMPTS,
     estimate_duration_seconds,
 )
 from sweep import Branch, DirectionPreset, plan_sweep, plan_custom_sweep, preset_applies
+from applog import get_logger
+
+_log = get_logger(__name__)
 
 
 # п.33 — минимализм: бело-кремовый фон, чёрный текст, геометричный
@@ -262,6 +270,10 @@ class IVTraceGUI:
         self.custom_program_var = tk.BooleanVar(value=False)
         self.show_labels_var = tk.BooleanVar(value=False)
         self.auto_range_var = tk.BooleanVar(value=True)
+        # Возврат приборов в Local после цикла (п.8) — по умолчанию включён.
+        self.restore_local_var = tk.BooleanVar(value=True)
+        # Плавный проход нуля для FULL_CYCLE (п.18).
+        self.zero_crossing_smooth_var = tk.BooleanVar(value=False)
 
         # Ручной режим вне измерительного цикла (Ф4, п.13/40) — открытая
         # сессия живёт между кликами (реле/уставка), не одна операция за
@@ -518,11 +530,15 @@ class IVTraceGUI:
                         command=self._run_preflight).grid(row=2, column=0, columnspan=2, sticky="w", pady=(8, 0))
         ttk.Checkbutton(bottom, text="Отключить все предупреждения и уведомления (не рекомендуется)",
                         variable=self.suppress_warnings_var).grid(row=3, column=0, columnspan=2, sticky="w", pady=(2, 0))
+        # Возврат приборов в местное управление после цикла (п.8) — чтобы после
+        # измерения можно было пользоваться передней панелью, не передёргивая питание.
+        ttk.Checkbutton(bottom, text="Возвращать приборы в Local после измерения",
+                        variable=self.restore_local_var).grid(row=4, column=0, columnspan=2, sticky="w", pady=(2, 0))
 
         self._on_excitation_change()
         self._on_custom_program_change()
         self._on_adaptive_cooling_change()
-        self._on_stop_on_error_change()
+        self._on_avg_count_change()
         self._on_branch_change()
         self._on_preset_change()
         self._update_sweep_preview()
@@ -648,20 +664,28 @@ class IVTraceGUI:
         self.e_label = ttk.Entry(pf)
         self.e_label.grid(row=5, column=1, columnspan=2, sticky="ew", pady=(6, 0))
 
-        # Отсечка по погрешности — отдельным пунктом, не перемешивая с
-        # параметрами самой развёртки (баг-репорт).
-        err_box = ttk.Labelframe(body, text="Отсечка по погрешности", padding=10)
+        # Погрешность: брак и отсечка. Баг-репорт п.16: порог погрешности
+        # управляет АВТОБРАКОМ точек (пометка Rejected при стабильном выходе за
+        # порог, когда заданы I ном. и коэффициент) — независимо от того,
+        # останавливать ли из-за этого весь свип. Поэтому порог виден ВСЕГДА, а
+        # не только при включённой «остановке» (раньше поле пряталось, а брак
+        # всё равно шёл по нему — баг). Число перепромеров (п.12) — рядом.
+        err_box = ttk.Labelframe(body, text="Погрешность: брак и отсечка", padding=10)
         err_box.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 8))
-        ttk.Checkbutton(err_box, text="Остановить при превышении погрешности",
-                        variable=self.stop_on_error_var,
-                        command=self._on_stop_on_error_change).grid(row=0, column=0, sticky="w")
-        # Порог показывается только когда отсечка реально включена (п.33).
-        self._error_threshold_row = ttk.Frame(err_box)
-        self._error_threshold_row.grid(row=1, column=0, sticky="ew", pady=(4, 0))
-        ttk.Label(self._error_threshold_row, text="Порог погрешности, %").pack(side="left")
-        self.e_error_threshold = ttk.Entry(self._error_threshold_row, width=10)
-        self.e_error_threshold.pack(side="left", padx=(8, 0))
+        ttk.Label(err_box, text="Порог брака / отсечки, %").grid(row=0, column=0, sticky="w", pady=3)
+        self.e_error_threshold = ttk.Entry(err_box, width=8)
+        self.e_error_threshold.grid(row=0, column=1, sticky="w", pady=3, padx=(8, 0))
         self.e_error_threshold.insert(0, "1.0")
+        ttk.Label(err_box, text="Доп. перепромеров при подозрении на брак").grid(
+            row=1, column=0, sticky="w", pady=3)
+        self.e_recheck_count = ttk.Entry(err_box, width=8)
+        self.e_recheck_count.grid(row=1, column=1, sticky="w", pady=3, padx=(8, 0))
+        self.e_recheck_count.insert(0, str(MAX_MEASUREMENT_ATTEMPTS - 1))
+        ttk.Label(err_box, text="(0 — без перепромеров, брак сразу)",
+                  style="Muted.TLabel").grid(row=2, column=0, columnspan=2, sticky="w")
+        ttk.Checkbutton(err_box, text="Также останавливать свип при браке",
+                        variable=self.stop_on_error_var).grid(
+                        row=3, column=0, columnspan=2, sticky="w", pady=(4, 0))
 
         avg_box = ttk.Labelframe(body, text="Усреднение", padding=10)
         avg_box.grid(row=2, column=0, sticky="ew", padx=10, pady=(0, 8))
@@ -669,12 +693,16 @@ class IVTraceGUI:
         self.e_avg_count = ttk.Entry(avg_box, width=6)
         self.e_avg_count.grid(row=0, column=1, sticky="w", pady=3, padx=(8, 0))
         self.e_avg_count.insert(0, str(DEFAULT_AVERAGING_COUNT))
+        # Прячем «отбрасывать первый» при одном отсчёте (баг-репорт п.10).
+        self.e_avg_count.bind("<KeyRelease>", self._on_avg_count_change)
+        self.e_avg_count.bind("<FocusOut>", self._on_avg_count_change)
         ttk.Label(avg_box, text="Задержка между ними, с").grid(row=1, column=0, sticky="w", pady=3)
         self.e_avg_delay = ttk.Entry(avg_box, width=6)
         self.e_avg_delay.grid(row=1, column=1, sticky="w", pady=3, padx=(8, 0))
         self.e_avg_delay.insert(0, str(DEFAULT_AVERAGING_DELAY))
-        ttk.Checkbutton(avg_box, text="Отбрасывать первый отсчёт",
-                        variable=self.discard_first_var).grid(row=2, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        self.discard_first_check = ttk.Checkbutton(avg_box, text="Отбрасывать первый отсчёт",
+                                                   variable=self.discard_first_var)
+        self.discard_first_check.grid(row=2, column=0, columnspan=2, sticky="w", pady=(4, 0))
 
         # --- предпросмотр развёртки: что реально получится при текущих
         # значениях (не то, что напечатано, а то, что посчитает планировщик,
@@ -818,6 +846,13 @@ class IVTraceGUI:
         self.preset_desc_label = ttk.Label(self._preset_row, style="Muted.TLabel",
                                            wraplength=300, justify="left")
         self.preset_desc_label.pack(side="top", anchor="w", pady=(2, 0))
+        # Плавный проход нуля (п.18) — только для петли гистерезиса (FULL_CYCLE);
+        # видимость чекбокса переключается в _on_preset_change.
+        self.zero_crossing_check = ttk.Checkbutton(
+            self._preset_row, text="Плавный проход нуля (медленно, без скачка)",
+            variable=self.zero_crossing_smooth_var,
+            command=self._update_sweep_preview)
+        self.zero_crossing_check.pack(side="top", anchor="w", pady=(2, 0))
 
         return scroll
 
@@ -1209,12 +1244,22 @@ class IVTraceGUI:
         names = self.sensor_config_mgr.list_sensor_configs(excitation_type=self.excitation_var.get())
         self.e_config_name['values'] = names
 
-    def _on_stop_on_error_change(self):
-        """п.33: порог погрешности виден только когда отсечка реально включена."""
-        if self.stop_on_error_var.get():
-            self._error_threshold_row.grid()
+    def _on_avg_count_change(self, *_):
+        """
+        Баг-репорт п.10: галочка «отбрасывать первый отсчёт» бессмысленна при
+        одном отсчёте (нечего отбрасывать) — прячем её, когда отсчётов ≤ 1.
+        """
+        if not hasattr(self, 'discard_first_check'):
+            return
+        raw = self.e_avg_count.get().strip().replace(",", ".")
+        try:
+            count = int(float(raw)) if raw else DEFAULT_AVERAGING_COUNT
+        except ValueError:
+            count = DEFAULT_AVERAGING_COUNT
+        if count <= 1:
+            self.discard_first_check.grid_remove()
         else:
-            self._error_threshold_row.grid_remove()
+            self.discard_first_check.grid()
 
     def _on_branch_change(self):
         """п.33: схема прохода имеет смысл только при полярности «both»."""
@@ -1227,8 +1272,18 @@ class IVTraceGUI:
         DirectionPreset.DIVERGING.value: "0 → +X, затем 0 → −X (по умолчанию)",
         DirectionPreset.CONVERGING.value: "+X → 0 → −X, без остановки в нуле",
         DirectionPreset.DESCENDING.value: "+X → 0 и −X → 0 — обе ветви идут к нулю",
-        DirectionPreset.FULL_CYCLE.value: "0 → +X → 0 → −X → 0 — петля гистерезиса",
+        DirectionPreset.FULL_CYCLE.value: "0 → +X → 0 → −X → 0 — петля гистерезиса "
+                                          "(можно включить плавный проход нуля)",
     }
+
+    def _update_zero_crossing_visibility(self):
+        """Галочка плавного прохода нуля (п.18) видна только для FULL_CYCLE."""
+        if not hasattr(self, 'zero_crossing_check'):
+            return
+        if self.preset_var.get() == DirectionPreset.FULL_CYCLE.value:
+            self.zero_crossing_check.pack(side="top", anchor="w", pady=(2, 0))
+        else:
+            self.zero_crossing_check.pack_forget()
 
     def _on_preset_change(self):
         """
@@ -1247,6 +1302,7 @@ class IVTraceGUI:
         """
         if not hasattr(self, 'preset_desc_label'):
             return
+        self._update_zero_crossing_visibility()
         try:
             x_start = float(self.e_start.get().strip().replace(",", "."))
             x_stop = float(self.e_stop.get().strip().replace(",", "."))
@@ -1357,25 +1413,25 @@ class IVTraceGUI:
 
     def _update_smooth_ramp_availability(self, max_current):
         """
-        Плавное нарастание (BETA) недоступно выше limits.SMOOTH_RAMP_MAX_CURRENT_A
-        (см. limits.smooth_ramp_block_reason) — чекбокс блокируется целиком
-        (не просто "ошибка при старте"), а не тихо остаётся кликабельным
-        для развёртки, которая всё равно не пройдёт валидацию.
+        Плавное нарастание (BETA) выше limits.SMOOTH_RAMP_WARN_CURRENT_A —
+        теперь это ПРЕДУПРЕЖДЕНИЕ, а не запрет (баг-репорт: раньше чекбокс
+        блокировался целиком). Чекбокс всегда кликабелен; при большом токе
+        рядом показывается предупреждающая заметка, а сам факт ещё раз
+        всплывёт в диалоге подтверждения старта (см. _start_measurement).
         """
         if not hasattr(self, 'smooth_ramp_check'):
             return
-        too_high = max_current is not None and max_current > SMOOTH_RAMP_MAX_CURRENT_A
-        if too_high:
-            self.smooth_ramp_check.configure(state="disabled")
+        self.smooth_ramp_check.configure(state="normal")
+        warn = smooth_ramp_warning(max_current) if max_current is not None else None
+        # Заметку показываем только когда режим включён (иначе она сбивает с
+        # толку на выключенной функции) и ток реально выше порога.
+        if warn and self.smooth_ramp_var.get():
             self.smooth_ramp_note_label.configure(
-                text=f"Недоступно: максимум развёртки {max_current:.1f} А превышает "
-                     f"{SMOOTH_RAMP_MAX_CURRENT_A:.0f} А.")
-            if self.smooth_ramp_var.get():
-                self.smooth_ramp_var.set(False)
-                self._on_smooth_ramp_change()
+                text=f"⚠ {max_current:.1f} А выше {SMOOTH_RAMP_WARN_CURRENT_A:.0f} А — "
+                     "алгоритм на таких токах не проверялся, на ответственности оператора.",
+                foreground=BUSY_COLOR)
         else:
-            self.smooth_ramp_check.configure(state="normal")
-            self.smooth_ramp_note_label.configure(text="")
+            self.smooth_ramp_note_label.configure(text="", foreground=MUTED)
 
     def _append_log(self, text):
         self.log.configure(state="normal")
@@ -1519,9 +1575,12 @@ class IVTraceGUI:
         import json as _json
 
         btn.configure(state="disabled")
-        self.discovery.pause()
 
         def worker():
+            # pause() теперь СИНХРОННЫЙ (ждёт завершения фонового скана, см.
+            # DiscoveryService.pause) — зовём его из рабочего потока, а не из
+            # Tk-потока, чтобы короткое ожидание скана не подвешивало UI.
+            self.discovery.pause()
             try:
                 try:
                     from visa_backend import make_resource_manager
@@ -1581,11 +1640,12 @@ class IVTraceGUI:
         }
         self.manual_open_btn.configure(state="disabled")
         self.manual_status_label.configure(text="Открываю сессию…")
-        self.discovery.pause()
 
         def worker():
             from visa_backend import make_resource_manager
             from orchestrate import open_manual_control_session
+            # pause() синхронный — из рабочего потока, чтобы не морозить UI.
+            self.discovery.pause()
             try:
                 rm = make_resource_manager()
                 session = open_manual_control_session(
@@ -2015,35 +2075,40 @@ class IVTraceGUI:
             messagebox.showerror("Ошибка", f"Конфиг '{name}' не найден или повреждён.")
             return
 
-        # Заполняем поля интерфейса
+        # Заполняем поля интерфейса. Все числовые поля — через _set_entry:
+        # сохранённый пустым параметр приходит как None, и раньше в поле попадал
+        # литерал "None" (str(None)), из-за чего старт измерения падал на
+        # float("None") (баг-репорт п.3 для смещения нуля; A2 — то же для
+        # I ном./коэффициента). _set_entry превращает None в пустую строку.
         self.excitation_var.set(params.get('excitation_type', 'current'))
         self.output_var.set(params.get('output_type', 'current'))
-        self.e_start.delete(0, 'end'); self.e_start.insert(0, str(params.get('X_start', '')))
-        self.e_stop.delete(0, 'end'); self.e_stop.insert(0, str(params.get('X_stop', '')))
-        self.e_step.delete(0, 'end'); self.e_step.insert(0, str(params.get('X_step', '')))
-        self.e_vlimit.delete(0, 'end'); self.e_vlimit.insert(0, str(params.get('V_limit', '')))
-        self.e_ilimit.delete(0, 'end'); self.e_ilimit.insert(0, str(params.get('I_limit', '')))
-        self.e_delay.delete(0, 'end'); self.e_delay.insert(0, str(params.get('delay', '')))
-        self.e_cool.delete(0, 'end'); self.e_cool.insert(0, str(params.get('cooling_delay', '')))
-        self.e_label.delete(0, 'end'); self.e_label.insert(0, params.get('label', ''))
-        self.e_inom.delete(0, 'end'); self.e_inom.insert(0, str(params.get('I_nom', '')))
-        self.e_ratio.delete(0, 'end'); self.e_ratio.insert(0, str(params.get('ratio', '')))
-        self.e_zero_offset.delete(0, 'end'); self.e_zero_offset.insert(0, str(params.get('zero_offset', '')))
-        self.e_turns.delete(0, 'end'); self.e_turns.insert(0, str(params.get('turns', 1.0)))
+        self._set_entry(self.e_start, params.get('X_start'))
+        self._set_entry(self.e_stop, params.get('X_stop'))
+        self._set_entry(self.e_step, params.get('X_step'))
+        self._set_entry(self.e_vlimit, params.get('V_limit'))
+        self._set_entry(self.e_ilimit, params.get('I_limit'))
+        self._set_entry(self.e_delay, params.get('delay'))
+        self._set_entry(self.e_cool, params.get('cooling_delay'))
+        self._set_entry(self.e_label, params.get('label', ''))
+        self._set_entry(self.e_inom, params.get('I_nom'))
+        self._set_entry(self.e_ratio, params.get('ratio'))
+        self._set_entry(self.e_zero_offset, params.get('zero_offset'))
+        self._set_entry(self.e_turns, params.get('turns', 1.0))
         self.stop_on_error_var.set(params.get('stop_on_error', False))
-        self.e_error_threshold.delete(0, 'end'); self.e_error_threshold.insert(0, str(params.get('error_threshold', 1.0)))
+        self._set_entry(self.e_error_threshold, params.get('error_threshold', 1.0))
+        self._set_entry(self.e_recheck_count, params.get('recheck_count', MAX_MEASUREMENT_ATTEMPTS - 1))
+        self.restore_local_var.set(params.get('restore_local', True))
+        self.zero_crossing_smooth_var.set(params.get('zero_crossing_smooth', False))
         self._set_branch_safe(params.get('branch', Branch.BOTH.value))
         self._set_preset_safe(params.get('preset', DirectionPreset.DIVERGING.value))
-        self.e_avg_count.delete(0, 'end'); self.e_avg_count.insert(0, str(params.get('averaging_count', DEFAULT_AVERAGING_COUNT)))
-        self.e_avg_delay.delete(0, 'end'); self.e_avg_delay.insert(0, str(params.get('averaging_delay', DEFAULT_AVERAGING_DELAY)))
+        self._set_entry(self.e_avg_count, params.get('averaging_count', DEFAULT_AVERAGING_COUNT))
+        self._set_entry(self.e_avg_delay, params.get('averaging_delay', DEFAULT_AVERAGING_DELAY))
         self.discard_first_var.set(params.get('discard_first', DEFAULT_DISCARD_FIRST))
         self.adaptive_cooling_var.set(params.get('adaptive_cooling', False))
-        self.e_cool_min.delete(0, 'end')
-        self.e_cool_min.insert(0, str(params.get('adaptive_cooling_min_delay', DEFAULT_ADAPTIVE_COOLING_MIN_DELAY)))
-        self.e_cool_max.delete(0, 'end')
-        self.e_cool_max.insert(0, str(params.get('adaptive_cooling_max_delay', DEFAULT_ADAPTIVE_COOLING_MAX_DELAY)))
+        self._set_entry(self.e_cool_min, params.get('adaptive_cooling_min_delay', DEFAULT_ADAPTIVE_COOLING_MIN_DELAY))
+        self._set_entry(self.e_cool_max, params.get('adaptive_cooling_max_delay', DEFAULT_ADAPTIVE_COOLING_MAX_DELAY))
         self.smooth_ramp_var.set(params.get('smooth_ramp', False))
-        self.e_ramp_duration.delete(0, 'end'); self.e_ramp_duration.insert(0, str(params.get('ramp_duration', 1.0)))
+        self._set_entry(self.e_ramp_duration, params.get('ramp_duration', 1.0))
         self.custom_program_var.set(bool(params.get('custom_program')))
         self.e_custom_program.delete("1.0", "end")
         if params.get('custom_program'):
@@ -2052,12 +2117,25 @@ class IVTraceGUI:
         self._on_excitation_change()
         self._on_custom_program_change()
         self._on_adaptive_cooling_change()
-        self._on_stop_on_error_change()
+        self._on_avg_count_change()
         self._on_branch_change()
         self._on_preset_change()
         self._update_sweep_preview()
         self._append_log(f"Конфиг датчика загружен: {name}\n")
         messagebox.showinfo("Успех", f"Конфиг '{name}' загружен.")
+
+    @staticmethod
+    def _set_entry(entry, value):
+        """
+        Заполняет Entry значением, превращая None (и строку 'None') в пустую
+        строку (баг-репорт п.3/A2): профиль, сохранённый с пустым числовым
+        полем, хранит там None; раньше str(None) клал в поле литерал 'None', и
+        старт измерения падал на float('None'). Пустое поле трактуется дальше
+        как «значение не задано» (optional_num -> None -> дефолт).
+        """
+        entry.delete(0, 'end')
+        if value is not None and str(value) != 'None':
+            entry.insert(0, str(value))
 
     # -------------------------------------------------------------- measurement
     def _gather_params(self):
@@ -2139,6 +2217,15 @@ class IVTraceGUI:
             params["turns"] = optional_num(self.e_turns) or 1.0
             params["stop_on_error"] = self.stop_on_error_var.get()
             params["error_threshold"] = optional_num(self.e_error_threshold) or 1.0
+            # Число доп. перепромеров при подозрении на брак (п.12): 0 = без
+            # перепромеров. Отрицательное недопустимо.
+            recheck = optional_num(self.e_recheck_count)
+            recheck = MAX_MEASUREMENT_ATTEMPTS - 1 if recheck is None else int(recheck)
+            if recheck < 0:
+                raise ValueError("Число перепромеров не может быть отрицательным.")
+            params["recheck_count"] = recheck
+            params["restore_local"] = self.restore_local_var.get()
+            params["zero_crossing_smooth"] = self.zero_crossing_smooth_var.get()
             params["branch"] = self.branch_var.get()
             params["preset"] = self.preset_var.get()
             params["averaging_count"] = int(optional_num(self.e_avg_count) or DEFAULT_AVERAGING_COUNT)
@@ -2218,6 +2305,14 @@ class IVTraceGUI:
             if warning:
                 confirm_text = f"⚠ {warning}\n\n{confirm_text}"
 
+        # Плавное нарастание на больших токах — предупреждение (баг-репорт:
+        # раньше запрет), ампераж не ограничен; показываем перед стартом.
+        if (not params["suppress_notifications"] and params.get("smooth_ramp")
+                and params["excitation_type"] == "current"):
+            ramp_warn = smooth_ramp_warning(current_sweep_max_abs(params, params["excitation_type"]))
+            if ramp_warn:
+                confirm_text = f"⚠ {ramp_warn}\n\n{confirm_text}"
+
         if not messagebox.askyesno("Запуск измерения", confirm_text):
             return
 
@@ -2234,8 +2329,9 @@ class IVTraceGUI:
             "relay_port": self.e_relay.get().strip() or None,
         }
         # Служба обнаружения (п.25) не должна спорить с измерением за те же
-        # VISA-ресурсы/serial-порт реле — возобновляется в _measure_worker.finally.
-        self.discovery.pause()
+        # VISA-ресурсы/serial-порт реле — pause() зовём В рабочем потоке
+        # (он синхронный, ждёт фоновый скан; из Tk-потока подвесил бы UI),
+        # возобновляется в _measure_worker.finally.
         self._start_countdown(params)
         self.worker = threading.Thread(target=self._measure_worker, args=(params, csv_path, addr), daemon=True)
         self.worker.start()
@@ -2251,6 +2347,12 @@ class IVTraceGUI:
         при превышении погрешности, см. докстринг estimate_duration_seconds)
         — подписана "≈", а не выдаётся за точный расчёт.
         """
+        # Стартовое время и число точек плана — для ПЕРЕСЧЁТА оценки по факту
+        # (баг-репорт п.7): estimate_duration_seconds не знает перепромеров при
+        # браке, поэтому по мере прихода прогресса (_on_progress) остаток
+        # экстраполируется от реально потраченного времени.
+        self._measure_start_time = time.time()
+        self._measure_total_points = 0
         try:
             if params.get('custom_program'):
                 plan = plan_custom_sweep(params['custom_program'])
@@ -2259,7 +2361,9 @@ class IVTraceGUI:
                     params['X_start'], params['X_stop'], params['X_step'],
                     branch=Branch(params.get('branch', Branch.BOTH.value)),
                     preset=DirectionPreset(params.get('preset', DirectionPreset.DIVERGING.value)),
+                    zero_crossing_smooth=params.get('zero_crossing_smooth', False),
                 )
+            self._measure_total_points = len(plan)
             total = estimate_duration_seconds(
                 plan, delay=params['delay'], cooling_delay=params['cooling_delay'],
                 averaging_count=params.get('averaging_count', DEFAULT_AVERAGING_COUNT),
@@ -2274,11 +2378,33 @@ class IVTraceGUI:
             self.countdown_label.configure(text="")
             return
 
-        import datetime as _dt
         self._countdown_remaining = int(round(total))
-        finish_at = (_dt.datetime.now() + _dt.timedelta(seconds=total)).strftime("%H:%M:%S")
-        self._countdown_finish_text = finish_at
+        self._refresh_countdown_finish_text()
         self._tick_countdown()
+
+    def _refresh_countdown_finish_text(self):
+        import datetime as _dt
+        secs = max(0, self._countdown_remaining or 0)
+        self._countdown_finish_text = (_dt.datetime.now() + _dt.timedelta(seconds=secs)).strftime("%H:%M:%S")
+
+    def _on_progress(self, done, total):
+        """
+        Прогресс измерения (баг-репорт п.7): пересчитываем остаток по ФАКТУ —
+        среднее реально потраченное время на снятую точку × число оставшихся.
+        Так оценка учитывает перепромеры при браке и прочие задержки, которых
+        теоретическая estimate_duration_seconds не знает.
+        """
+        if self._countdown_remaining is None or not done or not total:
+            return
+        elapsed = time.time() - getattr(self, '_measure_start_time', time.time())
+        per_point = elapsed / done
+        remaining = per_point * max(0, total - done)
+        self._countdown_remaining = int(round(remaining))
+        self._refresh_countdown_finish_text()
+        # немедленно обновим подпись (не дожидаясь следующего тика)
+        mm, ss = divmod(max(0, self._countdown_remaining), 60)
+        self.countdown_label.configure(
+            text=f"Снято {done}/{total}  ·  осталось ≈{mm:02d}:{ss:02d}  ·  окончание ≈{self._countdown_finish_text}")
 
     def _tick_countdown(self):
         if self._countdown_remaining is None:
@@ -2309,12 +2435,20 @@ class IVTraceGUI:
         sys.stdout = sys.stderr = _QueueWriter(self.events)
         rm = None
         try:
+            # Синхронный pause() (ждёт фоновый скан) — здесь, в рабочем потоке,
+            # ДО открытия VISA-ресурсов: гарантирует, что фоновое обнаружение
+            # уже отпустило приборы и не столкнётся с discover_instruments.
+            self.discovery.pause()
             rm = make_resource_manager()
             run_measurement_session(
                 rm, params, csv_path,
                 dmm_addr=addr["dmm_addr"], src_addr=addr["src_addr"], relay_port=addr["relay_port"],
                 should_stop=self.stop_event.is_set,
                 on_session_open=self._session.set,
+                # Прогресс для пересчёта оценки времени по факту (баг-репорт п.7):
+                # шлём (снято, всего) в очередь; главный поток пересчитывает остаток
+                # (с учётом реально потраченного на перепромеры времени).
+                on_point_done=lambda done, total: self.events.put(("progress", (done, total))),
             )
             self.events.put(("done", str(csv_path)))
         except Exception as e:
@@ -2596,7 +2730,18 @@ class IVTraceGUI:
         )
         if not out:
             return
-        path = export_xlsx(csv_path, xlsx_path=Path(out))
+        try:
+            path = export_xlsx(csv_path, xlsx_path=Path(out))
+        except Exception as e:
+            # export_xlsx уже записал трассировку в лог (applog). Здесь —
+            # видимое оператору сообщение вместо прежнего тихого «ничего не
+            # произошло» (баг-репорт: XLSX «не сохраняется» без объяснений).
+            _log.exception("Экспорт XLSX не удался")
+            messagebox.showerror(
+                "Экспорт не удался",
+                f"Не удалось сохранить XLSX:\n{e}\n\nПодробности — в журнале приложения.",
+            )
+            return
         self._append_log(f"XLSX сохранён: {path}\n")
         messagebox.showinfo("Экспорт", f"Файл сохранён:\n{path}")
 
@@ -2735,6 +2880,9 @@ class IVTraceGUI:
                         text=("Готово к измерению." if ok
                               else "Измерение заблокировано. См. журнал / установите NI-VISA."))
                     self.start_btn.configure(state="normal" if ok else "disabled")
+                elif kind == "progress":
+                    done, total = payload
+                    self._on_progress(done, total)
                 elif kind == "done":
                     self.last_csv = payload
                     self._append_log(f"\n✔ Измерение завершено. Данные: {payload}\n")

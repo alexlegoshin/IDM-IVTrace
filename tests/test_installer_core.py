@@ -268,3 +268,60 @@ def test_fetch_releases_propagates_network_errors(monkeypatch):
     monkeypatch.setattr(ic.urllib.request, "urlopen", _raise)
     with pytest.raises(OSError):
         ic.fetch_releases()
+
+
+# ---------------------------------------------------------------- copy_payload
+
+def test_copy_payload_copies_tree(tmp_path):
+    src = tmp_path / "src"
+    (src / "sub").mkdir(parents=True)
+    (src / "a.txt").write_text("A", encoding="utf-8")
+    (src / "sub" / "b.txt").write_text("B", encoding="utf-8")
+    dst = tmp_path / "dst"
+
+    ic.copy_payload(src, dst)
+
+    assert (dst / "a.txt").read_text(encoding="utf-8") == "A"
+    assert (dst / "sub" / "b.txt").read_text(encoding="utf-8") == "B"
+
+
+def test_copy_payload_missing_source_raises(tmp_path):
+    with pytest.raises(OSError):
+        ic.copy_payload(tmp_path / "nope", tmp_path / "dst")
+
+
+def test_copy_payload_retries_then_succeeds(tmp_path, monkeypatch):
+    """Занятые файлы (OSError) — несколько попыток; при удаче на 2-й ошибки нет."""
+    src = tmp_path / "src"; src.mkdir()
+    (src / "a.txt").write_text("A", encoding="utf-8")
+    dst = tmp_path / "dst"
+
+    calls = {"n": 0}
+    real = ic.shutil.copytree
+
+    def flaky(s, d, dirs_exist_ok=False):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OSError("locked")
+        return real(s, d, dirs_exist_ok=dirs_exist_ok)
+
+    monkeypatch.setattr(ic.shutil, "copytree", flaky)
+    monkeypatch.setattr(ic.time, "sleep", lambda *_: None)  # без реальных пауз
+
+    ic.copy_payload(src, dst, retries=3, retry_delay=0)
+    assert calls["n"] == 2
+    assert (dst / "a.txt").read_text(encoding="utf-8") == "A"
+
+
+def test_copy_payload_raises_after_all_retries(tmp_path, monkeypatch):
+    src = tmp_path / "src"; src.mkdir()
+    (src / "a.txt").write_text("A", encoding="utf-8")
+
+    def always_locked(*a, **k):
+        raise OSError("still locked")
+
+    monkeypatch.setattr(ic.shutil, "copytree", always_locked)
+    monkeypatch.setattr(ic.time, "sleep", lambda *_: None)
+
+    with pytest.raises(OSError, match="still locked"):
+        ic.copy_payload(src, tmp_path / "dst", retries=3, retry_delay=0)

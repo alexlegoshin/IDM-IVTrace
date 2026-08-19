@@ -5,6 +5,8 @@
     "source_type": "voltage",
     "timeout": 5000,
     "encoding": "utf-8",
+    "local_command": "SYST:LOC",
+    "local_notes": "local_command (п.8) — возврат из REMOTE в местное управление после цикла. 'SYSTem:LOCal' — по мануалу GW Instek GPP-серии; на реальном GPP-4323 не проверялась (ASRL-подключение). Неизвестная прибору команда безвредна (write не поднимает ошибку).",
     "baud_rate": 115200,
     "init_commands": [
         "*RST"

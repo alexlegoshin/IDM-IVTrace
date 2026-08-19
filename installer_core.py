@@ -17,10 +17,15 @@ import json
 import re
 import shutil
 import subprocess
+import time
 import urllib.request
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Tuple
+
+from applog import get_logger
+
+log = get_logger(__name__)
 
 GITHUB_API_RELEASES_URL = "https://api.github.com/repos/alexlegoshin/IDM-IVTrace/releases"
 
@@ -144,13 +149,41 @@ def fetch_releases(timeout: float = 4.0) -> list:
         data = json.loads(response.read().decode('utf-8'))
     if not isinstance(data, list):
         raise ValueError("Неожиданный ответ GitHub API: ожидался список релизов.")
+    log.info("fetch_releases: получено релизов с GitHub: %d", len(data))
     return data
 
 
-def copy_payload(src_dir: Path, dest_dir: Path) -> None:
-    """Копирует содержимое src_dir (папка IVTrace/ рядом с Setup.exe) в dest_dir (install_root), с перезаписью."""
+def copy_payload(src_dir: Path, dest_dir: Path, retries: int = 3, retry_delay: float = 1.0) -> None:
+    """
+    Копирует содержимое src_dir (папка IVTrace/ рядом с Setup.exe) в dest_dir
+    (install_root), с перезаписью.
+
+    Баг-репорт (автообновление «не срабатывало»): при обновлении целевые файлы
+    могут быть кратковременно заняты (антивирус, только что закрывшийся
+    процесс, индексатор) — одиночный copytree падал с OSError и весь апдейт
+    срывался. Теперь несколько попыток с паузой; если и после них не вышло —
+    пробрасываем последнюю ошибку наверх (installer.py покажет её оператору,
+    а не проглотит). Каждый шаг логируется.
+    """
+    src_dir = Path(src_dir)
+    dest_dir = Path(dest_dir)
+    log.info("copy_payload: %s -> %s (существует источник: %s)", src_dir, dest_dir, src_dir.is_dir())
+    if not src_dir.is_dir():
+        raise OSError(f"Папка с новой версией не найдена: {src_dir}")
     dest_dir.mkdir(parents=True, exist_ok=True)
-    shutil.copytree(src_dir, dest_dir, dirs_exist_ok=True)
+    last_err: Optional[OSError] = None
+    for attempt in range(1, retries + 1):
+        try:
+            shutil.copytree(src_dir, dest_dir, dirs_exist_ok=True)
+            log.info("copy_payload: успешно с попытки %d/%d", attempt, retries)
+            return
+        except OSError as e:
+            last_err = e
+            log.warning("copy_payload: попытка %d/%d не удалась: %s", attempt, retries, e)
+            if attempt < retries:
+                time.sleep(retry_delay)
+    assert last_err is not None
+    raise last_err
 
 
 def get_desktop_path() -> Path:

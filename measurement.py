@@ -37,7 +37,10 @@ DEFAULT_AVERAGING_DELAY = 0.0
 DEFAULT_DISCARD_FIRST = True
 
 # п.9: сколько раз в сумме пытаемся снять точку, если она выходит за порог
-# погрешности, прежде чем забраковать её окончательно.
+# погрешности, прежде чем забраковать её окончательно. Это ДЕФОЛТ; число
+# перепромеров настраивается (баг-репорт п.12) — см. параметр max_attempts
+# в _measure_point_row/run_measurement (max_attempts = 1 + число доп. промеров;
+# 1 = без перепромеров вовсе, брак сразу по первому промеру вне допуска).
 MAX_MEASUREMENT_ATTEMPTS = 3
 
 # п.27: границы адаптивной задержки охлаждения (BETA) — оператор задаёт их
@@ -261,11 +264,16 @@ def _measure_point_row(dmm: DMM, src: Union[CurrentSource, VoltageSource],
                         suppress_notifications: bool = False,
                         zero_offset: float = 0.0,
                         y_sec_nom: Optional[float] = None,
+                        max_attempts: int = MAX_MEASUREMENT_ATTEMPTS,
                         ) -> Tuple[Dict, Optional[str]]:
     """
     Измеряет одну ненулевую точку плана — с поправкой на витки (п.37),
     контрольными повторами при отклонении (п.9), отсечкой по погрешности
     после них (п.7) и детектом перепутанной полярности (п.14).
+
+    max_attempts (баг-репорт п.12) — сколько раз ВСЕГО пытаемся снять точку
+    при выходе за порог, прежде чем забраковать (1 = без перепромеров: брак
+    сразу). Раньше было жёстко MAX_MEASUREMENT_ATTEMPTS=3.
 
     Реальный вход датчика — point.magnitude * turns (витки умножают
     ампервитки внутри датчика, а не ток в проводе — см. limits.py и
@@ -312,7 +320,7 @@ def _measure_point_row(dmm: DMM, src: Union[CurrentSource, VoltageSource],
     polarity_mismatch = False
     aborted_reason: Optional[str] = None
 
-    for attempt in range(1, MAX_MEASUREMENT_ATTEMPTS + 1):
+    for attempt in range(1, max_attempts + 1):
         if excitation_type == 'current':
             src.set_current(point.magnitude)
         else:
@@ -358,16 +366,17 @@ def _measure_point_row(dmm: DMM, src: Union[CurrentSource, VoltageSource],
         if error_percent is None or error_percent <= error_threshold:
             break  # в допуске — точка принята
 
-        if attempt == MAX_MEASUREMENT_ATTEMPTS:
+        if attempt == max_attempts:
+            attempts_word = "попытка" if max_attempts == 1 else "попытки подряд"
             rejected = True
             reject_reason = (
                 f"погрешность {error_percent:.2f}% > {error_threshold}% "
-                f"({MAX_MEASUREMENT_ATTEMPTS} попытки подряд)"
+                f"({max_attempts} {attempts_word})"
             )
             if stop_on_error:
                 aborted_reason = (
                     f"Погрешность {error_percent:.2f}% превысила порог {error_threshold}% "
-                    f"на X_уст = {point.x_set:+.4f} {unit} ({MAX_MEASUREMENT_ATTEMPTS} попытки подряд)"
+                    f"на X_уст = {point.x_set:+.4f} {unit} ({max_attempts} {attempts_word})"
                 )
         # иначе — попытка не последняя, продолжаем цикл (контрольный промер, п.9)
 
@@ -404,6 +413,7 @@ def _measure_point_row_ramp(dmm: DMM, src: CurrentSource, output_type: str,
                             zero_offset: float = 0.0,
                             suppress_notifications: bool = False,
                             y_sec_nom: Optional[float] = None,
+                            max_attempts: int = MAX_MEASUREMENT_ATTEMPTS,
                             ) -> Tuple[Dict, Optional[str]]:
     """
     Вариант _measure_point_row для плавного нарастания (feature, BETA,
@@ -444,7 +454,7 @@ def _measure_point_row_ramp(dmm: DMM, src: CurrentSource, output_type: str,
     polarity_mismatch = False
     aborted_reason: Optional[str] = None
 
-    for attempt in range(1, MAX_MEASUREMENT_ATTEMPTS + 1):
+    for attempt in range(1, max_attempts + 1):
         readings = _read_averaged(dmm, **averaging)
         i_avg = _average(readings)
         if readings:
@@ -464,16 +474,16 @@ def _measure_point_row_ramp(dmm: DMM, src: CurrentSource, output_type: str,
         if error_percent is None or error_percent <= error_threshold:
             break
 
-        if attempt == MAX_MEASUREMENT_ATTEMPTS:
+        if attempt == max_attempts:
             rejected = True
             reject_reason = (
                 f"погрешность {error_percent:.2f}% > {error_threshold}% "
-                f"({MAX_MEASUREMENT_ATTEMPTS} повторных отсчёта без повторного нарастания — режим BETA)"
+                f"({max_attempts} отсчёта(ов) без повторного нарастания — режим BETA)"
             )
             if stop_on_error:
                 aborted_reason = (
                     f"Погрешность {error_percent:.2f}% превысила порог {error_threshold}% "
-                    f"на X_уст = {point.x_set:+.4f} {unit} ({MAX_MEASUREMENT_ATTEMPTS} повторных отсчёта)"
+                    f"на X_уст = {point.x_set:+.4f} {unit} ({max_attempts} отсчёта(ов))"
                 )
         # иначе — не последняя попытка, переснимаем ЧТЕНИЕ (см. докстринг)
 
@@ -525,6 +535,9 @@ def run_measurement(dmm: DMM, src: Union[CurrentSource, VoltageSource], relay: O
                      smooth_ramp: bool = False,
                      ramp_duration: float = 1.0,
                      plan_override: Optional[List[SweepPoint]] = None,
+                     max_attempts: int = MAX_MEASUREMENT_ATTEMPTS,
+                     on_point_done: Optional[Callable[[int, int], None]] = None,
+                     zero_crossing_smooth: bool = False,
                      ) -> Tuple[List[Dict], Optional[str]]:
     """
     Полный цикл измерения амплитудной характеристики датчика: строит план
@@ -561,9 +574,9 @@ def run_measurement(dmm: DMM, src: Union[CurrentSource, VoltageSource], relay: O
     любого другого branch relay обязателен.
 
     smooth_ramp/ramp_duration (feature "плавное нарастание", BETA) — только
-    для excitation_type='current' и только до limits.SMOOTH_RAMP_MAX_CURRENT_A
-    включительно (enforced выше, в cli.validate_measure_params — эта
-    функция только исполняет). Заменяет обычный скачок set_current+delay на
+    для excitation_type='current'. Выше limits.SMOOTH_RAMP_WARN_CURRENT_A —
+    предупреждение (не запрет, см. limits.smooth_ramp_warning); ампераж не
+    ограничен. Заменяет обычный скачок set_current+delay на
     плавный переход по _ramp_steps (см. _measure_point_row_ramp) —
     источник остаётся включённым непрерывно между точками ОДНОЙ ветви,
     delay/cooling_delay/adaptive_cooling в этом режиме не применяются вовсе
@@ -635,10 +648,21 @@ def run_measurement(dmm: DMM, src: Union[CurrentSource, VoltageSource], relay: O
     отсечка по погрешности этим флагом НЕ управляются — они не уведомления,
     а функции безопасности/измерения (см. PLAN_V2.md, п.38).
 
+    max_attempts (баг-репорт п.12) — сколько раз ВСЕГО пытаться снять точку
+    при выходе за порог погрешности, прежде чем забраковать (1 = без
+    перепромеров, брак сразу; дефолт MAX_MEASUREMENT_ATTEMPTS). Отсечка/брак
+    работают независимо от stop_on_error: stop_on_error решает лишь, ронять ли
+    весь свип по факту брака, а сам брак (Rejected) ставится всегда, если
+    известны ratio+I_nom и точка стабильно вне допуска.
+
+    on_point_done (баг-репорт п.7) — необязательный колбэк (done, total),
+    вызывается после каждой снятой точки; GUI пересчитывает по нему остаток
+    времени по факту (с учётом перепромеров), а не по теоретической оценке.
+
     Возвращает (results, aborted_reason): aborted_reason — текст причины
-    досрочной остановки по погрешности (после MAX_MEASUREMENT_ATTEMPTS
-    подряд неудачных попыток, см. _measure_point_row), либо None, если
-    свип прошёл до конца или был прерван пользователем.
+    досрочной остановки по погрешности (после max_attempts подряд неудачных
+    попыток, см. _measure_point_row), либо None, если свип прошёл до конца или
+    был прерван пользователем.
     """
     if excitation_type == 'current':
         src.setup(voltage_limit=V_limit)
@@ -647,7 +671,9 @@ def run_measurement(dmm: DMM, src: Union[CurrentSource, VoltageSource], relay: O
     else:
         raise ValueError(f"Неизвестный тип возбуждения: {excitation_type!r} (ожидается 'current' или 'voltage')")
 
-    plan = plan_override if plan_override is not None else plan_sweep(X_start, X_stop, X_step, branch=branch, preset=preset)
+    plan = plan_override if plan_override is not None else plan_sweep(
+        X_start, X_stop, X_step, branch=branch, preset=preset,
+        zero_crossing_smooth=zero_crossing_smooth)
     averaging = dict(count=averaging_count, delay=averaging_delay, discard_first=discard_first)
     max_magnitude = max((p.magnitude for p in plan), default=0.0)
     y_sec_nom = (I_nom * turns / ratio) if (I_nom and ratio and ratio > 0) else None
@@ -699,7 +725,7 @@ def run_measurement(dmm: DMM, src: Union[CurrentSource, VoltageSource], relay: O
                     ratio, turns, averaging, stop_on_error, error_threshold,
                     is_first_of_run=run_started_fresh, log_callback=log_callback,
                     zero_offset=zero_offset, suppress_notifications=suppress_notifications,
-                    y_sec_nom=y_sec_nom,
+                    y_sec_nom=y_sec_nom, max_attempts=max_attempts,
                 )
                 run_started_fresh = False
                 ramp_from = point.magnitude
@@ -715,7 +741,7 @@ def run_measurement(dmm: DMM, src: Union[CurrentSource, VoltageSource], relay: O
                     adaptive_cooling_max_delay=adaptive_cooling_max_delay,
                     suppress_notifications=suppress_notifications,
                     zero_offset=zero_offset,
-                    y_sec_nom=y_sec_nom,
+                    y_sec_nom=y_sec_nom, max_attempts=max_attempts,
                 )
                 run_started_fresh = False
                 if point_aborted:
@@ -724,6 +750,17 @@ def run_measurement(dmm: DMM, src: Union[CurrentSource, VoltageSource], relay: O
             results.append(row)
             if results_sink is not None:
                 results_sink.append(row)
+
+            # Прогресс-хук (баг-репорт п.7): сообщаем, сколько точек плана уже
+            # снято — по факту, с учётом реально потраченного на перепромеры
+            # времени; GUI по нему пересчитывает оставшуюся оценку (не по
+            # теоретическому estimate_duration_seconds, который перепромеры не
+            # знает). Ошибка в колбэке не должна валить измерение.
+            if on_point_done is not None:
+                try:
+                    on_point_done(len(results), len(plan))
+                except Exception:
+                    pass
 
             if aborted_reason:
                 break

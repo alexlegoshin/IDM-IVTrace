@@ -1,9 +1,52 @@
+import threading
 import time
 
 import pytest
 
 from discovery import DiscoveredInstrument, DiscoveryState, DiscoveryService, scan_instruments
 from tests.conftest import FakeVisaResource, FakeResourceManager
+
+
+# ----------------------------------------------------------------------
+# pause() синхронный (баг-репорт п.2/п.4)
+# ----------------------------------------------------------------------
+
+def test_pause_blocks_until_inflight_scan_finishes():
+    """
+    pause() должен ДОЖДАТЬСЯ завершения уже идущего скана, а не просто
+    выставить флаг: иначе фоновый скан продолжает держать VISA-ресурсы, пока
+    измерение/blink уже открывают их (VI_ERROR_RSRC_BUSY).
+    """
+    svc = DiscoveryService(rm_factory=lambda: None, config_dirs={})
+    svc._scan_lock.acquire()  # имитируем идущий _do_scan, держащий лок
+    done = []
+
+    def call_pause():
+        svc.pause()
+        done.append(True)
+
+    t = threading.Thread(target=call_pause, daemon=True)
+    t.start()
+    t.join(timeout=0.3)
+    assert not done, "pause() вернулся, не дождавшись in-flight скана"
+    assert svc._paused.is_set(), "флаг паузы должен быть выставлен сразу"
+
+    svc._scan_lock.release()  # «скан» закончился
+    t.join(timeout=2.0)
+    assert done, "pause() не завершился после освобождения скан-лока"
+
+
+def test_scan_instruments_excludes_relay_port(instruments_dir):
+    """п.4: известный порт реле (ASRL-ресурс) исключается из *IDN?-опроса."""
+    relay = FakeVisaResource()  # без idn — query('*IDN?') бросил бы
+    dmm = FakeVisaResource(idn="AKIP-2101")
+    rm = FakeResourceManager({"ASRL5::INSTR": relay, "USB0::DMM::INSTR": dmm})
+    found = scan_instruments(rm, {'multimeter': instruments_dir / "multimeters_current"},
+                             exclude_relay_port="COM5")
+    addrs = {i.address for i in found}
+    assert "ASRL5::INSTR" not in addrs
+    assert "USB0::DMM::INSTR" in addrs
+    assert relay.queried == []
 
 
 # ----------------------------------------------------------------------

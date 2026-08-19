@@ -43,6 +43,9 @@ from typing import Optional
 
 import installer_core as core
 from apppaths import assets_dir, app_root, read_install_record, write_install_record
+from applog import get_logger
+
+log = get_logger(__name__)
 
 BG = "#0d1117"  # тон баннера — без белой рамки по краям окна
 FG = "#e6e6e6"
@@ -143,6 +146,7 @@ class Installer:
             # файлов при копировании) перехвачены по месту и тихие/с
             # понятным сообщением — сюда долетает только то, что мы не
             # предвидели, и молчать об этом было бы хуже, чем показать.
+            log.exception("Непредвиденный сбой установщика")
             self._show_error("Ошибка установки", str(e))
         finally:
             self.events.put(("finish", (), None, None))
@@ -154,28 +158,46 @@ class Installer:
 
     def _do_auto_update(self):
         self._status("Обновление…")
+        log.info("Авто-обновление: старт")
         record = read_install_record()
         if not record or not record.get("install_root"):
+            log.error("Авто-обновление: нет записи об установке (install_info.json)")
             self._show_error("Обновление", "Не найдена информация о текущей установке.")
             return
-        self._install_into(Path(record["install_root"]), lookup_release_date=True)
-        self._status("Готово")
+        target = Path(record["install_root"])
+        installed = self._install_into(target, lookup_release_date=True)
+        if not installed:
+            # _install_into уже показал ошибку и записал её в лог; не
+            # запускаем приложение — установка не состоялась.
+            return
+        # Баг-репорт (главный симптом «обновление не срабатывает»): после
+        # доустановки СТАРЫЙ код просто закрывался, ничего не запуская — со
+        # стороны это «мигнуло и ничего». Теперь запускаем обновлённое
+        # приложение и явно сообщаем об успехе.
+        self._status("Обновлено, запускаю…")
+        log.info("Авто-обновление: успешно, запускаю %s", target / "IVTrace.exe")
+        self._launch(target)
 
     def _do_interactive(self):
         record = read_install_record()
         target = Path(record["install_root"]) if record and record.get("install_root") else None
         if target is None or not target.is_dir():
+            log.info("Интерактив: валидной установки нет -> первичная установка")
             self._fresh_install()
             return
 
         self._status("Проверка обновлений…")
+        log.info("Интерактив: установка в %s, tag=%s; проверяю обновления",
+                 target, (record or {}).get("tag"))
         try:
             releases = core.fetch_releases()
             latest = core.select_latest_release(releases)
-        except Exception:
+        except Exception as e:
             # Нет интернета/GitHub недоступен — тихо, без единого
             # уведомления (явное требование): просто запускаем то, что уже
-            # установлено.
+            # установлено. В лог пишем (это не показ оператору) — чтобы при
+            # разборе было видно, что проверка не прошла именно из-за сети.
+            log.info("Проверка обновлений не удалась (%s) — тихо запускаю установленную версию", e)
             self._launch(target)
             return
 
@@ -184,6 +206,8 @@ class Installer:
             record.get("tag", ""), record.get("release_date"),
         ):
             self._status("Обновление доступно")
+            log.info("Найдено обновление: %s (установлено %s)",
+                     latest.get("tag_name"), record.get("tag"))
             yes = self._ask_yes_no(
                 "Обновление IVTrace",
                 f"Доступна новая версия {latest.get('tag_name')} "
@@ -192,9 +216,11 @@ class Installer:
             if yes:
                 self._download_and_relaunch_update(latest, target)
             else:
+                log.info("Обновление отклонено — запускаю установленную версию")
                 self._launch(target)
             return
 
+        log.info("Обновлений нет (установлено самое новое) — предлагаю переустановку")
         self._offer_reinstall(target, record)
 
     def _offer_reinstall(self, target: Path, record: dict):
@@ -202,37 +228,46 @@ class Installer:
             "IVTrace уже установлена",
             f"Уже установлена версия {record.get('tag', '?')} в {target}.\nПереустановить?",
         )
-        if yes:
-            self._install_into(target, lookup_release_date=True)
-            self._status("Готово")
-        else:
+        if not yes:
+            log.info("Переустановка отклонена — запускаю установленную версию")
+            self._launch(target)
+            return
+        if self._install_into(target, lookup_release_date=True):
+            self._status("Готово, запускаю…")
             self._launch(target)
 
     def _fresh_install(self):
         self._status("Выбор папки установки…")
         base = self._ask_directory(str(Path.home()))
         if not base:
+            log.info("Установка отменена: папка не выбрана")
             self._status("Установка отменена")
             return
         target = Path(base) / "Legoshi" / "IVTrace"
+        log.info("Первичная установка в %s", target)
         # Полностью офлайн: без обращения к GitHub, дата релиза неизвестна.
-        self._install_into(target, lookup_release_date=False)
-        self._status("Готово")
+        if self._install_into(target, lookup_release_date=False):
+            self._status("Установлено, запускаю…")
+            self._launch(target)
 
-    def _install_into(self, target: Path, lookup_release_date: bool):
+    def _install_into(self, target: Path, lookup_release_date: bool) -> bool:
+        """Копирует новую версию в target и ставит ярлыки. True — успех."""
         self._status("Копирование файлов…")
+        log.info("Установка в %s (payload: %s)", target, self._payload_dir())
         try:
             core.copy_payload(self._payload_dir(), target)
         except OSError as e:
+            log.exception("Копирование файлов не удалось")
             self._show_error(
                 "Не удалось скопировать файлы",
                 f"Закройте IVTrace, если она запущена, и запустите установку снова.\n\n{e}",
             )
-            return
+            return False
 
         tag = core.own_build_tag() or "dev"
         release_date = self._lookup_own_release_date(tag) if lookup_release_date else None
         write_install_record(target, tag=tag, release_date=release_date)
+        log.info("Запись об установке обновлена: tag=%s, release_date=%s", tag, release_date)
 
         self._status("Создание ярлыков…")
         exe = target / "IVTrace.exe"
@@ -243,13 +278,14 @@ class Installer:
         try:
             core.create_shortcut(exe, desktop / "IVTrace.lnk")
         except Exception:
-            pass  # ярлык — удобство, не критично для самой установки
+            log.warning("Ярлык на рабочем столе не создан", exc_info=True)  # удобство, не критично
         try:
             start_menu = (Path.home() / "AppData" / "Roaming" / "Microsoft" /
                           "Windows" / "Start Menu" / "Programs")
             core.create_shortcut(exe, start_menu / "IVTrace.lnk")
         except Exception:
-            pass  # ярлык — удобство, не критично для самой установки
+            log.warning("Ярлык в меню Пуск не создан", exc_info=True)  # удобство, не критично
+        return True
 
     def _lookup_own_release_date(self, tag: str) -> Optional[str]:
         """
@@ -271,35 +307,49 @@ class Installer:
     def _download_and_relaunch_update(self, release: dict, target: Path):
         asset = core.pick_windows_asset(release)
         if asset is None:
+            log.warning("У релиза %s нет Windows-ассета — запускаю установленную версию",
+                        release.get("tag_name"))
             self._launch(target)
             return
         self._status("Скачивание обновления…")
         tmp_dir = Path(tempfile.mkdtemp(prefix="ivtrace_update_"))
         zip_path = tmp_dir / asset["name"]
+        log.info("Скачиваю обновление: %s -> %s", asset.get("browser_download_url"), zip_path)
         try:
             urllib.request.urlretrieve(asset["browser_download_url"], zip_path)
             self._status("Распаковка…")
             with zipfile.ZipFile(zip_path) as zf:
+                names = zf.namelist()
+                log.info("Скачано %d байт; в архиве записей: %d (корень: %s)",
+                         zip_path.stat().st_size, len(names),
+                         ", ".join(sorted({n.split('/')[0].split(chr(92))[0] for n in names})[:6]))
                 zf.extractall(tmp_dir)
         except Exception:
             # Скачивание/распаковка сорвались — тот же тихий фолбэк, что и
             # при недоступной проверке обновлений.
+            log.exception("Скачивание/распаковка обновления сорвались — запускаю установленную версию")
             self._launch(target)
             return
 
         new_setup = tmp_dir / "Setup.exe"
         if not new_setup.exists():
+            log.error("В распакованном обновлении нет Setup.exe (%s) — запускаю установленную версию", tmp_dir)
             self._launch(target)
             return
 
         # Popen, не wait(): сами закрываемся немедленно (см. finally в
-        # _worker), не держим ничего занятым для новой установки.
+        # _worker), не держим ничего занятым для новой установки. Новый
+        # Setup.exe --auto-update доустановит в install_root и запустит приложение.
+        log.info("Запускаю новый установщик: %s --auto-update", new_setup)
         subprocess.Popen([str(new_setup), "--auto-update"])
 
     def _launch(self, target: Path):
         exe = target / "IVTrace.exe"
         if exe.exists():
+            log.info("Запускаю IVTrace: %s", exe)
             subprocess.Popen([str(exe)], cwd=str(target))
+        else:
+            log.error("Не удалось запустить IVTrace — нет %s", exe)
 
 
 def main(argv=None) -> int:
@@ -310,6 +360,10 @@ def main(argv=None) -> int:
              "(так запускает себя новая версия после согласия пользователя на обновление).",
     )
     args = parser.parse_args(argv)
+
+    from applog import setup_logging, get_logger
+    setup_logging("installer")
+    get_logger(__name__).info("Setup.exe старт: auto_update=%s", args.auto_update)
 
     root = tk.Tk()
     Installer(root, auto_update=args.auto_update)

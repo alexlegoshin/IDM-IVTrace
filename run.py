@@ -536,6 +536,13 @@ def main(argv=None) -> int:
     parser = build_parser(default_data_dir=work_dir())
     args = parser.parse_args(argv)
 
+    # Файловое логирование (п.15) — поднимаем до любой работы с железом/файлами,
+    # чтобы в лог попал и сам старт. component — по подкоманде (gui/measure/...),
+    # чтобы в общем файле было видно, что именно запускалось.
+    from applog import setup_logging, get_logger
+    setup_logging(args.command or "gui")
+    get_logger(__name__).info("CLI/GUI старт: команда=%s", args.command or "gui")
+
     # Без подкоманды или с 'gui' — запускаем графический интерфейс.
     if args.command is None or args.command == "gui":
         return cmd_gui(args)

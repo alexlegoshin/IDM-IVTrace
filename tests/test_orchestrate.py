@@ -216,9 +216,13 @@ class _FakeInstrument:
     def __init__(self, *args, **kwargs):
         self.config = {'model_name': 'Fake', 'model_id': 'fake'}
         self.current_range_idx = 0
+        self.went_local = False
 
     def setup(self, **kwargs):
         pass
+
+    def go_local(self):
+        self.went_local = True
 
     def set_current(self, value):
         pass
@@ -282,6 +286,98 @@ def test_no_relay_branch_never_discovers_or_constructs_relay(tmp_path, monkeypat
 
     assert relay_touch_log == []  # ни discover_relay_port, ни RelayController() не вызывались
     assert len(df) == 3  # 0, 1, 2
+
+
+def test_aborted_reason_from_run_measurement_reaches_csv(tmp_path, monkeypatch):
+    """
+    A1 (найдено при аудите): раньше возврат run_measurement() игнорировался,
+    и причина досрочной остановки по погрешности не попадала в шапку CSV.
+    Теперь run_measurement_session должен её принять и записать.
+    """
+    _set_registry(monkeypatch, [])
+    monkeypatch.setattr(orchestrate, 'Multimeter', _FakeInstrument)
+    monkeypatch.setattr(orchestrate, 'CurrentSource', _FakeInstrument)
+
+    reason = "Погрешность 5.00% превысила порог 1% на X_уст = +2.0000 A"
+
+    def fake_run_measurement(*args, results_sink=None, **kwargs):
+        if results_sink is not None:
+            results_sink.append({'Timestamp': 't', 'Branch': 'zero', 'X_set': 0.0,
+                                 'X_real': 0.0, 'Y_meas': 0.0, 'Y_unit': 'A',
+                                 'Rejected': False, 'RejectReason': '', 'PolarityMismatch': False})
+        return [], reason
+
+    monkeypatch.setattr(orchestrate, 'run_measurement', fake_run_measurement)
+
+    rm = FakeResourceManager({"DMM": FakeVisaResource(idn="AKIP-2101"),
+                              "SRC": FakeVisaResource(idn="ITECH IT-M3130")})
+    csv_path = tmp_path / "IVtrace_abort_20260101_000000.csv"
+    params = {
+        'excitation_type': 'current', 'output_type': 'current',
+        'X_start': 0.0, 'X_stop': 2.0, 'X_step': 1.0,
+        'V_limit': 5.0, 'I_limit': None, 'delay': 0, 'cooling_delay': 0,
+        'branch': 'no_relay', 'label': 'AbortTest', 'suppress_notifications': True,
+    }
+    run_measurement_session(rm, params, csv_path, dmm_addr="DMM", src_addr="SRC")
+
+    header = csv_path.read_text(encoding='utf-8')
+    assert "прервано досрочно" in header.lower()
+    assert reason in header
+
+
+def test_instruments_go_local_after_cycle(tmp_path, monkeypatch):
+    """п.8: после цикла dmm/src возвращаются в местное управление (go_local)."""
+    _set_registry(monkeypatch, [])
+    created = []
+
+    class _Tracked(_FakeInstrument):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            created.append(self)
+
+    monkeypatch.setattr(orchestrate, 'Multimeter', _Tracked)
+    monkeypatch.setattr(orchestrate, 'CurrentSource', _Tracked)
+
+    rm = FakeResourceManager({"DMM": FakeVisaResource(idn="AKIP-2101"),
+                              "SRC": FakeVisaResource(idn="ITECH IT-M3130")})
+    csv_path = tmp_path / "IVtrace_local_20260101_000000.csv"
+    params = {
+        'excitation_type': 'current', 'output_type': 'current',
+        'X_start': 0.0, 'X_stop': 1.0, 'X_step': 1.0,
+        'V_limit': 5.0, 'I_limit': None, 'delay': 0, 'cooling_delay': 0,
+        'branch': 'no_relay', 'label': 'LocalTest', 'suppress_notifications': True,
+    }
+    run_measurement_session(rm, params, csv_path, dmm_addr="DMM", src_addr="SRC")
+
+    assert created and all(inst.went_local for inst in created)
+
+
+def test_restore_local_can_be_disabled(tmp_path, monkeypatch):
+    """restore_local=False (задел под UI-галочку п.8) — go_local НЕ вызывается."""
+    _set_registry(monkeypatch, [])
+    created = []
+
+    class _Tracked(_FakeInstrument):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            created.append(self)
+
+    monkeypatch.setattr(orchestrate, 'Multimeter', _Tracked)
+    monkeypatch.setattr(orchestrate, 'CurrentSource', _Tracked)
+
+    rm = FakeResourceManager({"DMM": FakeVisaResource(idn="AKIP-2101"),
+                              "SRC": FakeVisaResource(idn="ITECH IT-M3130")})
+    csv_path = tmp_path / "IVtrace_nolocal_20260101_000000.csv"
+    params = {
+        'excitation_type': 'current', 'output_type': 'current',
+        'X_start': 0.0, 'X_stop': 1.0, 'X_step': 1.0,
+        'V_limit': 5.0, 'I_limit': None, 'delay': 0, 'cooling_delay': 0,
+        'branch': 'no_relay', 'label': 'NoLocalTest', 'suppress_notifications': True,
+        'restore_local': False,
+    }
+    run_measurement_session(rm, params, csv_path, dmm_addr="DMM", src_addr="SRC")
+
+    assert created and not any(inst.went_local for inst in created)
 
 
 def test_custom_program_plan_overrides_x_start_stop_step(tmp_path, monkeypatch):

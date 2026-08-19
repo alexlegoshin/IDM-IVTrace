@@ -212,6 +212,34 @@ def test_full_cycle_shape_is_symmetric_positive_then_negative():
     assert values == [0, 25, 50, 75, 100, 75, 50, 25, 0, -25, -50, -75, -100, -75, -50, -25, 0]
 
 
+def test_zero_crossing_smooth_densifies_near_zero_in_full_cycle():
+    """
+    п.18: плавный проход нуля добавляет мелкие подшаги у нуля в FULL_CYCLE,
+    оставляя обычный шаг вдали от нуля и по-прежнему проходя ноль трижды.
+    """
+    plain = plan_sweep(0, 100, 25, preset=DirectionPreset.FULL_CYCLE)
+    smooth = plan_sweep(0, 100, 25, preset=DirectionPreset.FULL_CYCLE,
+                        zero_crossing_smooth=True)
+    smooth_vals = xs(smooth)
+    # точек стало больше (сгущение у нуля)
+    assert len(smooth) > len(plain)
+    # ноль всё так же встречается три раза (остановка в нуле сохранена)
+    assert smooth_vals.count(0.0) == 3
+    # у нуля появились подшаги мельче обычного шага 25 (зона = 25, 4 подшага -> 6.25)
+    near_zero = sorted({abs(v) for v in smooth_vals if 0 < abs(v) < 25})
+    assert near_zero and min(near_zero) < 25
+    # крайняя точка ±100 по-прежнему берётся точно
+    assert 100.0 in smooth_vals and -100.0 in smooth_vals
+
+
+def test_zero_crossing_smooth_ignored_for_non_full_cycle():
+    """Флаг влияет только на FULL_CYCLE — у DIVERGING план не меняется."""
+    plain = plan_sweep(0, 100, 25, preset=DirectionPreset.DIVERGING)
+    smooth = plan_sweep(0, 100, 25, preset=DirectionPreset.DIVERGING,
+                        zero_crossing_smooth=True)
+    assert xs(plain) == xs(smooth)
+
+
 def test_preset_choreography_ignores_raw_direction_when_anchored():
     # И "0->10", и "10->0" под одним пресетом дают одну и ту же
     # хореографию — пресет сам решает направление внутри и порядок ветвей.

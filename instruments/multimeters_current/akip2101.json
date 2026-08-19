@@ -4,6 +4,8 @@
     "keywords": ["AKIP-2101", "SIGLENT"],
     "timeout": 5000,
     "encoding": "utf-8",
+    "local_command": "SYST:LOC",
+    "local_notes": "local_command (п.8) — возврат из REMOTE в местное управление после цикла. 'SYSTem:LOCal' — стандартная SCPI/IEEE-488.2 команда; на реальном Siglent SDM не проверялась. Неизвестная прибору команда безвредна (write не поднимает ошибку).",
     "init_commands": [
         "*RST",
         "SENS:FUNC \"CURR:DC\"",

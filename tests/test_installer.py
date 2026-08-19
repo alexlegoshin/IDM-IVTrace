@@ -169,11 +169,51 @@ def test_install_into_shows_error_and_stops_on_copy_failure(monkeypatch, tmp_pat
     errors = []
     monkeypatch.setattr(inst, "_show_error", lambda title, text: errors.append((title, text)))
 
-    inst._install_into(tmp_path / "install", lookup_release_date=False)
+    result = inst._install_into(tmp_path / "install", lookup_release_date=False)
 
+    assert result is False  # сигнал вызывающему: установка не состоялась
     assert len(errors) == 1
     assert "закройте" in errors[0][1].lower()
     assert write_calls == []  # не пишем запись об установке, которая не удалась
+
+
+def test_do_auto_update_launches_app_after_successful_install(monkeypatch, tmp_path):
+    """
+    Баг-репорт (главный симптом «обновление не срабатывает»): после
+    доустановки СТАРЫЙ код закрывался, ничего не запуская. Теперь
+    _do_auto_update при успехе ДОЛЖЕН запустить приложение.
+    """
+    inst = _bare_installer()
+    inst.auto_update = True
+    target = tmp_path / "install"
+    monkeypatch.setattr(installer, "read_install_record",
+                        lambda: {"install_root": str(target), "tag": "v2.0"})
+    install_calls = []
+    monkeypatch.setattr(inst, "_install_into",
+                        lambda t, lookup_release_date: install_calls.append(t) or True)
+    launched = []
+    monkeypatch.setattr(inst, "_launch", lambda t: launched.append(t))
+
+    inst._do_auto_update()
+
+    assert install_calls == [target]
+    assert launched == [target]  # приложение запущено после установки
+
+
+def test_do_auto_update_does_not_launch_when_install_fails(monkeypatch, tmp_path):
+    """Если доустановка не удалась — приложение НЕ запускаем (не выдаём сбой за успех)."""
+    inst = _bare_installer()
+    inst.auto_update = True
+    target = tmp_path / "install"
+    monkeypatch.setattr(installer, "read_install_record",
+                        lambda: {"install_root": str(target), "tag": "v2.0"})
+    monkeypatch.setattr(inst, "_install_into", lambda t, lookup_release_date: False)
+    launched = []
+    monkeypatch.setattr(inst, "_launch", lambda t: launched.append(t))
+
+    inst._do_auto_update()
+
+    assert launched == []
 
 
 def test_lookup_own_release_date_finds_matching_tag(monkeypatch):

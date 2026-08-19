@@ -3,9 +3,13 @@ import math
 import re
 import time
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional, Set, Tuple
 
 import pyvisa
+
+from applog import get_logger
+
+log = get_logger(__name__)
 
 # Некоторые приборы (GW Instek GPP-серия — VOUT1?/IOUT1?) отвечают на
 # измерительные запросы с суффиксом единиц ("00.000V", "0.0000A"), а не
@@ -183,6 +187,9 @@ class Multimeter:
                 self.current_range_idx -= 1
                 self.set_range(self.ranges[self.current_range_idx])
 
+    def go_local(self):
+        _go_local(self.instr, self.config)
+
     def close(self):
         try:
             self.instr.close()
@@ -225,6 +232,9 @@ class CurrentSource:
     def shutdown(self):
         self.set_current(0)
         self.output_off()
+
+    def go_local(self):
+        _go_local(self.instr, self.config)
 
     def close(self):
         try:
@@ -334,11 +344,66 @@ class VoltageSource:
         self.set_voltage(0)
         self.output_off()
 
+    def go_local(self):
+        _go_local(self.instr, self.config)
+
     def close(self):
         try:
             self.instr.close()
         except Exception:
             pass
+
+
+def _go_local(instr, config: dict) -> bool:
+    """
+    Возврат прибора в местное управление (feature, п.8): после SCPI-обмена
+    прибор остаётся в режиме REMOTE (передняя панель заблокирована), и
+    оператор не может пользоваться им руками, пока не выключит-включит.
+
+    Команда берётся из необязательного поля `local_command` конфига
+    (АКИП/RIGOL — 'SYST:LOC'; у GW Instek — по мануалу, помечено «не
+    проверено на реальном приборе»). Нет поля — прибор ничего такого не
+    умеет/не настроено, тихо пропускаем. Любая ошибка отправки — не критична
+    (сессия могла быть уже закрыта аварийным остановом): логируем и молчим,
+    возврат в Local — удобство, а не функция безопасности.
+
+    Возвращает True, если команда реально отправлена.
+    """
+    cmd = config.get('local_command')
+    if not cmd:
+        return False
+    try:
+        instr.write(cmd)
+        return True
+    except Exception as e:
+        log.debug("go_local: не удалось отправить %r: %s", cmd, e)
+        return False
+
+
+def relay_visa_address_match(visa_addr: str, relay_port: Optional[str]) -> bool:
+    """
+    True, если VISA-ресурс `visa_addr` — это, скорее всего, тот же
+    физический serial-порт, что и плата реле `relay_port`.
+
+    Зачем (п.4): плата реле после установки CP210x видна NI-VISA как ASRL-
+    ресурс, и полный автопоиск (discover_instruments/scan_instruments) шлёт
+    ей `*IDN?` — лишний таймаут и сброс платы (открытие порта дёргает DTR).
+    Исключаем её из VISA-опроса. Источник напряжения GW Instek — тоже ASRL,
+    поэтому нельзя резать все ASRL; сопоставляем именно с известным портом
+    реле, консервативно: при малейшем сомнении НЕ исключаем (probing вернётся).
+
+    Сопоставление best-effort: `COM3` (pyserial) ↔ `ASRL3::INSTR` (NI-VISA на
+    Windows) — по числу; `/dev/ttyUSB0` — по вхождению подстроки.
+    """
+    if not relay_port:
+        return False
+    a = visa_addr.upper()
+    rp = relay_port.upper()
+    if rp in a:  # '/dev/ttyUSB0' как подстрока ASRL-адреса, либо 'COM3' в 'ASRLCOM3'
+        return True
+    m_com = re.search(r'COM(\d+)', rp)
+    m_asrl = re.search(r'ASRL(\d+)', a)
+    return bool(m_com and m_asrl and m_com.group(1) == m_asrl.group(1))
 
 
 def find_config_for_idn(idn: str, config_dir: Path) -> Optional[Path]:
@@ -386,17 +451,26 @@ def discover_instruments(
     rm: Optional[pyvisa.ResourceManager] = None,
     query_timeout: int = 3000,
     source_label: str = "источник",
+    exclude_relay_port: Optional[str] = None,
 ) -> Tuple[str, Path, str, Path]:
     """
     Перебирает все доступные VISA-ресурсы, опрашивает *IDN? и сопоставляет
     каждый ответ с json-конфигами мультиметров и источников (тип источника —
     ток или напряжение — определяется тем, какая source_dir передана).
 
+    exclude_relay_port (п.4) — serial-порт платы реле (COM.../tty...), если
+    он известен: соответствующий ему ASRL-ресурс НЕ опрашивается `*IDN?`
+    (плата не отвечает на SCPI, а открытие её порта — лишний таймаут и сброс,
+    см. relay_visa_address_match). None — опрашиваем всё (реле не найдено/не
+    задано).
+
     Возвращает (dmm_addr, dmm_config_path, src_addr, src_config_path).
     Бросает RuntimeError, если один из приборов не найден.
     """
     rm = rm or pyvisa.ResourceManager()
     resources = rm.list_resources()
+    log.info("Автопоиск приборов: VISA-ресурсов видно %d%s", len(resources),
+             f", порт реле исключён: {exclude_relay_port}" if exclude_relay_port else "")
 
     if len(resources) == 0:
         raise RuntimeError("Не найдено ни одного VISA-ресурса. Проверьте подключение и драйверы NI-VISA.")
@@ -406,12 +480,17 @@ def discover_instruments(
 
     print("Поиск приборов...")
     for res in resources:
+        if relay_visa_address_match(res, exclude_relay_port):
+            log.debug("  %s — пропущен (порт платы реле, *IDN? не шлём)", res)
+            print(f"  {res}  ->  пропущен (плата реле)")
+            continue
         try:
             instr = rm.open_resource(res)
             instr.encoding = 'utf-8'
             instr.timeout = query_timeout
             idn = instr.query('*IDN?').strip()
             print(f"  {res}  ->  {idn}")
+            log.debug("  %s -> %s", res, idn)
 
             if dmm_addr is None:
                 cfg = find_config_for_idn(idn, multimeter_dir)
@@ -426,6 +505,7 @@ def discover_instruments(
             instr.close()
         except Exception as e:
             print(f"  {res}  ->  Ошибка при опросе: {e}")
+            log.debug("  %s -> ошибка опроса: %s", res, e)
 
     if not dmm_addr or not src_addr:
         missing = []
@@ -433,10 +513,13 @@ def discover_instruments(
             missing.append("мультиметр")
         if not src_addr:
             missing.append(source_label)
+        log.warning("Автопоиск не нашёл: %s (ресурсов было %d)", ", ".join(missing), len(resources))
         raise RuntimeError(
             f"Не удалось обнаружить: {', '.join(missing)}. Проверьте список ресурсов выше и json-конфиги."
         )
 
+    log.info("Автопоиск: мультиметр %s (%s), %s %s (%s)",
+             dmm_addr, dmm_cfg.stem, source_label, src_addr, src_cfg.stem)
     print(f"\nМультиметр: {dmm_addr}  ({dmm_cfg.stem})")
     print(f"{source_label.capitalize()}: {src_addr}  ({src_cfg.stem})\n")
 

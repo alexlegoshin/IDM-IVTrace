@@ -24,6 +24,14 @@ jobs:
         with:
           python-version: "3.11"
 
+      # Фиксируем в логе сборки РЕАЛЬНУЮ версию Python и путь: в артефактах
+      # v2.0/patch1 попадался mypyc-модуль с тегом cp313 при заявленном 3.11 —
+      # эта строка позволит при следующем билде убедиться, на чём он собран.
+      - name: Report Python version
+        run: |
+          python --version
+          python -c "import sys; print(sys.executable)"
+
       - name: Install dependencies
         run: pip install -r requirements-dev.txt
 

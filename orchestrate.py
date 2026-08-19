@@ -25,10 +25,17 @@ from measurement import (
     run_measurement, EXCITATION_UNITS, OUTPUT_UNITS,
     DEFAULT_AVERAGING_COUNT, DEFAULT_AVERAGING_DELAY, DEFAULT_DISCARD_FIRST,
     DEFAULT_ADAPTIVE_COOLING_MIN_DELAY, DEFAULT_ADAPTIVE_COOLING_MAX_DELAY,
+    MAX_MEASUREMENT_ATTEMPTS,
 )
 from sweep import Branch, DirectionPreset, plan_custom_sweep
 from safety import emergency_shutdown
 from calibration import CalibrationStatus, resolve_calibration_info
+from applog import get_logger
+
+# Файловый логгер (applog). Назван _flog, а не log, потому что в этом модуле
+# `log` — это параметр-колбэк вывода для оператора (LogFn, по умолчанию print);
+# путать их нельзя.
+_flog = get_logger(__name__)
 
 
 LogFn = Callable[[str], None]
@@ -72,12 +79,20 @@ class SessionHandle:
 
 def _resolve_instruments(rm, excitation_type: str, dmm_addr: Optional[str],
                          src_addr: Optional[str], source_cfg_dir: Path,
-                         source_label: str, log: LogFn, dmm_cfg_dir: Path):
+                         source_label: str, log_fn: LogFn, dmm_cfg_dir: Path,
+                         relay_port: Optional[str] = None):
     """
     Возвращает (dmm_addr, dmm_cfg, src_addr, src_cfg).
 
     Если оба адреса заданы вручную — опрашивает *IDN? по каждому, чтобы
     подобрать json-конфиг. Иначе запускает полное автообнаружение.
+
+    relay_port (п.4) — известный порт платы реле (обычно при ручном вводе):
+    передаётся в discover_instruments, чтобы её ASRL-ресурс не опрашивался
+    `*IDN?` (плата на SCPI не отвечает, открытие её порта — лишний таймаут и
+    сброс). При автопоиске порта реле (relay_port is None на этом этапе)
+    исключение не применяется — главный конфликт автопоиска (гонка с фоновым
+    сервисом) снят синхронным discovery.pause(), см. discovery.py.
 
     dmm_cfg_dir — каталог конфигов мультиметра в НУЖНОЙ роли: multimeters_current/
     (амперметр) или multimeters_voltage/ (вольтметр) — выбирается вызывающей
@@ -86,7 +101,7 @@ def _resolve_instruments(rm, excitation_type: str, dmm_addr: Optional[str],
     участвовали в автообнаружении вовсе).
     """
     if dmm_addr and src_addr:
-        log("Открываю приборы по заданным адресам, определяю модели по *IDN?...")
+        log_fn("Открываю приборы по заданным адресам, определяю модели по *IDN?...")
 
         dmm_instr = rm.open_resource(dmm_addr)
         dmm_instr.encoding = 'utf-8'
@@ -110,6 +125,7 @@ def _resolve_instruments(rm, excitation_type: str, dmm_addr: Optional[str],
     # в GUI это перехватывается редиректом stdout — см. gui.py).
     return discover_instruments(
         dmm_cfg_dir, source_cfg_dir, rm=rm, source_label=source_label,
+        exclude_relay_port=relay_port,
     )
 
 
@@ -221,6 +237,9 @@ def write_results_csv(csv_path: Path, df: pd.DataFrame, params: dict,
                 preset = params.get('preset', DirectionPreset.DIVERGING.value)
                 if preset != DirectionPreset.DIVERGING.value:
                     f.write(f"# Схема прохода: {preset}\n")
+                if preset == DirectionPreset.FULL_CYCLE.value and params.get('zero_crossing_smooth'):
+                    f.write("# Плавный проход нуля: у нуля ток менялся мелким подшагом "
+                            "(п.18), без резкого скачка\n")
             elif branch == Branch.NO_RELAY.value:
                 f.write("# Снята одна полярность без платы реле (режим \"No Relay\") — "
                         "коммутация не использовалась вовсе (см. колонку Branch)\n")
@@ -259,6 +278,7 @@ def run_measurement_session(
     log: LogFn = print,
     should_stop: StopFn = None,
     on_session_open: Optional[Callable[['SessionHandle'], None]] = None,
+    on_point_done: Optional[Callable[[int, int], None]] = None,
 ) -> pd.DataFrame:
     """
     Полный цикл: подобрать/открыть приборы и реле, снять обе ветви (или одну, если params['branch'] != 'both'),
@@ -286,8 +306,11 @@ def run_measurement_session(
     # выбора (см. measurement.run_measurement, output_type).
     dmm_cfg_dir = multimeter_cfg_dir() if output_type == 'current' else voltmeter_cfg_dir()
 
+    # relay_port на этом этапе — только ЗАДАННЫЙ вручную (автопоиск порта реле
+    # ниже); передаём его, чтобы discover_instruments не слал `*IDN?` в плату.
     dmm_addr, dmm_cfg, src_addr, src_cfg = _resolve_instruments(
         rm, excitation_type, dmm_addr, src_addr, source_cfg_dir, source_label, log, dmm_cfg_dir,
+        relay_port=relay_port,
     )
 
     branch = Branch(params.get('branch', Branch.BOTH.value))
@@ -341,8 +364,15 @@ def run_measurement_session(
     # эти четыре параметра (см. measurement.run_measurement, docstring).
     custom_program = params.get('custom_program')
     plan_override = plan_custom_sweep(custom_program) if custom_program else None
+    # Число перепромеров при подозрении на брак (баг-репорт п.12): в params —
+    # recheck_count (число ДОПОЛНИТЕЛЬНЫХ промеров, 0 = без перепромеров);
+    # max_attempts = 1 + recheck_count. Без ключа — прежнее поведение (дефолт).
+    recheck_count = params.get('recheck_count', MAX_MEASUREMENT_ATTEMPTS - 1)
+    max_attempts = max(1, 1 + int(recheck_count))
+    _flog.info("Старт измерения: датчик=%r, возбуждение=%s, выход=%s, branch=%s, попыток на точку=%d",
+               params.get('label'), excitation_type, output_type, branch.value, max_attempts)
     try:
-        run_measurement(
+        _, run_aborted = run_measurement(
             dmm, src, relay, excitation_type,
             X_start=params.get('X_start') or 0.0, X_stop=params.get('X_stop') or 0.0,
             X_step=params.get('X_step') or 1.0,
@@ -374,22 +404,42 @@ def run_measurement_session(
             smooth_ramp=params.get('smooth_ramp', False),
             ramp_duration=params.get('ramp_duration') or 1.0,
             plan_override=plan_override,
+            max_attempts=max_attempts,
+            on_point_done=on_point_done,
+            zero_crossing_smooth=params.get('zero_crossing_smooth', False),
         )
-        # Возвращаемый список намеренно игнорируется: его содержимое
-        # совпадает с накопителем, а накопитель переживает аварийный останов.
+        # Точки берём из накопителя (results_sink) — он переживает аварийный
+        # останов; а вот aborted_reason возвращается ТОЛЬКО из штатного выхода
+        # run_measurement (досрочная остановка по погрешности, stop_on_error).
+        # Баг-репорт: раньше возврат игнорировался целиком, aborted_reason
+        # оставался None, и причина досрочной остановки не попадала ни в шапку
+        # CSV, ни в финальный лог (ветка elif была мёртвой).
+        if run_aborted:
+            aborted_reason = run_aborted
     except Exception:
         # Аварийный останов закрывает сессии из другого потока, поэтому
         # падение цикла здесь — ожидаемое следствие нажатия «Стоп», а не
         # сбой. Всё, что успели снять, лежит в results и будет записано.
         if not handle.stopped:
+            _flog.exception("Измерение упало (не аварийный останов)")
             raise
     finally:
         # По одному в try: аварийный останов мог уже закрыть часть сессий,
         # и падение на первой не должно оставить остальные открытыми.
         # relay может быть None в режиме "No Relay" — там нет сессии для закрытия.
+        # Перед закрытием — возврат SCPI-приборов в местное управление (п.8),
+        # чтобы после цикла оператор мог пользоваться передней панелью, не
+        # передёргивая питание. Только dmm/src (у реле нет SCPI-режима REMOTE);
+        # best-effort, аварийный останов мог уже закрыть сессию.
+        restore_local = params.get('restore_local', True)
         for instrument in (dmm, src, relay):
             if instrument is None:
                 continue
+            if restore_local and instrument is not relay:
+                try:
+                    instrument.go_local()
+                except Exception:
+                    pass
             try:
                 instrument.close()
             except Exception:
@@ -397,8 +447,10 @@ def run_measurement_session(
 
     if handle.stopped:
         log("Измерение прервано аварийным остановом: стенд обесточен.")
+        _flog.warning("Измерение прервано аварийным остановом")
     elif aborted_reason:
         log(f"Измерение прервано досрочно: {aborted_reason}")
+        _flog.warning("Измерение прервано досрочно: %s", aborted_reason)
     else:
         log("Измерения завершены, источник и реле выключены.")
 
@@ -406,6 +458,7 @@ def run_measurement_session(
     write_results_csv(csv_path, df, params, excitation_type, unit, aborted_reason,
                       instrument_configs=[dmm.config, src.config])
     log(f"Данные сохранены в {csv_path}")
+    _flog.info("Измерение завершено: точек %d, файл %s", len(df), csv_path)
 
     return df
 
@@ -500,6 +553,15 @@ class ManualControlSession:
         return self.handle.emergency_stop(log)
 
     def close(self) -> None:
+        # Возврат SCPI-приборов в местное управление (п.8) перед закрытием —
+        # чтобы после ручного режима передняя панель снова работала; у реле
+        # SCPI-режима REMOTE нет, его пропускаем.
+        for instrument in (self.handle.dmm, self.handle.src):
+            if instrument is not None:
+                try:
+                    instrument.go_local()
+                except Exception:
+                    pass
         for instrument in (self.handle.dmm, self.handle.src, self.handle.relay):
             if instrument is not None:
                 try:
@@ -553,6 +615,7 @@ def open_manual_control_session(
 
     dmm_addr, dmm_cfg, src_addr, src_cfg = _resolve_instruments(
         rm, excitation_type, dmm_addr, src_addr, source_cfg_dir, source_label, log, dmm_cfg_dir,
+        relay_port=relay_port,
     )
 
     if relay_port:

@@ -88,7 +88,8 @@ def test_validate_skips_relay_hard_limit_for_no_relay_branch():
 
 
 # ----------------------------------------------------------------------
-# smooth_ramp (feature "плавное нарастание", BETA) — только ток, до 300 А
+# smooth_ramp (feature "плавное нарастание", BETA) — только ток; выше 300 А
+# ТЕПЕРЬ ПРЕДУПРЕЖДЕНИЕ, а не запрет (баг-репорт п.13)
 # ----------------------------------------------------------------------
 
 def test_smooth_ramp_allowed_at_or_below_300a():
@@ -98,11 +99,16 @@ def test_smooth_ramp_allowed_at_or_below_300a():
     assert errors == []
 
 
-def test_smooth_ramp_blocked_above_300a():
+def test_smooth_ramp_above_300a_not_blocked_anymore():
+    """Баг-репорт п.13: ток выше 300 А больше НЕ блокирует плавное нарастание —
+    это лишь предупреждение (см. limits.smooth_ramp_warning), не ошибка валидации."""
     p = _good_current_params(); p['X_stop'] = 300.1
     p['smooth_ramp'] = True; p['ramp_duration'] = 2.0
     errors = validate_measure_params(p, 'current', current_source_limits={})
-    assert any('300' in e for e in errors)
+    assert not any('плавн' in e.lower() for e in errors)
+    # предупреждение доступно отдельно
+    from limits import smooth_ramp_warning
+    assert smooth_ramp_warning(300.1) is not None
 
 
 def test_smooth_ramp_requires_positive_ramp_duration():
@@ -464,6 +470,37 @@ def test_resolve_measure_params_branch_preset_turns_averaging_from_cli(tmp_path)
     assert params['averaging_count'] == 8
     assert params['averaging_delay'] == 0.05
     assert params['discard_first'] is False
+
+
+def test_resolve_measure_params_recheck_and_zero_crossing_from_cli(tmp_path):
+    """п.12/п.18: --recheck-count и --zero-crossing-smooth доходят до params."""
+    parser = build_parser()
+    args = _measure_args(parser, [
+        "--excitation", "current",
+        "--start", "0", "--stop", "10", "--step", "5",
+        "--vlimit", "5", "--delay", "0.1", "--cool", "0.1",
+        "--label", "S", "--yes",
+        "--preset", "full_cycle", "--zero-crossing-smooth", "--recheck-count", "0",
+    ])
+    mgr = ConfigManager(tmp_path / "cfg.json")
+    params = resolve_measure_params(args, mgr)
+    assert params['recheck_count'] == 0
+    assert params['zero_crossing_smooth'] is True
+
+
+def test_resolve_measure_params_recheck_defaults_when_absent(tmp_path):
+    """Без --recheck-count дефолт сохраняет прежнее поведение (2 доп. промера)."""
+    from measurement import MAX_MEASUREMENT_ATTEMPTS
+    parser = build_parser()
+    args = _measure_args(parser, [
+        "--excitation", "current",
+        "--start", "0", "--stop", "10", "--step", "5",
+        "--vlimit", "5", "--delay", "0.1", "--cool", "0.1", "--label", "S", "--yes",
+    ])
+    mgr = ConfigManager(tmp_path / "cfg.json")
+    params = resolve_measure_params(args, mgr)
+    assert params['recheck_count'] == MAX_MEASUREMENT_ATTEMPTS - 1
+    assert params['zero_crossing_smooth'] is False
 
 
 def test_smooth_ramp_flags_flow_into_params_from_cli(tmp_path):

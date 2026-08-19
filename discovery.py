@@ -29,8 +29,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, List, Optional
 
-from instruments import find_config_for_idn
+from instruments import find_config_for_idn, relay_visa_address_match
 from relay import discover_relay_port, list_candidate_ports
+from applog import get_logger
+
+log = get_logger(__name__)
 
 DEFAULT_POLL_INTERVAL = 5.0
 
@@ -68,7 +71,8 @@ class DiscoveryState:
         return [i for i in self.instruments if i.kind == kind]
 
 
-def scan_instruments(rm, config_dirs: Dict[str, Path], query_timeout: int = 1500) -> List[DiscoveredInstrument]:
+def scan_instruments(rm, config_dirs: Dict[str, Path], query_timeout: int = 1500,
+                     exclude_relay_port: Optional[str] = None) -> List[DiscoveredInstrument]:
     """
     Опрашивает все видимые VISA-ресурсы и сопоставляет каждый ответившим
     IDN с json-конфигами из config_dirs (например {'multimeter': ...,
@@ -80,6 +84,10 @@ def scan_instruments(rm, config_dirs: Dict[str, Path], query_timeout: int = 1500
     ресурсе (занят другим процессом, не отвечает) не прерывает скан
     остальных — один сломанный прибор не должен гасить весь список.
 
+    exclude_relay_port (п.4) — известный serial-порт платы реле: его ASRL-
+    ресурс не опрашивается `*IDN?` (плата на SCPI не отвечает, а открытие её
+    порта — лишний таймаут и сброс платы, см. instruments.relay_visa_address_match).
+
     Не совпавший ни с одним каталогом ресурс всё равно попадает в список с
     kind='unknown' — оператору полезно видеть "тут что-то есть, но программа
     не знает что", а не тишину.
@@ -87,10 +95,13 @@ def scan_instruments(rm, config_dirs: Dict[str, Path], query_timeout: int = 1500
     found: List[DiscoveredInstrument] = []
     try:
         resources = rm.list_resources()
-    except Exception:
+    except Exception as e:
+        log.debug("scan_instruments: list_resources упал: %s", e)
         return found
 
     for addr in resources:
+        if relay_visa_address_match(addr, exclude_relay_port):
+            continue  # порт платы реле — не трогаем SCPI-опросом
         try:
             instr = rm.open_resource(addr)
             instr.encoding = 'utf-8'
@@ -139,6 +150,10 @@ class DiscoveryService:
 
         self._state = DiscoveryState()
         self._lock = threading.Lock()
+        # Сериализует _do_scan: пока лок держит фоновый скан, никто другой
+        # (pause(), rescan_now, следующая итерация) не начнёт второй скан и не
+        # тронет те же VISA-ресурсы. Ключ к синхронности pause() (см. pause).
+        self._scan_lock = threading.Lock()
         self._stop_event = threading.Event()
         self._paused = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -159,18 +174,34 @@ class DiscoveryService:
 
     def pause(self) -> None:
         """
-        Приостанавливает сканирование — вызывается перед стартом измерения
-        (п.25: сервис не должен спорить с измерительным циклом за те же
+        Приостанавливает сканирование — вызывается перед стартом измерения,
+        ручным режимом и blink (п.25: сервис не должен спорить с ними за те же
         VISA-ресурсы/serial-порт реле).
+
+        СИНХРОННЫЙ (баг-репорт п.2/п.4): раньше pause() лишь выставлял флаг, и
+        если фоновый скан был уже В ПРОЦЕССЕ, он спокойно дорабатывал —
+        держа открытыми те же VISA-ресурсы, — пока измерение параллельно шло в
+        discover_instruments. На NI-VISA открытие одного ресурса из двух
+        ResourceManager'ов даёт VI_ERROR_RSRC_BUSY, и прибор молча выпадал из
+        автопоиска («не удалось обнаружить мультиметр/источник»); тот же
+        конфликт ронял blink. Теперь pause() ВЫСТАВЛЯЕТ флаг И ДОЖИДАЕТСЯ
+        завершения текущего скана (через _scan_lock), поэтому по возвращении
+        из pause() ни один скан не держит ресурсы и не начнёт новый.
         """
         self._paused.set()
+        # Дождаться завершения in-flight скана: захватываем и сразу отпускаем
+        # лок скана. Если скан идёт — блокируемся до его конца; если не идёт —
+        # проходим мгновенно. После этого _paused не даст начаться новому.
+        with self._scan_lock:
+            pass
 
     def resume(self) -> None:
         self._paused.clear()
 
     def rescan_now(self) -> DiscoveryState:
         """Форсирует один цикл скана вне очереди (кнопка «Обновить» в UI) и возвращает новый снимок."""
-        self._do_scan()
+        with self._scan_lock:
+            self._do_scan()
         return self.snapshot()
 
     def snapshot(self) -> DiscoveryState:
@@ -180,8 +211,14 @@ class DiscoveryService:
     # ------------------------------------------------------------- internals
     def _run(self) -> None:
         while not self._stop_event.is_set():
-            if not self._paused.is_set():
-                self._do_scan()
+            # Лок держим на всё время скана: pause() из другого потока
+            # блокируется на нём, пока скан не закончит трогать VISA-ресурсы.
+            # Проверку _paused делаем ВНУТРИ лока — иначе pause(), успевший
+            # выставить флаг между проверкой и захватом лока, всё равно застал
+            # бы уже начавшийся скан.
+            with self._scan_lock:
+                if not self._paused.is_set():
+                    self._do_scan()
             self._stop_event.wait(self._poll_interval)
 
     def _publish(self, state: DiscoveryState) -> None:
@@ -204,7 +241,10 @@ class DiscoveryService:
                 resource_count = len(rm.list_resources())
             except Exception:
                 resource_count = None
-            instruments = scan_instruments(rm, self._config_dirs)
+            # Известный порт реле исключаем из *IDN?-опроса (см. scan_instruments):
+            # плата на SCPI не отвечает, а её лишнее открытие сбрасывает.
+            instruments = scan_instruments(rm, self._config_dirs,
+                                           exclude_relay_port=self._known_relay_port)
         finally:
             try:
                 rm.close()
@@ -214,6 +254,8 @@ class DiscoveryService:
         relay_port = self._scan_relay()
         self._publish(DiscoveryState(instruments=instruments, relay_port=relay_port, scanning=False,
                                       resource_count=resource_count))
+        log.debug("Скан: ресурсов %s, опознано приборов %d, реле=%s",
+                  resource_count, len(instruments), relay_port)
 
     def _scan_relay(self) -> Optional[str]:
         candidates = self._port_lister()

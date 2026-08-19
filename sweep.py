@@ -134,6 +134,35 @@ def _magnitude_pass(magnitude: float, step: float) -> List[float]:
     return _raw_pass(0.0, magnitude, step)
 
 
+# Плавный проход нуля (feature, баг-репорт п.18): множитель и делители для
+# автоматического «зазора» у нуля и мелкого подшага в нём. Идея — на подходе к
+# нулю и на отходе от него ток должен меняться мелкими шагами (плавно, без
+# скачка), а вдали от нуля — обычным шагом. Отдельного UI-поля под ширину зоны
+# и подшаг нет (заказчик просил «просто красиво»); выводим их из X_step.
+ZERO_SMOOTH_ZONE_STEPS = 1.0   # ширина зоны сглаживания = 1 обычный шаг
+ZERO_SMOOTH_SUBSTEPS = 4       # столько мелких подшагов на эту зону
+
+
+def _graduated_magnitude_pass(magnitude: float, step: float,
+                              zone: float, substep: float) -> List[float]:
+    """
+    0 → +magnitude, но у нуля — мелким подшагом (substep) в пределах zone, а
+    дальше — обычным step. Строительный блок для FULL_CYCLE с плавным проходом
+    нуля (п.18): каждая ветвь стартует/финиширует у нуля густо и медленно.
+    """
+    if magnitude == 0:
+        return [0.0]
+    zone = min(zone, magnitude)
+    if zone <= 0 or substep <= 0:
+        return _raw_pass(0.0, magnitude, step)
+    fine = _raw_pass(0.0, zone, substep)          # 0 … zone мелким подшагом
+    if magnitude <= zone:
+        return fine
+    coarse = _raw_pass(zone, magnitude, step)     # zone … magnitude обычным шагом
+    # zone встречается в конце fine и в начале coarse — не дублируем.
+    return fine[:-1] + coarse
+
+
 def _to_sweep_points(values: List[float], magnitude: float) -> List[SweepPoint]:
     return [
         SweepPoint(
@@ -151,7 +180,8 @@ def _to_sweep_points(values: List[float], magnitude: float) -> List[SweepPoint]:
     ]
 
 
-def _preset_sequence(magnitude: float, step: float, preset: DirectionPreset) -> List[float]:
+def _preset_sequence(magnitude: float, step: float, preset: DirectionPreset,
+                     zero_crossing_smooth: bool = False) -> List[float]:
     """
     Строит знаковую последовательность для одностороннего (заякоренного в
     нуле) свипа по выбранному пресету. Каждый вызов _magnitude_pass строит
@@ -163,8 +193,20 @@ def _preset_sequence(magnitude: float, step: float, preset: DirectionPreset) -> 
     задумано ещё в Ф0), DESCENDING/FULL_CYCLE специально возвращаются в
     ноль несколько раз — это и есть смысл снятия петли гистерезиса, ноль
     после разных экскурсий может показывать разное.
+
+    zero_crossing_smooth (feature, баг-репорт п.18) — только для FULL_CYCLE:
+    каждая ветвь проходит ноль густо и медленно (мелкий подшаг в зоне у нуля,
+    см. _graduated_magnitude_pass), без резкого скачка. Ноль при этом всё
+    равно измеряется отдельной точкой (это и есть «остановка в нуле» — на ней
+    источник выключен, см. measurement._measure_zero_row). Для остальных
+    пресетов флаг игнорируется (у них проход нуля не является смыслом схемы).
     """
-    pos_away = _magnitude_pass(magnitude, step)          # 0 → +X
+    if preset == DirectionPreset.FULL_CYCLE and zero_crossing_smooth:
+        zone = step * ZERO_SMOOTH_ZONE_STEPS
+        substep = zone / ZERO_SMOOTH_SUBSTEPS
+        pos_away = _graduated_magnitude_pass(magnitude, step, zone, substep)
+    else:
+        pos_away = _magnitude_pass(magnitude, step)      # 0 → +X
     pos_toward = list(reversed(pos_away))                # +X → 0
     neg_away = [-p for p in pos_away]                     # 0 → -X
     neg_toward = list(reversed(neg_away))                 # -X → 0
@@ -208,10 +250,14 @@ def preset_applies(X_start: float, X_stop: float, branch: Branch) -> bool:
 
 def plan_sweep(X_start: float, X_stop: float, X_step: float,
                branch: Branch = Branch.BOTH,
-               preset: DirectionPreset = DirectionPreset.DIVERGING) -> List[SweepPoint]:
+               preset: DirectionPreset = DirectionPreset.DIVERGING,
+               zero_crossing_smooth: bool = False) -> List[SweepPoint]:
     """
     Строит полный план измерения. Ничего не знает про приборы — только
     комбинаторика точек. См. докстринг модуля про модель целиком.
+
+    zero_crossing_smooth (п.18) — плавный проход нуля; действует только на
+    FULL_CYCLE с заякоренной в нуле развёрткой (см. _preset_sequence).
     """
     if X_step <= 0:
         raise ValueError("X_step должен быть положительным")
@@ -265,7 +311,8 @@ def plan_sweep(X_start: float, X_stop: float, X_step: float,
             return _to_sweep_points(base, magnitude) + _to_sweep_points(mirror, magnitude)
 
         magnitude = max(abs(X_start), abs(X_stop))
-        sequence = _preset_sequence(magnitude, X_step, preset)
+        sequence = _preset_sequence(magnitude, X_step, preset,
+                                    zero_crossing_smooth=zero_crossing_smooth)
         return _to_sweep_points(sequence, magnitude)
 
     # branch — конкретная полярность, не обе.

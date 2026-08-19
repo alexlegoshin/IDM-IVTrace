@@ -5,7 +5,7 @@ import pytest
 from instruments import (
     Multimeter, CurrentSource, VoltageSource,
     find_config_for_idn, discover_instruments, is_overflow_reading, parse_scpi_number,
-    identify_instrument,
+    identify_instrument, relay_visa_address_match,
 )
 from tests.conftest import FakeVisaResource, FakeResourceManager
 
@@ -66,6 +66,41 @@ def akip2101_manual_range_cfg(instruments_dir, tmp_path):
     path = tmp_path / "akip2101_manual.json"
     path.write_text(json.dumps(cfg), encoding='utf-8')
     return path
+
+
+def test_go_local_sends_configured_command(akip2101_cfg, make_fake_rm):
+    """п.8: go_local() шлёт local_command (в конфиге АКИП-2101 — 'SYST:LOC')."""
+    fake = FakeVisaResource()
+    rm = make_fake_rm({"FAKE::ADDR": fake})
+    dmm = Multimeter("FAKE::ADDR", akip2101_cfg, rm=rm)
+    fake.written.clear()
+    dmm.go_local()
+    assert "SYST:LOC" in fake.written
+
+
+def test_go_local_noop_without_command(akip2101_cfg, make_fake_rm, tmp_path):
+    """Без local_command в конфиге go_local() ничего не шлёт и не падает."""
+    cfg = json.loads(akip2101_cfg.read_text(encoding="utf-8"))
+    cfg.pop("local_command", None)
+    path = tmp_path / "no_local.json"
+    path.write_text(json.dumps(cfg), encoding="utf-8")
+    fake = FakeVisaResource()
+    rm = make_fake_rm({"FAKE::ADDR": fake})
+    dmm = Multimeter("FAKE::ADDR", path, rm=rm)
+    fake.written.clear()
+    dmm.go_local()
+    assert fake.written == []
+
+
+@pytest.mark.parametrize("visa_addr,relay_port,expected", [
+    ("ASRL3::INSTR", "COM3", True),          # Windows: COM3 <-> ASRL3
+    ("ASRL3::INSTR", "COM4", False),         # другой номер — не реле
+    ("USB0::0x1234::0x5678::INSTR", "COM3", False),  # USB-TMC прибор — не реле
+    ("ASRL/dev/ttyUSB0::INSTR", "/dev/ttyUSB0", True),  # Unix: по подстроке
+    ("ASRL1::INSTR", None, False),           # порт реле неизвестен — не исключаем
+])
+def test_relay_visa_address_match(visa_addr, relay_port, expected):
+    assert relay_visa_address_match(visa_addr, relay_port) is expected
 
 
 def test_multimeter_uses_autorange_by_default(akip2101_cfg, make_fake_rm):
@@ -693,6 +728,27 @@ def test_discover_instruments_finds_dmm_and_source(instruments_dir):
     assert dmm_cfg.name == "akip2101.json"
     assert src_addr == "SRC_ADDR"
     assert src_cfg.name == "akip1162.json"
+
+
+def test_discover_instruments_skips_relay_port(instruments_dir):
+    """
+    п.4: ASRL-ресурс платы реле НЕ опрашивается *IDN? (плата не отвечает на
+    SCPI, открытие её порта — лишний таймаут/сброс). Реле-ресурс, который бы
+    бросил при query, должен быть пропущен — а обычные приборы найдены.
+    """
+    relay_res = FakeVisaResource()  # без idn -> query('*IDN?') бросит AssertionError
+    dmm_res = FakeVisaResource(idn="SIGLENT,SDM3055,SN001,1.0")
+    src_res = FakeVisaResource(idn="ITECH,IT-M3122,SN002,1.0")
+    rm = FakeResourceManager({"ASRL3::INSTR": relay_res, "DMM_ADDR": dmm_res, "SRC_ADDR": src_res})
+
+    dmm_addr, _, src_addr, _ = discover_instruments(
+        instruments_dir / "multimeters_current", instruments_dir / "current_sources", rm=rm,
+        exclude_relay_port="COM3",
+    )
+    assert dmm_addr == "DMM_ADDR"
+    assert src_addr == "SRC_ADDR"
+    # плату реле не трогали *IDN?-опросом
+    assert relay_res.queried == []
 
 
 def test_discover_instruments_raises_when_no_resources(instruments_dir):

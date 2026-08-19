@@ -425,6 +425,48 @@ def test_rejected_point_does_not_abort_when_stop_on_error_disabled():
     assert len(results) == 2  # вторая точка всё равно была снята
 
 
+def test_recheck_count_one_rejects_on_first_attempt(monkeypatch):
+    """
+    п.12: max_attempts=1 (0 доп. перепромеров) — точка вне допуска бракуется
+    сразу, без повторов. Должен читаться ровно один заход усреднения (4 отсчёта).
+    """
+    dmm = FakeDMM(readings=[0.5, 0.5, 0.5, 0.5])  # ровно один заход
+    src = FakeSource()
+    relay = FakeRelay()
+    results, aborted = _run(
+        dmm, src, relay, X_start=1, X_stop=1, X_step=1, branch=Branch.POSITIVE,
+        ratio=1000.0, stop_on_error=True, error_threshold=1.0, max_attempts=1,
+    )
+    assert results[0]['Rejected'] is True
+    assert 'попытка' in results[0]['RejectReason']  # единственное число
+    assert aborted is not None
+
+
+def test_recheck_count_extra_attempts_allow_recovery():
+    """max_attempts=4: три плохих захода, четвёртый в допуске -> точка принята."""
+    dmm = FakeDMM(readings=([0.5] * 4) * 3 + [0.001] * 4)
+    src = FakeSource()
+    relay = FakeRelay()
+    results, aborted = _run(
+        dmm, src, relay, X_start=1, X_stop=1, X_step=1, branch=Branch.POSITIVE,
+        ratio=1000.0, stop_on_error=True, error_threshold=1.0, max_attempts=4,
+    )
+    assert results[0]['Rejected'] is False
+    assert aborted is None
+
+
+def test_on_point_done_called_once_per_point():
+    """п.7: прогресс-хук вызывается после каждой снятой точки с (done, total)."""
+    dmm = FakeDMM(readings=[0.001] * 40)
+    src = FakeSource()
+    relay = FakeRelay()
+    progress = []
+    _run(dmm, src, relay, X_start=0, X_stop=2, X_step=1, branch=Branch.POSITIVE,
+         on_point_done=lambda done, total: progress.append((done, total)))
+    # план POSITIVE 0..2 шаг 1 -> точки 0,1,2 (3 точки)
+    assert progress == [(1, 3), (2, 3), (3, 3)]
+
+
 def test_rejected_point_still_appears_in_raw_results():
     # "остаётся в сырых данных с флагом" — не выбрасывается из results.
     dmm = FakeDMM(readings=[0.5] * 12)

@@ -4,6 +4,8 @@
     "keywords": ["PICOTEST", "AKIP-B7-78", "V7-78", "PRIST", "M3500"],
     "timeout": 5000,
     "encoding": "utf-8",
+    "local_command": "SYST:LOC",
+    "local_notes": "local_command (п.8) — возврат из REMOTE в местное управление после цикла. 'SYSTem:LOCal' — по платформе Keysight/Agilent 34401A; на реальном Picotest M3500A не проверялась. Неизвестная прибору команда безвредна (write не поднимает ошибку).",
     "init_commands": [
         "*RST",
         "SENS:FUNC \"VOLT:DC\"",
